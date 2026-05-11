@@ -1,0 +1,1394 @@
+#!/usr/bin/env python3
+"""fuzzer — search file contents for words/phrases.
+
+Defaults: case-insensitive, fuzzy matching ON.
+
+Flags:
+  -k  case-sensitive
+  -e  exact match only (no fuzzy)
+  -t  fuzzy threshold 0-100 (default 80)
+  -v  show full sentence around each match
+  -C  context lines around each match
+  -l  filenames only
+  -n  no line numbers
+  -r  recursive directory search
+  -a  AI-powered semantic search (needs ANTHROPIC_API_KEY)
+  -o  export results to FILE (.csv .tsv .json .txt .xlsx)
+  --no-color
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+# ── colour ─────────────────────────────────────────────────────────────────────
+
+_BOLD = "\033[1m"
+_DIM  = "\033[2m"
+_RED  = "\033[31m"
+_GRN  = "\033[32m"
+_YEL  = "\033[33m"
+_MAG  = "\033[35m"
+_CYN  = "\033[36m"
+_RST  = "\033[0m"
+
+_color_on = True
+
+def _c(*codes: str) -> str:
+    return "".join(codes) if _color_on else ""
+
+def _r() -> str:
+    return _RST if _color_on else ""
+
+def _err(msg: str) -> None:
+    print(f"{_c(_YEL)}warning:{_r()} {msg}", file=sys.stderr)
+
+# ── types ──────────────────────────────────────────────────────────────────────
+
+class Match(NamedTuple):
+    filepath: str
+    line_num: int   # 1-based
+    line: str
+    score: int      # 100 = exact substring, <100 = fuzzy %
+    page_num: int = 0  # PDF page (1-based); 0 = not a PDF / unknown
+
+# ── text extraction ────────────────────────────────────────────────────────────
+
+def _extract_plain(fp: str) -> Optional[List[str]]:
+    try:
+        return Path(fp).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        _err(f"{fp}: {e}")
+        return None
+
+_pdf_page_map: Dict[str, List[int]] = {}  # fp → page_num per line (1-based)
+
+def _extract_pdf(fp: str) -> Optional[List[str]]:
+    # PyMuPDF preserves logical Unicode character order for Arabic text;
+    # fall back to pdfplumber if fitz is not installed.
+    lines: List[str] = []
+    page_nums: List[int] = []
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(fp)
+        for page_idx in range(1, len(doc) + 1):
+            page = doc[page_idx - 1]
+            # sort=True re-orders glyphs by position, fixing ligature order in
+            # Arabic PDFs that use non-standard glyph sequences.
+            text: str = page.get_text("text", sort=True) or ""  # type: ignore[attr-defined]
+            page_lines = text.splitlines()
+            lines.extend(page_lines)
+            page_nums.extend([page_idx] * len(page_lines))
+        doc.close()
+        _pdf_page_map[fp] = page_nums
+        return lines
+    except ImportError:
+        pass
+    except Exception as e:
+        _err(f"{fp}: {e}")
+        return None
+    try:
+        import pdfplumber
+    except ImportError:
+        _err("PDF support requires pdfplumber or pymupdf — pip install pymupdf")
+        return None
+    try:
+        with pdfplumber.open(fp) as pdf:
+            for page_idx, page in enumerate(pdf.pages, start=1):
+                text = page.extract_text() or ""
+                page_lines = text.splitlines()
+                lines.extend(page_lines)
+                page_nums.extend([page_idx] * len(page_lines))
+        _pdf_page_map[fp] = page_nums
+        return lines
+    except Exception as e:
+        _err(f"{fp}: {e}")
+        return None
+
+def _extract_docx(fp: str) -> Optional[List[str]]:
+    try:
+        from docx import Document
+    except ImportError:
+        _err("DOCX support requires python-docx — pip install python-docx")
+        return None
+    try:
+        doc = Document(fp)
+        return [p.text for p in doc.paragraphs if p.text.strip()]
+    except Exception as e:
+        _err(f"{fp}: {e}")
+        return None
+
+_EXT_MAP = {
+    ".pdf":  _extract_pdf,
+    ".docx": _extract_docx,
+    ".doc":  _extract_docx,
+    ".txt":  _extract_plain,
+    ".md":   _extract_plain,
+    ".rst":  _extract_plain,
+    ".csv":  _extract_plain,
+    ".tsv":  _extract_plain,
+    ".log":  _extract_plain,
+    ".json": _extract_plain,
+    ".xml":  _extract_plain,
+    ".html": _extract_plain,
+    ".htm":  _extract_plain,
+}
+
+def read_lines(fp: str) -> Optional[List[str]]:
+    ext = Path(fp).suffix.lower()
+    fn = _EXT_MAP.get(ext, _extract_plain)
+    return fn(fp)
+
+# ── sentence extraction ────────────────────────────────────────────────────────
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+def extract_sentence(full_text: str, char_offset: int) -> str:
+    """Return the sentence that contains char_offset in full_text."""
+    # find start: last sentence-end before offset
+    start = 0
+    for m in _SENTENCE_END.finditer(full_text):
+        if m.start() < char_offset:
+            start = m.end()
+        else:
+            break
+    # find end: next sentence-end after offset
+    end_match = _SENTENCE_END.search(full_text, char_offset)
+    end = end_match.start() + 1 if end_match else len(full_text)
+    sentence = full_text[start:end].strip()
+    return sentence or full_text[max(0, char_offset - 120): char_offset + 120].strip()
+
+# ── fuzzy matching ─────────────────────────────────────────────────────────────
+
+def _levenshtein(a: str, b: str) -> int:
+    if len(a) > len(b):
+        a, b = b, a
+    row = list(range(len(a) + 1))
+    for c2 in b:
+        prev, row[0] = row[0], row[0] + 1
+        for j, c1 in enumerate(a):
+            prev, row[j + 1] = row[j + 1], min(
+                row[j + 1] + 1, row[j] + 1, prev + (c1 != c2)
+            )
+    return row[-1]
+
+def _builtin_ratio(a: str, b: str) -> int:
+    dist = _levenshtein(a, b)
+    total = len(a) + len(b)
+    return int((1 - dist / total) * 100) if total else 100
+
+def fuzzy_score(pattern: str, line: str) -> int:
+    """Best similarity score (0-100) of pattern against tokens in line."""
+    try:
+        from thefuzz import fuzz
+        ratio_fn = fuzz.ratio
+        partial_fn = fuzz.partial_ratio
+        token_fn = fuzz.token_set_ratio
+    except ImportError:
+        ratio_fn = _builtin_ratio  # type: ignore[assignment]
+        partial_fn = None
+        token_fn = None
+
+    words = line.split()
+    pw = pattern.split()
+    n = len(pw)
+    best = 0
+
+    if n == 1:
+        for w in words:
+            best = max(best, ratio_fn(pattern, w))
+    else:
+        for i in range(max(1, len(words) - n + 1)):
+            window = " ".join(words[i: i + n])
+            best = max(best, ratio_fn(pattern, window))
+        if partial_fn:
+            best = max(best, partial_fn(pattern, line))
+        if token_fn:
+            best = max(best, token_fn(pattern, line))
+
+    return best
+
+# ── core search ────────────────────────────────────────────────────────────────
+
+def search_file(
+    fp: str,
+    pattern: str,
+    *,
+    case_sensitive: bool,
+    exact_only: bool,
+    threshold: int,
+) -> Tuple[List[str], List[Match]]:
+    lines = read_lines(fp)
+    if lines is None:
+        return [], []
+
+    pat = pattern if case_sensitive else pattern.lower()
+    matches: List[Match] = []
+    _pages = _pdf_page_map.get(fp, [])
+
+    for i, line in enumerate(lines, start=1):
+        cmp = line if case_sensitive else line.lower()
+        pg = _pages[i - 1] if i - 1 < len(_pages) else 0
+        if pat in cmp:
+            matches.append(Match(fp, i, line, 100, pg))
+            continue
+        if not exact_only:
+            sc = fuzzy_score(pat, cmp)
+            if sc >= threshold:
+                matches.append(Match(fp, i, line, sc, pg))
+
+    return lines, matches
+
+# ── AI search ─────────────────────────────────────────────────────────────────
+
+def ai_search_file(fp: str, query: str, log_fn=None,
+                   api_key: str = "") -> Tuple[List[str], List[Match]]:
+    """Use Claude to find semantically relevant passages.
+    log_fn(tag, prefix, text) is called (thread-safe via root.after) to show
+    the query and response in the GUI chat panel.
+    api_key overrides ANTHROPIC_API_KEY env var (used by GUI when key is stored in state)."""
+    def _log(tag: str, prefix: str, text: str) -> None:
+        if log_fn:
+            log_fn(tag, prefix, text)
+
+    try:
+        import anthropic
+    except ImportError:
+        _err("AI mode requires anthropic — pip install anthropic")
+        return [], []
+
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        _err("AI mode needs ANTHROPIC_API_KEY environment variable set")
+        _log("err", "error", "No API key. Set one via 'API Key…' button.")
+        return [], []
+
+    lines = read_lines(fp)
+    if not lines:
+        return [], []
+
+    # Keep ~20 000 chars (~5 000 tokens) to stay well under free-tier rate limits.
+    # Number lines BEFORE truncating so line numbers stay accurate.
+    numbered_lines = [f"{i+1}: {l}" for i, l in enumerate(lines)]
+    numbered = "\n".join(numbered_lines)
+    truncated = False
+    if len(numbered) > 20_000:
+        numbered = numbered[:20_000]
+        truncated = True
+
+    client = anthropic.Anthropic(api_key=key)
+    prompt = (
+        f'You are a search assistant. Find every line in the document below that is '
+        f'relevant to the query: "{query}"\n\n'
+        f"Return ONLY a JSON array of objects, each with:\n"
+        f'  "line": the 1-based line number (integer)\n'
+        f'  "reason": one short phrase explaining relevance\n\n'
+        f"If nothing is relevant, return []\n\n"
+        f"Document:\n{numbered}"
+    )
+
+    fname = os.path.basename(fp)
+    _log("you", "AI search", f'"{query}" in {fname}')
+    if truncated:
+        _log("sys", "note", "Document truncated to ~20 000 chars to fit rate limits")
+    _log("sys", "claude", f"Searching {fname}…")
+
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        import json
+        from anthropic.types import TextBlock as _TextBlock
+        raw = next(
+            (b.text for b in resp.content if isinstance(b, _TextBlock)), ""
+        ).strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        hits = json.loads(raw)
+        matches: List[Match] = []
+        _pg_map = _pdf_page_map.get(fp, [])
+        for h in hits:
+            ln = int(h["line"])
+            if 1 <= ln <= len(lines):
+                _pg_num = _pg_map[ln - 1] if _pg_map and ln - 1 < len(_pg_map) else 0
+                matches.append(Match(fp, ln, lines[ln - 1], -1, _pg_num))
+        summary = (
+            f"Found {len(matches)} match(es) in {fname}" if matches
+            else f"No matches in {fname}"
+        )
+        _log("claude", "claude", summary)
+        if matches:
+            for m in matches[:5]:
+                reason = next(
+                    (h.get("reason", "") for h in hits if int(h["line"]) == m.line_num),
+                    ""
+                )
+                _log("claude", "  →", f"line {m.line_num}: {reason}")
+        return lines, matches
+    except Exception as e:
+        err_str = str(e)
+        if "rate_limit" in err_str or "429" in err_str:
+            msg = "Rate limit hit — wait a minute and try again, or use a smaller file."
+        else:
+            msg = f"AI search failed: {err_str[:120]}"
+        _err(f"AI search failed for {fp}: {e}")
+        _log("err", "error", msg)
+        return lines, []
+
+# ── output ─────────────────────────────────────────────────────────────────────
+
+def _highlight(line: str, pattern: str, case_sensitive: bool) -> str:
+    pat = pattern if case_sensitive else pattern.lower()
+    cmp = line if case_sensitive else line.lower()
+    idx = cmp.find(pat)
+    if idx == -1:
+        return line
+    end = idx + len(pat)
+    return line[:idx] + _c(_RED, _BOLD) + line[idx:end] + _r() + line[end:]
+
+def _score_tag(score: int) -> str:
+    if score == 100:
+        return ""
+    if score == -1:
+        return f" {_c(_CYN)}[AI]{_r()}"
+    return f" {_c(_YEL)}[~{score}%]{_r()}"
+
+def print_results(
+    results: Dict[str, Tuple[List[str], List[Match]]],
+    *,
+    pattern: str,
+    case_sensitive: bool,
+    files_only: bool,
+    show_nums: bool,
+    context_lines: int,
+    verbose: bool,
+    ai_mode: bool,
+) -> int:
+    total = 0
+    for fp, (lines, matches) in results.items():
+        if not matches:
+            continue
+        total += len(matches)
+        print(_c(_MAG, _BOLD) + fp + _r())
+        if files_only:
+            continue
+
+        full_text = "\n".join(lines)
+        shown: set = set()
+
+        for m in matches:
+            ln = m.line_num
+            tag = _score_tag(m.score)
+
+            if verbose:
+                # find sentence containing this line
+                # compute char offset of this line's start
+                offset = sum(len(l) + 1 for l in lines[:ln - 1])
+                sentence = extract_sentence(full_text, offset + max(0, len(m.line) // 2))
+                if case_sensitive:
+                    hl = re.sub(re.escape(pattern),
+                                _c(_RED, _BOLD) + r"\g<0>" + _r(),
+                                sentence)
+                else:
+                    hl = re.sub(re.escape(pattern), _c(_RED, _BOLD) + r"\g<0>" + _r(),
+                                sentence, flags=re.IGNORECASE)
+                num = (_c(_GRN) + f"{ln}:" + _r() + " ") if show_nums else ""
+                print(f"  {num}{hl}{tag}")
+
+            elif context_lines > 0:
+                lo = max(1, ln - context_lines)
+                hi = min(len(lines), ln + context_lines)
+                if shown and min(k for k in range(lo, hi + 1) if k not in shown) > lo:
+                    print(_c(_DIM) + "--" + _r())
+                for ctx in range(lo, hi + 1):
+                    if ctx in shown:
+                        continue
+                    shown.add(ctx)
+                    ctx_line = lines[ctx - 1]
+                    if ctx == ln:
+                        num = (_c(_GRN) + f"{ctx}:" + _r()) if show_nums else ""
+                        print(f"{num}{_highlight(ctx_line, pattern, case_sensitive)}{tag}")
+                    else:
+                        num = (_c(_DIM) + f"{ctx}-" + _r()) if show_nums else ""
+                        print(f"{num}{_c(_DIM)}{ctx_line}{_r()}")
+            else:
+                num = (_c(_GRN) + f"{ln}:" + _r()) if show_nums else ""
+                if ai_mode:
+                    print(f"{num}{m.line}{tag}")
+                else:
+                    print(f"{num}{_highlight(m.line, pattern, case_sensitive)}{tag}")
+
+    return total
+
+# ── export ─────────────────────────────────────────────────────────────────────
+
+def _build_rows(
+    results: Dict[str, Tuple[List[str], List[Match]]],
+    *,
+    verbose: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for fp, (lines, matches) in results.items():
+        full_text = "\n".join(lines)
+        for m in matches:
+            if m.score == 100:
+                match_type = "exact"
+                score_val: object = 100
+            elif m.score == -1:
+                match_type = "ai"
+                score_val = ""
+            else:
+                match_type = "fuzzy"
+                score_val = m.score
+
+            row: Dict[str, object] = {
+                "file": fp,
+                "line": m.line_num,
+                "page": m.page_num if m.page_num else "",
+                "match_type": match_type,
+                "score": score_val,
+                "content": m.line,
+            }
+            if verbose:
+                offset = sum(len(l) + 1 for l in lines[:m.line_num - 1])
+                row["sentence"] = extract_sentence(
+                    full_text, offset + max(0, len(m.line) // 2)
+                )
+            rows.append(row)
+    return rows
+
+
+def export_results(
+    results: Dict[str, Tuple[List[str], List[Match]]],
+    out_path: str,
+    *,
+    verbose: bool,
+) -> None:
+    rows = _build_rows(results, verbose=verbose)
+    ext = Path(out_path).suffix.lower()
+
+    if ext in (".csv", ".tsv"):
+        import csv
+        delim = "\t" if ext == ".tsv" else ","
+        fields = list(rows[0].keys()) if rows else \
+            ["file", "line", "match_type", "score", "content"]
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, delimiter=delim)
+            w.writeheader()
+            w.writerows(rows)
+
+    elif ext == ".json":
+        import json
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    elif ext in (".xlsx", ".xls"):
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font
+        except ImportError:
+            _err("Excel export requires openpyxl — pip install openpyxl")
+            return
+        from openpyxl.utils import get_column_letter
+        wb = Workbook()
+        ws = wb.active
+        assert ws is not None
+        ws.title = "fuzzer results"
+        fields = list(rows[0].keys()) if rows else \
+            ["file", "line", "match_type", "score", "content"]
+        ws.append(fields)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for row in rows:
+            ws.append([row.get(k, "") for k in fields])
+        for col_idx, name in enumerate(fields, start=1):
+            max_len = max(
+                [len(str(name))] + [len(str(r.get(name, ""))) for r in rows]
+            )
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 80)
+        wb.save(out_path)
+
+    else:
+        # plain text — mirror the console layout, no colours
+        with open(out_path, "w", encoding="utf-8") as f:
+            current_file: Optional[str] = None
+            for r in rows:
+                if r["file"] != current_file:
+                    current_file = str(r["file"])
+                    f.write(f"\n{current_file}\n")
+                tag = ""
+                if r["match_type"] == "fuzzy":
+                    tag = f" [~{r['score']}%]"
+                elif r["match_type"] == "ai":
+                    tag = " [AI]"
+                f.write(f"  {r['line']}: {r['content']}{tag}\n")
+                if verbose and "sentence" in r:
+                    f.write(f"     {r['sentence']}\n")
+
+    print(_c(_CYN) + f"exported {len(rows)} rows to {out_path}" + _r(),
+          file=sys.stderr)
+
+# ── file collection ────────────────────────────────────────────────────────────
+
+def collect_files(paths: List[str], recursive: bool) -> List[str]:
+    out: List[str] = []
+    for p in paths:
+        path = Path(p)
+        if path.is_dir():
+            if recursive:
+                for f in sorted(path.rglob("*")):
+                    if f.is_file() and f.suffix.lower() in _EXT_MAP:
+                        out.append(str(f))
+            else:
+                _err(f"{p} is a directory — use -r to search recursively")
+        elif path.is_file():
+            out.append(str(path))
+        else:
+            _err(f"{p}: not found")
+    return out
+
+# ── GUI ────────────────────────────────────────────────────────────────────────
+
+def run_gui() -> int:
+    try:
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox
+    except ImportError:
+        print("error: tkinter is not available in this Python.\n"
+              "  macOS Homebrew: brew install python-tk\n"
+              "  Debian/Ubuntu:  sudo apt install python3-tk",
+              file=sys.stderr)
+        return 2
+
+    import json as _json
+    import queue
+    import threading
+
+    _STATE_FILE = Path.home() / ".fuzzer_gui_state.json"
+
+    def _load_state() -> Dict[str, object]:
+        try:
+            return _json.loads(_STATE_FILE.read_text())
+        except Exception:
+            return {}
+
+    def _save_state(data: Dict[str, object]) -> None:
+        try:
+            _STATE_FILE.write_text(_json.dumps(data))
+        except Exception:
+            pass
+
+    _gui_state = _load_state()
+
+    # tkinter Treeview cells are always LTR containers, so we need
+    # bidi.get_display() to reorder Arabic words for correct visual order.
+    # On macOS, CoreText handles letter-level shaping (connecting glyphs)
+    # from raw Unicode, so arabic_reshaper is NOT needed and would fight
+    # CoreText. On other platforms both reshaper + bidi are required.
+    import platform as _platform
+    _bidi_display = None
+    _arabic_reshaper = None
+    try:
+        from bidi.algorithm import get_display as _bidi_display  # type: ignore[assignment]
+    except ImportError:
+        pass
+    try:
+        import arabic_reshaper as _arabic_reshaper  # type: ignore[assignment]
+    except ImportError:
+        pass
+
+    def _fix_arabic(text: str) -> str:
+        if not text:
+            return text
+        if _platform.system() == "Darwin":
+            # PyMuPDF returns logical-order Unicode; CoreText + Geeza Pro
+            # handles RTL shaping and bidi rendering natively in tkinter.
+            return text
+        else:
+            reshaped = _arabic_reshaper.reshape(text) if _arabic_reshaper else text
+            return _bidi_display(reshaped, base_dir='R') if _bidi_display else reshaped
+
+    class _Tooltip:
+        def __init__(self, widget: tk.Widget, text: str) -> None:
+            self._w = widget
+            self._text = text
+            self._tip: Optional[tk.Toplevel] = None
+            widget.bind("<Enter>", self._show)
+            widget.bind("<Leave>", self._hide)
+
+        def _show(self, _event: object = None) -> None:
+            x = self._w.winfo_rootx() + 16
+            y = self._w.winfo_rooty() + self._w.winfo_height() + 4
+            self._tip = tk.Toplevel(self._w)
+            self._tip.wm_overrideredirect(True)
+            self._tip.wm_geometry(f"+{x}+{y}")
+            ttk.Label(
+                self._tip, text=self._text,
+                background="#ffffc0", relief="solid", borderwidth=1, padding=(6, 3)
+            ).pack()
+
+        def _hide(self, _event: object = None) -> None:
+            if self._tip:
+                self._tip.destroy()
+                self._tip = None
+
+    root = tk.Tk()
+    root.title("fuzzer")
+    root.geometry("1100x680")
+
+    state: Dict[str, object] = {
+        "results": {},   # Dict[str, Tuple[List[str], List[Match]]]
+        "searching": False,
+    }
+    msg_q: "queue.Queue[tuple]" = queue.Queue()
+
+    # ── top form ─────────────────────────────────────────────────────────────
+    form = ttk.Frame(root, padding=10)
+    form.pack(fill="x")
+
+    ttk.Label(form, text="Pattern:").grid(row=0, column=0, sticky="w")
+    pattern_var = tk.StringVar()
+    _search_history: List[str] = [str(x) for x in _gui_state.get("search_history", [])]  # type: ignore[arg-type]
+    pattern_entry = ttk.Combobox(form, textvariable=pattern_var, values=_search_history,
+                                 justify="right")
+    pattern_entry.grid(row=0, column=1, columnspan=4, sticky="ew", padx=4, pady=2)
+
+    ttk.Label(form, text="Files/folders:").grid(row=1, column=0, sticky="w")
+    files_var = tk.StringVar(value=str(_gui_state.get("last_files", "")))
+    files_entry = ttk.Entry(form, textvariable=files_var)
+    files_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=4, pady=2)
+
+    def pick_files() -> None:
+        paths = filedialog.askopenfilenames(title="Select files to search")
+        if paths:
+            existing = files_var.get().strip()
+            joined = " ".join(f'"{p}"' for p in paths)
+            files_var.set(f"{existing} {joined}".strip() if existing else joined)
+
+    def pick_folder() -> None:
+        path = filedialog.askdirectory(title="Select folder")
+        if path:
+            existing = files_var.get().strip()
+            quoted = f'"{path}"'
+            files_var.set(f"{existing} {quoted}".strip() if existing else quoted)
+            recursive_var.set(True)
+
+    ttk.Button(form, text="Pick files…", command=pick_files).grid(
+        row=1, column=3, padx=2)
+    ttk.Button(form, text="Pick folder…", command=pick_folder).grid(
+        row=1, column=4, padx=2)
+
+    # options row
+    opts = ttk.Frame(form)
+    opts.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+    case_var = tk.BooleanVar()
+    exact_var = tk.BooleanVar()
+    recursive_var = tk.BooleanVar()
+    ai_var = tk.BooleanVar()
+    verbose_var = tk.BooleanVar()
+
+    _opt_tooltips = [
+        ("Case-sensitive",    case_var,      "Match uppercase/lowercase exactly"),
+        ("Exact only",        exact_var,     "Skip fuzzy matching — report only verbatim phrase matches"),
+        ("Recursive",         recursive_var, "Search subfolders when a folder is given"),
+        ("AI mode",           ai_var,        "Use Claude AI for semantic/conceptual matches\n(requires ANTHROPIC_API_KEY env var)"),
+        ("Verbose (sentence)",verbose_var,   "Show the full sentence surrounding each match"),
+    ]
+    for _label, _var, _tip in _opt_tooltips:
+        _cb = ttk.Checkbutton(opts, text=_label, variable=_var)
+        _cb.pack(side="left", padx=4)
+        _Tooltip(_cb, _tip)
+
+    _thr_lbl = ttk.Label(opts, text="  Threshold:")
+    _thr_lbl.pack(side="left")
+    threshold_var = tk.IntVar(value=80)
+    _thr_spin = ttk.Spinbox(opts, from_=0, to=100, textvariable=threshold_var, width=5)
+    _thr_spin.pack(side="left", padx=4)
+    _Tooltip(_thr_lbl, "Minimum fuzzy similarity score (0 = anything, 100 = exact only)")
+    _Tooltip(_thr_spin, "Minimum fuzzy similarity score (0 = anything, 100 = exact only)")
+
+    # action row
+    actions = ttk.Frame(form)
+    actions.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+
+    search_btn = ttk.Button(actions, text="Search")
+    search_btn.pack(side="left", padx=2)
+    clear_btn = ttk.Button(actions, text="Clear results")
+    clear_btn.pack(side="left", padx=2)
+    export_btn = ttk.Button(actions, text="Export…", state="disabled")
+    export_btn.pack(side="left", padx=2)
+    apikey_btn = ttk.Button(actions, text="API Key…")
+    apikey_btn.pack(side="left", padx=(12, 2))
+
+    form.columnconfigure(1, weight=1)
+    form.columnconfigure(2, weight=1)
+
+    # ── results table ────────────────────────────────────────────────────────
+    table_frame = ttk.Frame(root, padding=(10, 0, 10, 0))
+    table_frame.pack(fill="both", expand=True)
+
+    columns = ("file", "line", "page", "match", "score", "content")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+
+    # Use a font with solid Arabic support; fall back gracefully
+    import tkinter.font as _tkfont
+    _arabic_font = None
+    for _candidate in ("Geeza Pro", "Arial Unicode MS", "Tahoma", "Arial"):
+        if _candidate in _tkfont.families():
+            _arabic_font = (_candidate, 15)
+            break
+    if _arabic_font:
+        tree.configure(style="Arabic.Treeview")
+        style = ttk.Style()
+        style.configure("Arabic.Treeview", font=_arabic_font, rowheight=32)
+        style.configure("Arabic.Treeview.Heading", font=(_arabic_font[0], 13, "bold"))
+
+    headings = {
+        "file":    ("File",    240),
+        "line":    ("Line",     55),
+        "page":    ("Page",     55),
+        "match":   ("Match",    65),
+        "score":   ("Score",    55),
+        "content": ("Content", 590),
+    }
+    for col, (label, width) in headings.items():
+        tree.heading(col, text=label)
+        anchor = "e" if col in ("content", "file") else ("center" if col in ("line", "page", "score") else "w")
+        tree.column(col, width=width, anchor=anchor)
+
+    vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vsb.grid(row=0, column=1, sticky="ns")
+    hsb.grid(row=1, column=0, sticky="ew")
+    table_frame.rowconfigure(0, weight=1)
+    table_frame.columnconfigure(0, weight=1)
+
+    # ── status bar (packed before table so it always reserves space) ─────────
+    status_var = tk.StringVar(value="Ready")
+    status = ttk.Label(root, textvariable=status_var, anchor="w",
+                       relief="sunken", padding=(6, 2))
+    status.pack(fill="x", side="bottom")
+
+    # ── Claude chat panel (packed before table so it always gets its space) ──
+    _chat_font = (_arabic_font[0] if _arabic_font else "Menlo", 13)
+    chat_frame = ttk.LabelFrame(root, text="Claude Chat", padding=(6, 4))
+    chat_frame.pack(fill="x", side="bottom", padx=10, pady=(2, 2))
+
+    # terminal-style log: dark bg, light text
+    chat_log = tk.Text(
+        chat_frame, height=5, state="disabled", wrap="word",
+        font=_chat_font,
+        background="#1e1e1e", foreground="#d4d4d4",
+        insertbackground="#ffffff", relief="flat", borderwidth=0,
+    )
+    chat_log.pack(fill="x", expand=False, pady=(0, 4))
+    chat_log.tag_config("you",    foreground="#4fc1ff", font=(*_chat_font[:1], _chat_font[1], "bold"))
+    chat_log.tag_config("claude", foreground="#89d185")
+    chat_log.tag_config("err",    foreground="#f44747")
+    chat_log.tag_config("sys",    foreground="#808080")
+
+    chat_input_row = ttk.Frame(chat_frame)
+    chat_input_row.pack(fill="x")
+    chat_entry = tk.Entry(
+        chat_input_row,
+        font=_chat_font,
+        background="#2d2d2d", foreground="#d4d4d4",
+        insertbackground="#ffffff", relief="flat",
+        disabledbackground="#1e1e1e", disabledforeground="#555555",
+    )
+    chat_entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 4))
+    chat_send_btn = ttk.Button(chat_input_row, text="Send", width=8)
+    chat_send_btn.pack(side="left")
+
+    def _chat_has_key() -> bool:
+        return bool(_gui_state.get("api_key") or os.environ.get("ANTHROPIC_API_KEY"))
+
+    def _update_chat_state() -> None:
+        if _chat_has_key():
+            chat_entry.config(state="normal")
+            chat_send_btn.config(state="normal")
+        else:
+            chat_entry.config(state="disabled")
+            chat_send_btn.config(state="disabled")
+            chat_log.config(state="normal")
+            chat_log.insert("end", "system: Set an API key via 'API Key…' to use chat.\n", "sys")
+            chat_log.see("end")
+            chat_log.config(state="disabled")
+
+    def _append_chat(tag: str, prefix: str, text: str) -> None:
+        chat_log.config(state="normal")
+        chat_log.insert("end", f"{prefix}: {text}\n", tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+
+    def _send_chat(_event: object = None) -> None:
+        msg = chat_entry.get().strip()
+        if not msg:
+            return
+        api_key = str(_gui_state.get("api_key") or os.environ.get("ANTHROPIC_API_KEY") or "")
+        if not api_key:
+            return
+        chat_entry.delete(0, "end")
+        _append_chat("you", "you", msg)
+        chat_entry.config(state="disabled")
+        chat_send_btn.config(state="disabled")
+
+        def _worker() -> None:
+            try:
+                import anthropic as _ant
+                client = _ant.Anthropic(api_key=api_key)
+                resp = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": msg}],
+                )
+                from anthropic.types import TextBlock as _TB
+                reply = next((b.text for b in resp.content if isinstance(b, _TB)), "")
+                root.after(0, lambda: _append_chat("claude", "claude", reply))
+            except Exception as exc:
+                root.after(0, lambda: _append_chat("err", "error", str(exc)))
+            finally:
+                root.after(0, _update_chat_state)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    chat_send_btn.config(command=_send_chat)
+    chat_entry.bind("<Return>", _send_chat)
+    _update_chat_state()
+
+    # ── argument parsing for the files field ─────────────────────────────────
+    import shlex
+
+    def parse_files_field(text: str) -> List[str]:
+        text = text.strip()
+        if not text:
+            return []
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return [t for t in text.split() if t]
+
+    # ── search worker ────────────────────────────────────────────────────────
+    def _chat_log_fn(tag: str, prefix: str, text: str) -> None:
+        """Thread-safe bridge: schedule _append_chat on the main thread."""
+        root.after(0, lambda t=tag, p=prefix, x=text: _append_chat(t, p, x))
+
+    def worker(pattern: str, paths: List[str], case_sensitive: bool,
+               exact: bool, threshold: int, recursive: bool, ai: bool) -> None:
+        try:
+            files = collect_files(paths, recursive)
+            if not files:
+                msg_q.put(("error", "No files to search."))
+                return
+            results: Dict[str, Tuple[List[str], List[Match]]] = {}
+            for i, fp in enumerate(files, 1):
+                msg_q.put(("status", f"Searching {i}/{len(files)}: {fp}"))
+                if ai:
+                    _api_key = str(_gui_state.get("api_key") or os.environ.get("ANTHROPIC_API_KEY") or "")
+                    lines, matches = ai_search_file(fp, pattern, log_fn=_chat_log_fn, api_key=_api_key)
+                else:
+                    lines, matches = search_file(
+                        fp, pattern,
+                        case_sensitive=case_sensitive,
+                        exact_only=exact,
+                        threshold=threshold,
+                    )
+                if matches:
+                    results[fp] = (lines, matches)
+            msg_q.put(("done", results))
+        except Exception as e:
+            msg_q.put(("error", f"{type(e).__name__}: {e}"))
+
+    def start_search() -> None:
+        if state["searching"]:
+            return
+        pat = pattern_var.get().strip()
+        if not pat:
+            messagebox.showwarning("fuzzer", "Enter a search pattern.")
+            return
+        paths = parse_files_field(files_var.get())
+        if not paths:
+            messagebox.showwarning("fuzzer", "Pick at least one file or folder.")
+            return
+
+        thr = threshold_var.get()
+        if not 0 <= thr <= 100:
+            messagebox.showwarning("fuzzer", "Threshold must be 0-100.")
+            return
+
+        _gui_state["last_files"] = files_var.get()
+        # Prepend to history, deduplicate, cap at 30
+        if pat in _search_history:
+            _search_history.remove(pat)
+        _search_history.insert(0, pat)
+        del _search_history[30:]
+        pattern_entry.config(values=_search_history)
+        _gui_state["search_history"] = _search_history
+        _save_state(_gui_state)
+        state["searching"] = True
+        state["results"] = {}
+        state["pattern"] = pat
+        search_btn.config(state="disabled", text="Searching…")
+        export_btn.config(state="disabled")
+        tree.delete(*tree.get_children())
+        status_var.set("Starting…")
+
+        t = threading.Thread(
+            target=worker,
+            args=(pat, paths, case_var.get(), exact_var.get(),
+                  threshold_var.get(), recursive_var.get(), ai_var.get()),
+            daemon=True,
+        )
+        t.start()
+
+    _row_paths: Dict[str, str] = {}       # iid → full file path
+    _highlighted_pdfs: Dict[str, str] = {}  # original path → highlighted copy path
+
+    def _build_highlighted_pdf(fp: str, matches: List[Match]) -> str:
+        """Highlight matched lines in a PDF copy using line-number positioning.
+
+        For PDFs with non-standard Arabic glyph encodings, search_for() and
+        text comparison both fail. Instead we use the match's global line
+        number to compute its local index within the page, then look up the
+        exact bounding box from get_text("dict") and highlight that bbox.
+        """
+        try:
+            import fitz as _fitz
+            from difflib import SequenceMatcher
+            _tmp_dir = Path.home() / ".fuzzer_tmp"
+            _tmp_dir.mkdir(exist_ok=True)
+            _doc = _fitz.open(fp)
+            _pg_map = _pdf_page_map.get(fp, [])
+
+            # Group matches by page number (1-based)
+            _page_ms: Dict[int, List[Match]] = {}
+            for m in matches:
+                _page_ms.setdefault(m.page_num or 1, []).append(m)
+
+            for _pn, _ms in _page_ms.items():
+                if not (1 <= _pn <= len(_doc)):
+                    continue
+                _pg = _doc[_pn - 1]
+
+                # Collect all dict lines (text + bbox) in sorted order —
+                # same sort order as get_text("text", sort=True).
+                _pg_dict: dict = _pg.get_text("dict", sort=True)  # type: ignore[assignment]
+                _dict_lines: List[tuple] = []  # (text, bbox)
+                for _blk in _pg_dict.get("blocks", []):
+                    if _blk.get("type") != 0:
+                        continue
+                    for _ln in _blk.get("lines", []):
+                        _lt = "".join(s.get("text", "") for s in _ln.get("spans", []))
+                        _dict_lines.append((_lt.strip(), _ln.get("bbox")))
+
+                # get_text("text") lines for this page — used to skip blank lines
+                _pg_raw: str = _pg.get_text("text", sort=True)  # type: ignore[assignment]
+                _pg_text_lines = _pg_raw.splitlines()
+
+                for m in _ms:
+                    _gidx = m.line_num - 1  # 0-based global line index
+                    # Position within this page's raw text lines
+                    _pg_start = next(
+                        (i for i in range(len(_pg_map)) if _pg_map[i] == _pn), 0
+                    )
+                    _page_local_pos = _gidx - _pg_start
+                    # dict_lines skips blank lines; count only non-blank lines
+                    # before _page_local_pos to get the correct dict index
+                    _local_idx = sum(
+                        1 for line in _pg_text_lines[:_page_local_pos]
+                        if line.strip()
+                    )
+
+                    _bbox = None
+                    # Strategy 1: use computed local index directly
+                    if 0 <= _local_idx < len(_dict_lines):
+                        _bbox = _dict_lines[_local_idx][1]
+
+                    # Strategy 2: best fuzzy match among dict lines
+                    if not _bbox and m.line.strip():
+                        _best, _best_bbox = 0.0, None
+                        for _dt, _db in _dict_lines:
+                            _r = SequenceMatcher(None, m.line.strip(), _dt).ratio()
+                            if _r > _best:
+                                _best, _best_bbox = _r, _db
+                        if _best > 0.35:
+                            _bbox = _best_bbox
+
+                    if _bbox:
+                        _pg.add_highlight_annot(_fitz.Rect(_bbox))
+
+            _tmp = str(_tmp_dir / f"fuzzer_{os.getpid()}_{id(_doc)}.pdf")
+            _doc.save(_tmp)
+            _doc.close()
+            return _tmp
+        except Exception as _e:
+            status_var.set(f"Highlight failed: {_e}")
+            return fp
+
+    def populate(results: Dict[str, Tuple[List[str], List[Match]]]) -> None:
+        _row_paths.clear()
+        _highlighted_pdfs.clear()
+        total = 0
+        for fp, (_, matches) in results.items():
+            display_name = _fix_arabic(os.path.basename(fp))
+            for m in matches:
+                if m.score == 100:
+                    match_type, score_text = "exact", "100"
+                elif m.score == -1:
+                    match_type, score_text = "ai", ""
+                else:
+                    match_type, score_text = "fuzzy", str(m.score)
+                page_text = str(m.page_num) if m.page_num else ""
+                iid = tree.insert("", "end", values=(
+                    display_name, m.line_num, page_text, match_type, score_text,
+                    _fix_arabic(m.line.strip())))
+                _row_paths[iid] = fp
+                total += 1
+            # Pre-build highlighted copy for every PDF in results
+            if Path(fp).suffix.lower() == ".pdf":
+                _highlighted_pdfs[fp] = _build_highlighted_pdf(fp, matches)
+
+        n_files = len(results)
+        status_var.set(
+            f"{total} match{'es' if total != 1 else ''} "
+            f"in {n_files} file{'s' if n_files != 1 else ''}"
+        )
+
+    def poll_queue() -> None:
+        try:
+            while True:
+                kind, payload = msg_q.get_nowait()
+                if kind == "status":
+                    status_var.set(str(payload))
+                elif kind == "done":
+                    state["results"] = payload  # type: ignore[assignment]
+                    state["searching"] = False
+                    search_btn.config(state="normal", text="Search")
+                    if payload:
+                        populate(payload)  # type: ignore[arg-type]
+                        export_btn.config(state="normal")
+                    else:
+                        status_var.set("No matches found.")
+                        export_btn.config(state="disabled")
+                elif kind == "error":
+                    state["searching"] = False
+                    search_btn.config(state="normal", text="Search")
+                    status_var.set(f"Error: {payload}")
+                    messagebox.showerror("fuzzer", str(payload))
+        except queue.Empty:
+            pass
+        root.after(100, poll_queue)
+
+    def clear_results() -> None:
+        tree.delete(*tree.get_children())
+        _row_paths.clear()
+        state["results"] = {}
+        export_btn.config(state="disabled")
+        status_var.set("Ready")
+
+    def export_to_file() -> None:
+        results = state["results"]
+        if not results:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export results",
+            defaultextension=".xlsx",
+            filetypes=[
+                ("Excel workbook", "*.xlsx"),
+                ("CSV", "*.csv"),
+                ("TSV", "*.tsv"),
+                ("JSON", "*.json"),
+                ("Text", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            export_results(results, path, verbose=verbose_var.get())  # type: ignore[arg-type]
+            status_var.set(f"Exported to {path}")
+        except Exception as e:
+            messagebox.showerror("fuzzer", f"Export failed: {e}")
+
+    _editor_exts = {'.txt', '.md', '.py', '.js', '.ts', '.jsx', '.tsx',
+                    '.json', '.xml', '.html', '.htm', '.rst', '.csv',
+                    '.log', '.yaml', '.yml', '.toml', '.ini', '.cfg'}
+
+    def open_selected(event: object = None) -> None:
+        # Resolve iid: try click position first (reliable on double-click),
+        # then fall back to current selection.
+        iid = ""
+        if event is not None and hasattr(event, "y"):
+            iid = tree.identify_row(event.y) or ""  # type: ignore[attr-defined]
+        if not iid:
+            sel = tree.selection()
+            iid = sel[0] if sel else ""
+        if not iid:
+            return
+
+        filepath = _row_paths.get(iid, "")
+        if not filepath:
+            return
+
+        vals = tree.item(iid, "values")
+        # values order: (file, line, page, match, score, content)
+        try:
+            line_num = int(vals[1])
+        except (ValueError, IndexError):
+            line_num = 1
+        try:
+            page_num = int(vals[2]) if vals[2] else 0
+        except (ValueError, IndexError):
+            page_num = 0
+
+        import subprocess, shutil
+        ext = Path(filepath).suffix.lower()
+        try:
+            if ext == ".pdf":
+                open_page = page_num or 1
+                # Use the pre-built highlighted copy from populate(); fall back
+                # to original if not available (e.g. fitz not installed).
+                _tmp_path = _highlighted_pdfs.get(filepath, filepath)
+                _esc = _tmp_path.replace("\\", "\\\\").replace('"', '\\"')
+                _script = "\n".join([
+                    # Close any previously opened tmp PDFs before opening new one
+                    'tell application "Preview"',
+                    '  try',
+                    '    set toClose to {}',
+                    '    repeat with d in documents',
+                    '      if name of d starts with "tmp" then',
+                    '        copy d to end of toClose',
+                    '      end if',
+                    '    end repeat',
+                    '    repeat with d in toClose',
+                    '      close d saving no',
+                    '    end repeat',
+                    '  end try',
+                    'end tell',
+                    'tell application "Preview"',
+                    '  activate',
+                    f'  open POSIX file "{_esc}"',
+                    'end tell',
+                    'delay 1.5',
+                    f'if {open_page} > 1 then',
+                    '  tell application "System Events"',
+                    '    tell process "Preview"',
+                    '      click menu item "Go to Page…" of menu "Go" of menu bar 1',
+                    '      delay 0.6',
+                    '      set n to 0',
+                    '      repeat',
+                    '        delay 0.3',
+                    '        set n to n + 1',
+                    '        if n > 20 then exit repeat',
+                    '        try',
+                    '          tell sheet 1 of front window',
+                    f'            set value of text field 1 to "{open_page}"',
+                    '            click button "OK"',
+                    '          end tell',
+                    '          exit repeat',
+                    '        end try',
+                    '      end repeat',
+                    '    end tell',
+                    '  end tell',
+                    'end if',
+                ])
+                _as_proc = subprocess.run(
+                    ["osascript", "-e", _script],
+                    capture_output=True, text=True
+                )
+                if _as_proc.returncode != 0:
+                    _as_err = (_as_proc.stderr or _as_proc.stdout).strip()
+                    status_var.set(f"Open failed — {_as_err[:80]}")
+                    messagebox.showerror("fuzzer – open PDF", f"AppleScript error: {_as_err}")
+                else:
+                    hl_note = "" if _tmp_path != filepath else " (no highlight — fitz missing?)"
+                    status_var.set(f"Opened page {open_page} — {os.path.basename(filepath)}{hl_note}")
+            elif ext in _editor_exts:
+                if shutil.which("code"):
+                    subprocess.Popen(["code", "--goto", f"{filepath}:{line_num}"])
+                elif shutil.which("cursor"):
+                    subprocess.Popen(["cursor", "--goto", f"{filepath}:{line_num}"])
+                elif shutil.which("subl"):
+                    subprocess.Popen(["subl", f"{filepath}:{line_num}"])
+                else:
+                    subprocess.Popen(["open", filepath])
+                status_var.set(f"Opened line {line_num} — {os.path.basename(filepath)}")
+            else:
+                subprocess.Popen(["open", filepath])
+                status_var.set(f"Opened {os.path.basename(filepath)}")
+        except Exception as _ex:
+            status_var.set(f"Open failed: {_ex}")
+            messagebox.showerror("fuzzer", f"Could not open:\n{_ex}")
+
+    def set_api_key() -> None:
+        dlg = tk.Toplevel(root)
+        dlg.title("Claude API Key")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        ttk.Label(dlg, text="Paste your Anthropic API key:").pack(padx=16, pady=(12, 4))
+        key_var = tk.StringVar(value=str(_gui_state.get("api_key", "")))
+        key_entry = ttk.Entry(dlg, textvariable=key_var, width=52, show="*")
+        key_entry.pack(padx=16, pady=4)
+        show_var = tk.BooleanVar()
+        def _toggle_show() -> None:
+            key_entry.config(show="" if show_var.get() else "*")
+        ttk.Checkbutton(dlg, text="Show key", variable=show_var,
+                        command=_toggle_show).pack(anchor="w", padx=16)
+        def _save() -> None:
+            k = key_var.get().strip()
+            _gui_state["api_key"] = k
+            _save_state(_gui_state)
+            os.environ["ANTHROPIC_API_KEY"] = k
+            dlg.destroy()
+            _update_chat_state()
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(pady=(8, 12))
+        ttk.Button(btn_row, text="Save", command=_save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left", padx=4)
+        key_entry.focus_set()
+        dlg.bind("<Return>", lambda _e: _save())
+
+    search_btn.config(command=start_search)
+    clear_btn.config(command=clear_results)
+    export_btn.config(command=export_to_file)
+    apikey_btn.config(command=set_api_key)
+    tree.bind("<Double-1>", open_selected)
+    tree.bind("<Return>", open_selected)
+    pattern_entry.bind("<Return>", lambda _e: start_search())
+    files_entry.bind("<Return>", lambda _e: start_search())
+
+    pattern_entry.focus_set()
+    root.after(100, poll_queue)
+    root.mainloop()
+    return 0
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def main(argv: Optional[List[str]] = None) -> int:
+    global _color_on
+
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if not raw_argv or "--gui" in raw_argv:
+        return run_gui()
+
+    ap = argparse.ArgumentParser(
+        prog="fuzzer",
+        description=(
+            "Search file contents for a word or phrase.\n"
+            "Case-insensitive and fuzzy matching are ON by default.\n"
+            "Supported: .txt .md .pdf .docx .doc .csv .log .json .xml .html .rst"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  fuzzer "climate change" report.pdf
+  fuzzer -v "global warming" thesis.pdf          full sentence around match
+  fuzzer -k "CaseSensitive" notes.txt            case-sensitive mode
+  fuzzer -e "exact phrase" notes.txt             exact match (no fuzzy)
+  fuzzer -t 70 "aproximate" *.txt                lower fuzzy threshold
+  fuzzer -C 2 "keyword" chapter.txt              2 lines of context
+  fuzzer -r "topic" ./docs/                      recursive search
+  fuzzer -a "renewable energy trends" paper.pdf  AI semantic search
+  fuzzer -o hits.csv  "topic" *.pdf              export to CSV
+  fuzzer -o hits.xlsx "topic" *.pdf              export to Excel
+  fuzzer -o hits.json "topic" *.pdf              export to JSON
+  fuzzer --gui                                   launch graphical interface
+  fuzzer                                         (no args also launches the GUI)
+""",
+    )
+    ap.add_argument("pattern", help="word or phrase to search for")
+    ap.add_argument("files", nargs="+", metavar="FILE",
+                    help="files or directories to search")
+
+    grp = ap.add_argument_group("matching options")
+    grp.add_argument("-k", "--case-sensitive", action="store_true",
+                     help="case-sensitive search (default: ignore case)")
+    grp.add_argument("-e", "--exact", action="store_true",
+                     help="exact match only — disable fuzzy")
+    grp.add_argument("-t", "--threshold", type=int, default=80, metavar="N",
+                     help="fuzzy similarity threshold 0-100 (default: 80)")
+    grp.add_argument("-a", "--ai", action="store_true",
+                     help="AI semantic search via Claude (needs ANTHROPIC_API_KEY)")
+
+    grp2 = ap.add_argument_group("output options")
+    grp2.add_argument("-v", "--verbose", action="store_true",
+                      help="show full sentence containing each match")
+    grp2.add_argument("-C", "--context", type=int, default=0, metavar="N",
+                      help="lines of context around each match (default: 0)")
+    grp2.add_argument("-l", "--files-only", action="store_true",
+                      help="print only filenames with matches")
+    grp2.add_argument("-n", "--no-line-numbers", action="store_true",
+                      help="suppress line numbers")
+    grp2.add_argument("-r", "--recursive", action="store_true",
+                      help="recurse into directories")
+    grp2.add_argument("--no-color", action="store_true",
+                      help="disable coloured output")
+    grp2.add_argument("-o", "--output", metavar="FILE",
+                      help="export results to FILE "
+                           "(format auto-detected: .csv .tsv .json .txt .xlsx)")
+
+    args = ap.parse_args(argv)
+
+    if not 0 <= args.threshold <= 100:
+        ap.error("--threshold must be 0-100")
+
+    _color_on = not args.no_color and sys.stdout.isatty()
+
+    files = collect_files(args.files, args.recursive)
+    if not files:
+        print("error: no files to search", file=sys.stderr)
+        return 2
+
+    results: Dict[str, Tuple[List[str], List[Match]]] = {}
+
+    for fp in files:
+        if args.ai:
+            lines, matches = ai_search_file(fp, args.pattern)
+        else:
+            lines, matches = search_file(
+                fp, args.pattern,
+                case_sensitive=args.case_sensitive,
+                exact_only=args.exact,
+                threshold=args.threshold,
+            )
+        if matches:
+            results[fp] = (lines, matches)
+
+    if not results:
+        print(_c(_YEL) + "no matches found" + _r(), file=sys.stderr)
+        return 1
+
+    total = print_results(
+        results,
+        pattern=args.pattern,
+        case_sensitive=args.case_sensitive,
+        files_only=args.files_only,
+        show_nums=not args.no_line_numbers,
+        context_lines=args.context,
+        verbose=args.verbose,
+        ai_mode=args.ai,
+    )
+
+    if args.output:
+        export_results(results, args.output, verbose=args.verbose)
+
+    n_files = len(results)
+    summary = (
+        f"\n{total} match{'es' if total != 1 else ''} "
+        f"in {n_files} file{'s' if n_files != 1 else ''}"
+    )
+    print(_c(_CYN) + summary + _r(), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
