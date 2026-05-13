@@ -143,6 +143,25 @@ def read_lines(fp: str) -> Optional[List[str]]:
     fn = _EXT_MAP.get(ext, _extract_plain)
     return fn(fp)
 
+# ── Arabic text normalization ──────────────────────────────────────────────────
+
+_AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")  # short vowels + tatweel (kashida)
+_ALEF_VARIANTS = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
+_YEH_VARIANTS = str.maketrans({"ى": "ي", "ئ": "ي"})
+
+def _normalize_arabic(s: str) -> str:
+    """Strip tatweel, diacritics, and normalize alef/yeh variants for fuzzy
+    matching. Leaves non-Arabic chars untouched."""
+    s = _AR_DIACRITICS.sub("", s)
+    s = s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
+    return s
+
+_TOKEN_RE = re.compile(r"[؀-ۿa-zA-Z0-9]+")
+
+def _tokenize(s: str, min_len: int = 2) -> set:
+    """Tokenize a string into normalized words ≥ min_len chars."""
+    return {t for t in _TOKEN_RE.findall(_normalize_arabic(s)) if len(t) >= min_len}
+
 # ── sentence extraction ────────────────────────────────────────────────────────
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
@@ -586,12 +605,44 @@ def run_gui() -> int:
 
     _gui_state = _load_state()
 
+    # Clean up old highlighted PDFs from previous sessions (>1 day old)
+    try:
+        import time as _time
+        _tmp_dir = Path.home() / ".fuzzer_tmp"
+        if _tmp_dir.is_dir():
+            _now = _time.time()
+            for _f in _tmp_dir.glob("fuzzer_*.pdf"):
+                try:
+                    if _now - _f.stat().st_mtime > 86400:  # 24h
+                        _f.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
     # tkinter Treeview cells are always LTR containers, so we need
     # bidi.get_display() to reorder Arabic words for correct visual order.
     # On macOS, CoreText handles letter-level shaping (connecting glyphs)
     # from raw Unicode, so arabic_reshaper is NOT needed and would fight
     # CoreText. On other platforms both reshaper + bidi are required.
     import platform as _platform
+
+    # macOS: pre-set Preview's saved window frame so PDFs open directly at
+    # 1000x720 with no resize flash. Uses `defaults write` against Preview's
+    # main PDF window frame key.
+    if _platform.system() == "Darwin":
+        try:
+            import subprocess as _sp
+            _frame = "120 80 1000 720 0 0 1920 1080 "
+            _sp.run(
+                ["defaults", "write", "com.apple.Preview",
+                 "NSWindow Frame PVMainPDFWindow", _frame],
+                capture_output=True, check=False,
+            )
+        except Exception:
+            pass
+
     _bidi_display = None
     _arabic_reshaper = None
     try:
@@ -603,16 +654,69 @@ def run_gui() -> int:
     except ImportError:
         pass
 
+    _WS_RUN = re.compile(r"\s+")
+    _HAS_ARABIC = re.compile(r"[؀-ۿ]")
+    # Mirror pairs — bidi RTL rendering flips these visually. Pre-swap them in
+    # the logical string so the rendered output reads correctly left-to-right.
+    _BIDI_MIRROR = str.maketrans({"(": ")", ")": "(", "[": "]", "]": "[",
+                                  "{": "}", "}": "{", "<": ">", ">": "<"})
+    # Some Arabic PDFs encode the definite article ال as ا+م+ل (positions 1-2
+    # swapped). Detect at word start and swap back. ا (0x627) is matched, but
+    # not أ/إ/آ — those are different alef variants for which "أم"/"إم" are
+    # legitimate word starts.
+    _AL_SWAP = re.compile(r"(?<![ء-ي])امل")
+
     def _fix_arabic(text: str) -> str:
         if not text:
             return text
+        # Collapse runs of whitespace — PyMuPDF sort=True often inserts
+        # huge stretches of spaces between visually-separated segments,
+        # which creates ugly leading gaps in the Treeview content column.
+        text = _WS_RUN.sub(" ", text).strip()
+        # Fix broken-encoding ا+م+ل → ا+ل+م at word starts
+        text = _AL_SWAP.sub("الم", text)
         if _platform.system() == "Darwin":
             # PyMuPDF returns logical-order Unicode; CoreText + Geeza Pro
             # handles RTL shaping and bidi rendering natively in tkinter.
+            # For mixed Arabic text, pre-swap mirror pairs so brackets read
+            # visually correct after bidi mirroring.
+            if _HAS_ARABIC.search(text):
+                text = text.translate(_BIDI_MIRROR)
             return text
         else:
             reshaped = _arabic_reshaper.reshape(text) if _arabic_reshaper else text
             return _bidi_display(reshaped, base_dir='R') if _bidi_display else reshaped
+
+    def _line_context(line: str, query: str, around: int = 6) -> str:
+        """Return a snippet of `line` centered on the token best matching
+        `query`. PyMuPDF's sort=True extraction can lump text from many
+        visual lines into one logical line; this trims the displayed
+        content down to the matched word plus N tokens on each side."""
+        from difflib import SequenceMatcher as _SM
+        if not line:
+            return line
+        tokens = line.split()
+        if not tokens:
+            return line
+        q_norm = _normalize_arabic((query or "").strip())
+        if not q_norm:
+            return " ".join(tokens)
+        best_idx, best_score = 0, 0.0
+        for i, t in enumerate(tokens):
+            s = _SM(None, q_norm, _normalize_arabic(t)).ratio()
+            if s > best_score:
+                best_idx, best_score = i, s
+        if best_score < 0.4:
+            # No clear match — fall back to a leading chunk
+            return " ".join(tokens[: around * 2 + 1]) + (" …" if len(tokens) > around * 2 + 1 else "")
+        lo = max(0, best_idx - around)
+        hi = min(len(tokens), best_idx + around + 1)
+        snippet = " ".join(tokens[lo:hi])
+        if lo > 0:
+            snippet = "… " + snippet
+        if hi < len(tokens):
+            snippet = snippet + " …"
+        return snippet
 
     class _Tooltip:
         def __init__(self, widget: tk.Widget, text: str) -> None:
@@ -640,7 +744,62 @@ def run_gui() -> int:
 
     root = tk.Tk()
     root.title("fuzzer")
-    root.geometry("1100x680")
+    root.geometry("1150x720")
+
+    # ── theme + styling ──────────────────────────────────────────────────────
+    _BG       = "#f4f5f7"
+    _CARD_BG  = "#ffffff"
+    _BORDER   = "#dcdfe3"
+    _TEXT     = "#1c1e22"
+    _MUTED    = "#5f6571"
+    _ACCENT   = "#2563eb"
+    _ROW_ALT  = "#f7f9fc"
+    _SEL_BG   = "#dbeafe"
+    _ui_font_family = "Helvetica Neue" if _platform.system() == "Darwin" else "Helvetica"
+
+    root.configure(background=_BG)
+    _style = ttk.Style()
+    try:
+        _style.theme_use("clam")  # consistent across platforms; honours colours
+    except tk.TclError:
+        pass
+    _style.configure(".", background=_BG, foreground=_TEXT,
+                     font=(_ui_font_family, 12))
+    _style.configure("TFrame", background=_BG)
+    _style.configure("TLabel", background=_BG, foreground=_TEXT)
+    _style.configure("TLabelframe", background=_BG, foreground=_MUTED,
+                     borderwidth=1, relief="solid")
+    _style.configure("TLabelframe.Label", background=_BG, foreground=_MUTED,
+                     font=(_ui_font_family, 11, "bold"))
+    _style.configure("TCheckbutton", background=_BG, foreground=_TEXT)
+    _style.configure("TEntry", fieldbackground=_CARD_BG, foreground=_TEXT,
+                     bordercolor=_BORDER, lightcolor=_BORDER, darkcolor=_BORDER,
+                     padding=4)
+    _style.configure("TCombobox", fieldbackground=_CARD_BG, foreground=_TEXT,
+                     bordercolor=_BORDER, padding=4, arrowsize=14)
+    _style.configure("TSpinbox", fieldbackground=_CARD_BG, foreground=_TEXT,
+                     bordercolor=_BORDER, padding=2)
+    _style.configure("TButton", background=_CARD_BG, foreground=_TEXT,
+                     bordercolor=_BORDER, padding=(10, 5))
+    _style.map("TButton",
+               background=[("active", "#eef2ff"), ("pressed", "#e0e7ff")],
+               foreground=[("disabled", _MUTED)])
+    _style.configure("Accent.TButton",
+                     background=_ACCENT, foreground="#ffffff",
+                     bordercolor=_ACCENT, padding=(12, 6),
+                     font=(_ui_font_family, 12, "bold"))
+    _style.map("Accent.TButton",
+               background=[("active", "#1e54d6"), ("pressed", "#1a4cc4")])
+    _style.configure("Treeview",
+                     background=_CARD_BG, fieldbackground=_CARD_BG,
+                     foreground=_TEXT, bordercolor=_BORDER, rowheight=30)
+    _style.map("Treeview", background=[("selected", _SEL_BG)],
+               foreground=[("selected", _TEXT)])
+    _style.configure("Treeview.Heading",
+                     background="#eef0f4", foreground=_TEXT,
+                     bordercolor=_BORDER, relief="flat", padding=(8, 6),
+                     font=(_ui_font_family, 11, "bold"))
+    _style.map("Treeview.Heading", background=[("active", "#e4e7ed")])
 
     state: Dict[str, object] = {
         "results": {},   # Dict[str, Tuple[List[str], List[Match]]]
@@ -656,8 +815,8 @@ def run_gui() -> int:
     pattern_var = tk.StringVar()
     _search_history: List[str] = [str(x) for x in _gui_state.get("search_history", [])]  # type: ignore[arg-type]
     pattern_entry = ttk.Combobox(form, textvariable=pattern_var, values=_search_history,
-                                 justify="right")
-    pattern_entry.grid(row=0, column=1, columnspan=4, sticky="ew", padx=4, pady=2)
+                                 justify="right", width=40)
+    pattern_entry.grid(row=0, column=1, sticky="w", padx=4, pady=2)
 
     ttk.Label(form, text="Files/folders:").grid(row=1, column=0, sticky="w")
     files_var = tk.StringVar(value=str(_gui_state.get("last_files", "")))
@@ -688,11 +847,11 @@ def run_gui() -> int:
     opts = ttk.Frame(form)
     opts.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
-    case_var = tk.BooleanVar()
-    exact_var = tk.BooleanVar()
-    recursive_var = tk.BooleanVar()
-    ai_var = tk.BooleanVar()
-    verbose_var = tk.BooleanVar()
+    case_var      = tk.BooleanVar(value=bool(_gui_state.get("case_sensitive", False)))
+    exact_var     = tk.BooleanVar(value=bool(_gui_state.get("exact_only",     False)))
+    recursive_var = tk.BooleanVar(value=bool(_gui_state.get("recursive",      False)))
+    ai_var        = tk.BooleanVar(value=bool(_gui_state.get("ai_mode",        False)))
+    verbose_var   = tk.BooleanVar(value=bool(_gui_state.get("verbose",        False)))
 
     _opt_tooltips = [
         ("Case-sensitive",    case_var,      "Match uppercase/lowercase exactly"),
@@ -708,7 +867,8 @@ def run_gui() -> int:
 
     _thr_lbl = ttk.Label(opts, text="  Threshold:")
     _thr_lbl.pack(side="left")
-    threshold_var = tk.IntVar(value=80)
+    _thr_saved = _gui_state.get("threshold", 80)
+    threshold_var = tk.IntVar(value=int(_thr_saved) if isinstance(_thr_saved, (int, str)) else 80)
     _thr_spin = ttk.Spinbox(opts, from_=0, to=100, textvariable=threshold_var, width=5)
     _thr_spin.pack(side="left", padx=4)
     _Tooltip(_thr_lbl, "Minimum fuzzy similarity score (0 = anything, 100 = exact only)")
@@ -718,7 +878,7 @@ def run_gui() -> int:
     actions = ttk.Frame(form)
     actions.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
 
-    search_btn = ttk.Button(actions, text="Search")
+    search_btn = ttk.Button(actions, text="Search", style="Accent.TButton")
     search_btn.pack(side="left", padx=2)
     clear_btn = ttk.Button(actions, text="Clear results")
     clear_btn.pack(side="left", padx=2)
@@ -766,6 +926,8 @@ def run_gui() -> int:
     vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
     tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    tree.tag_configure("odd", background=_ROW_ALT)
+    tree.tag_configure("even", background=_CARD_BG)
     tree.grid(row=0, column=0, sticky="nsew")
     vsb.grid(row=0, column=1, sticky="ns")
     hsb.grid(row=1, column=0, sticky="ew")
@@ -933,6 +1095,13 @@ def run_gui() -> int:
         del _search_history[30:]
         pattern_entry.config(values=_search_history)
         _gui_state["search_history"] = _search_history
+        # Persist option flags
+        _gui_state["case_sensitive"] = case_var.get()
+        _gui_state["exact_only"]     = exact_var.get()
+        _gui_state["recursive"]      = recursive_var.get()
+        _gui_state["ai_mode"]        = ai_var.get()
+        _gui_state["verbose"]        = verbose_var.get()
+        _gui_state["threshold"]      = threshold_var.get()
         _save_state(_gui_state)
         state["searching"] = True
         state["results"] = {}
@@ -954,20 +1123,17 @@ def run_gui() -> int:
     _highlighted_pdfs: Dict[str, str] = {}  # original path → highlighted copy path
 
     def _build_highlighted_pdf(fp: str, matches: List[Match]) -> str:
-        """Highlight matched lines in a PDF copy using line-number positioning.
-
-        For PDFs with non-standard Arabic glyph encodings, search_for() and
-        text comparison both fail. Instead we use the match's global line
-        number to compute its local index within the page, then look up the
-        exact bounding box from get_text("dict") and highlight that bbox.
-        """
+        """Highlight matched lines in a PDF copy. For complex layouts (RTL,
+        multi-column), the dict and text outputs from PyMuPDF reorder words
+        differently, so we match by normalized token overlap rather than
+        positional indexing. Falls back to query-token search when the matched
+        line is a long concatenation of many visual lines."""
         try:
             import fitz as _fitz
             from difflib import SequenceMatcher
             _tmp_dir = Path.home() / ".fuzzer_tmp"
             _tmp_dir.mkdir(exist_ok=True)
             _doc = _fitz.open(fp)
-            _pg_map = _pdf_page_map.get(fp, [])
 
             # Group matches by page number (1-based)
             _page_ms: Dict[int, List[Match]] = {}
@@ -979,8 +1145,7 @@ def run_gui() -> int:
                     continue
                 _pg = _doc[_pn - 1]
 
-                # Collect all dict lines (text + bbox) in sorted order —
-                # same sort order as get_text("text", sort=True).
+                # Collect all dict lines (text + bbox) in sorted order
                 _pg_dict: dict = _pg.get_text("dict", sort=True)  # type: ignore[assignment]
                 _dict_lines: List[tuple] = []  # (text, bbox)
                 for _blk in _pg_dict.get("blocks", []):
@@ -990,41 +1155,64 @@ def run_gui() -> int:
                         _lt = "".join(s.get("text", "") for s in _ln.get("spans", []))
                         _dict_lines.append((_lt.strip(), _ln.get("bbox")))
 
-                # get_text("text") lines for this page — used to skip blank lines
-                _pg_raw: str = _pg.get_text("text", sort=True)  # type: ignore[assignment]
-                _pg_text_lines = _pg_raw.splitlines()
+                # Pre-tokenize + normalize dict lines once per page
+                _dict_lines_aug = [
+                    (_t, _b, _tokenize(_t), _normalize_arabic(_t))
+                    for (_t, _b) in _dict_lines
+                ]
+                _q_norm = _normalize_arabic(pattern_var.get().strip())
 
                 for m in _ms:
-                    _gidx = m.line_num - 1  # 0-based global line index
-                    # Position within this page's raw text lines
-                    _pg_start = next(
-                        (i for i in range(len(_pg_map)) if _pg_map[i] == _pn), 0
-                    )
-                    _page_local_pos = _gidx - _pg_start
-                    # dict_lines skips blank lines; count only non-blank lines
-                    # before _page_local_pos to get the correct dict index
-                    _local_idx = sum(
-                        1 for line in _pg_text_lines[:_page_local_pos]
-                        if line.strip()
-                    )
+                    _q_line = m.line.strip()
+                    _q_tokens = _tokenize(_q_line)
+                    _added = False
 
-                    _bbox = None
-                    # Strategy 1: use computed local index directly
-                    if 0 <= _local_idx < len(_dict_lines):
-                        _bbox = _dict_lines[_local_idx][1]
+                    # Strategy 1: token-overlap match against full matched line.
+                    # Order-independent — handles RTL/Arabic where dict and text
+                    # outputs reorder words. Picks the dict line(s) covering
+                    # ≥60% of the query line's tokens.
+                    if _q_tokens:
+                        _hits: List = []
+                        for _dt, _db, _d_tokens, _d_norm in _dict_lines_aug:
+                            if not _d_tokens:
+                                continue
+                            _coverage = len(_q_tokens & _d_tokens) / len(_q_tokens)
+                            if _coverage >= 0.60:
+                                _hits.append((_coverage, _db))
+                        if _hits:
+                            _hits.sort(reverse=True, key=lambda x: x[0])
+                            _top = _hits[0][0]
+                            for _cov, _bb in _hits:
+                                if _cov >= _top - 0.05:
+                                    _pg.add_highlight_annot(_fitz.Rect(_bb))
+                                    _added = True
 
-                    # Strategy 2: best fuzzy match among dict lines
-                    if not _bbox and m.line.strip():
-                        _best, _best_bbox = 0.0, None
-                        for _dt, _db in _dict_lines:
-                            _r = SequenceMatcher(None, m.line.strip(), _dt).ratio()
+                    # Strategy 2: per-token fuzzy match against the query.
+                    # For PDFs with broken character encoding (e.g. ا+م+ل swap),
+                    # strict substring fails. Use the same per-token fuzzy
+                    # comparison the search itself uses — find dict lines with
+                    # any token at ≥70% similarity to the normalized query.
+                    if not _added and _q_norm:
+                        for _dt, _db, _d_tokens, _d_norm in _dict_lines_aug:
+                            for _tok in _d_tokens:
+                                if SequenceMatcher(None, _q_norm, _tok).ratio() >= 0.70:
+                                    _pg.add_highlight_annot(_fitz.Rect(_db))
+                                    _added = True
+                                    break
+
+                    # Strategy 3: SequenceMatcher fuzzy fallback against the
+                    # full query line, normalized
+                    if not _added and _q_line:
+                        _qs_norm = _normalize_arabic(_q_line)
+                        _best, _best_bbox = 0.55, None
+                        for _dt, _db, _d_tokens, _d_norm in _dict_lines_aug:
+                            if not _d_norm:
+                                continue
+                            _r = SequenceMatcher(None, _qs_norm, _d_norm).ratio()
                             if _r > _best:
                                 _best, _best_bbox = _r, _db
-                        if _best > 0.35:
-                            _bbox = _best_bbox
-
-                    if _bbox:
-                        _pg.add_highlight_annot(_fitz.Rect(_bbox))
+                        if _best_bbox:
+                            _pg.add_highlight_annot(_fitz.Rect(_best_bbox))
 
             _tmp = str(_tmp_dir / f"fuzzer_{os.getpid()}_{id(_doc)}.pdf")
             _doc.save(_tmp)
@@ -1048,9 +1236,11 @@ def run_gui() -> int:
                 else:
                     match_type, score_text = "fuzzy", str(m.score)
                 page_text = str(m.page_num) if m.page_num else ""
+                _tag = "odd" if total % 2 else "even"
+                _snippet = _line_context(m.line, pattern_var.get())
                 iid = tree.insert("", "end", values=(
                     display_name, m.line_num, page_text, match_type, score_text,
-                    _fix_arabic(m.line.strip())))
+                    _fix_arabic(_snippet)), tags=(_tag,))
                 _row_paths[iid] = fp
                 total += 1
             # Pre-build highlighted copy for every PDF in results
@@ -1159,36 +1349,36 @@ def run_gui() -> int:
                 # to original if not available (e.g. fitz not installed).
                 _tmp_path = _highlighted_pdfs.get(filepath, filepath)
                 _esc = _tmp_path.replace("\\", "\\\\").replace('"', '\\"')
+
+                # Open + resize + navigate via ⌘⌥G keyboard shortcut
                 _script = "\n".join([
-                    # Close any previously opened tmp PDFs before opening new one
-                    'tell application "Preview"',
-                    '  try',
-                    '    set toClose to {}',
-                    '    repeat with d in documents',
-                    '      if name of d starts with "tmp" then',
-                    '        copy d to end of toClose',
-                    '      end if',
-                    '    end repeat',
-                    '    repeat with d in toClose',
-                    '      close d saving no',
-                    '    end repeat',
-                    '  end try',
-                    'end tell',
                     'tell application "Preview"',
                     '  activate',
                     f'  open POSIX file "{_esc}"',
                     'end tell',
-                    'delay 1.5',
+                    'delay 0.35',
+                    'try',
+                    '  tell application "System Events"',
+                    '    tell process "Preview"',
+                    '      tell front window',
+                    '        if value of attribute "AXMinimized" is true then',
+                    '          set value of attribute "AXMinimized" to false',
+                    '        end if',
+                    '        set position to {120, 80}',
+                    '        set size to {1000, 720}',
+                    '      end tell',
+                    '    end tell',
+                    '  end tell',
+                    'end try',
                     f'if {open_page} > 1 then',
                     '  tell application "System Events"',
                     '    tell process "Preview"',
-                    '      click menu item "Go to Page…" of menu "Go" of menu bar 1',
-                    '      delay 0.6',
+                    '      keystroke "g" using {command down, option down}',
                     '      set n to 0',
                     '      repeat',
-                    '        delay 0.3',
+                    '        delay 0.06',
                     '        set n to n + 1',
-                    '        if n > 20 then exit repeat',
+                    '        if n > 30 then exit repeat',
                     '        try',
                     '          tell sheet 1 of front window',
                     f'            set value of text field 1 to "{open_page}"',
