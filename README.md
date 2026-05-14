@@ -5,7 +5,10 @@ Arabic-aware, with optional Claude-powered semantic search and a grounded
 chat panel.
 
 ```sh
-# install deps, build native extension, run tests
+# one-shot setup on a fresh machine (Python deps + native build + smoke test)
+./install.sh                  # add --with-docs / --with-corpus / --user as needed
+
+# or, if you prefer make:
 make install build-native test
 
 # fastest way to try it
