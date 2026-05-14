@@ -1,0 +1,71 @@
+sequenceDiagram
+    actor "User"
+    participant "GUI" as "Tkinter GUI"
+    participant "Worker" as "Search Thread"
+    participant "Fuzzer" as "Search Functions"
+    participant "Cache" as "SQLite Cache"
+    participant "Preview" as "System Preview"
+    participant "Clipboard" as "Clipboard"
+
+    "User"->>"GUI": Enter pattern\nPick files/folders\nToggle options (case/exact/threshold/recursive/AI)
+    "User"->>"GUI": Click Search
+
+    GUI->>GUI: Read form state\nPersist options + search history
+    GUI->>Fuzzer: collect_files(paths, recursive)
+    Fuzzer-->>GUI: List of matched file paths
+
+    GUI->>Worker: Start background search thread
+    activate "Worker"
+
+    loop "For each file"
+        "Worker"->>"Fuzzer": read_lines(fp)
+        alt "Cache hit"
+            "Fuzzer"->>"Cache": _cache_get(fp)
+            "Cache"-->>"Fuzzer": lines + page_nums
+        else "Cache miss"
+            "Fuzzer"->>"Fuzzer": Detect extension via _EXT_MAP
+            alt "PDF"
+                "Fuzzer"->>"Fuzzer": _extract_pdf(fp)\n(PyMuPDF or pdfplumber)
+            else "DOCX/DOC"
+                "Fuzzer"->>"Fuzzer": _extract_docx(fp)
+            else "Plain text"
+                "Fuzzer"->>"Fuzzer": _extract_plain(fp)
+            end
+            "Fuzzer"->>"Cache": _cache_put(fp, lines, page_nums)
+        end
+
+        alt "AI mode"
+            "Worker"->>"Fuzzer": ai_search_file(fp, query, log_fn)
+            "Fuzzer"->>"Fuzzer": Build prompt + truncate if needed
+            "Fuzzer"-->>"Worker": matches (score=-1)
+        else "Traditional search"
+            "Worker"->>"Fuzzer": search_file(fp, pattern, options)
+            "Fuzzer"->>"Fuzzer": exact + fuzzy_score per line
+            "Fuzzer"-->>"Worker": matches (score=100 or fuzzy%)
+        end
+
+        "Worker"->>"GUI": msg_q: done/results OR status updates
+        GUI->>GUI: root.after(...) update table rows
+    end
+
+    deactivate "Worker"
+
+    "GUI"->>"GUI": Enable Export… if any matches
+
+    "User"->>"GUI": Hover Content column
+    GUI->>GUI: Show hover tooltip with full match line
+
+    "User"->>"GUI": Select a row
+    GUI->>GUI: Update selected-match preview bar
+
+    "User"->>"GUI": Press Ctrl+C
+    GUI->>Clipboard: Copy selected match text\n(file:line + snippet + tags)
+
+    "User"->>"GUI": Double-click a row
+    GUI->>Preview: Open PDF page at matched page\n(with highlights if available)
+    GUI-->>"User": Status updates
+
+    "User"->>"GUI": Click Export…
+    GUI->>Fuzzer: export_results(results, out_path, verbose)
+    Fuzzer-->>GUI: Export complete
+    GUI-->>"User": Show exported path

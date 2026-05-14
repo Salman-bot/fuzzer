@@ -1,0 +1,67 @@
+sequenceDiagram
+    actor "User"
+    participant "GUI" as "Tkinter GUI"
+    participant "Worker" as "Search Thread"
+    participant "Fuzzer" as "Search Functions"
+    participant "Anthropic" as "Anthropic API"
+    participant "Cache" as "SQLite Cache"
+
+    "User"->>"GUI": "Enter pattern, select files/folders, enable AI mode"
+    "User"->>"GUI": "Click Search"
+
+    "GUI"->>"GUI": "Read form state (pattern, files, options)"
+    "GUI"->>"Fuzzer": "collect_files(paths, recursive)"
+    "Fuzzer"-->>"GUI": "List of file paths"
+
+    "GUI"->>"Worker": "Start background search thread"
+    activate "Worker"
+
+    loop "For each file"
+        "Worker"->>"Fuzzer": "read_lines(fp)"
+        alt "Cache hit"
+            "Fuzzer"->>"Cache": "_cache_get(fp)"
+            "Cache"-->>"Fuzzer": "(lines, page_nums)"
+        else "Cache miss"
+            "Fuzzer"->>"Fuzzer": "Detect extension via _EXT_MAP"
+            alt "PDF"
+                "Fuzzer"->>"Fuzzer": "_extract_pdf(fp)"
+            else "DOCX"
+                "Fuzzer"->>"Fuzzer": "_extract_docx(fp)"
+            else "Plain text"
+                "Fuzzer"->>"Fuzzer": "_extract_plain(fp)"
+            end
+            "Fuzzer"->>"Cache": "_cache_put(fp, lines, page_nums)"
+        end
+
+        alt "AI mode enabled"
+            "Worker"->>"Fuzzer": "ai_search_file(fp, query, log_fn, api_key)"
+            activate "Fuzzer"
+            "Fuzzer"->>"Anthropic": "messages.create(model, prompt)"
+            "Anthropic"-->>"Fuzzer": "JSON with line numbers"
+            "Fuzzer"->>"Fuzzer": "Parse JSON → matches (score=-1)"
+            "Fuzzer"-->>"Worker": "(lines, matches)"
+            deactivate "Fuzzer"
+        else "Traditional search"
+            "Worker"->>"Fuzzer": "search_file(fp, pattern, options)"
+            activate "Fuzzer"
+            "Fuzzer"->>"Fuzzer": "fuzzy_score()/exact checks per line"
+            "Fuzzer"-->>"Worker": "(lines, matches)"
+            deactivate "Fuzzer"
+        end
+
+        "Worker"->>"GUI": "Post progress/messages via msg_q"
+        "GUI"->>"GUI": "root.after(...) update table"
+    end
+
+    deactivate "Worker"
+
+    "GUI"->>"GUI": "Store results, enable Export…"
+
+    "User"->>"GUI": "Click Export…"
+    "GUI"->>"Fuzzer": "export_results(results, out_path, verbose)"
+    activate "Fuzzer"
+    "Fuzzer"->>"Fuzzer": "_build_rows(...) and write file"
+    "Fuzzer"-->>"GUI": "Export complete"
+    deactivate "Fuzzer"
+
+    "GUI"-->>"User": "Show exported file path / completion"

@@ -1,0 +1,16 @@
+rule_settings:
+  enable:
+    - default
+  disable:
+    - no-loop-in-tests
+    - no-conditionals-in-tests
+
+ignore:
+  - .venv/
+  - native/
+  - "*.so"
+  - tools/
+  - doc/
+
+metrics:
+  quality_threshold: 0.0

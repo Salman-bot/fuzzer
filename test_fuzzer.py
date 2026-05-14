@@ -240,8 +240,7 @@ class TestPdfHighlighting:
 
         doc = fitz.open(simple_pdf)
         pg = doc[0]
-        quads = pg.search_for("Subject", quads=True)
-        if quads:
+        if quads := pg.search_for("Subject", quads=True):
             pg.add_highlight_annot(quads)
             fd, tmp = tf.mkstemp(suffix=".pdf")
             os.close(fd)
@@ -343,6 +342,35 @@ class TestVisualHighlight:
         doc.close()
         return str(fp)
 
+    @staticmethod
+    def _collect_dict_lines(pg):
+        pg_dict: dict = pg.get_text("dict", sort=True)  # type: ignore[assignment]
+        out = []
+        for blk in pg_dict.get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for ln in blk.get("lines", []):
+                lt = "".join(s.get("text", "") for s in ln.get("spans", []))
+                out.append((lt.strip(), ln.get("bbox")))
+        return out
+
+    @staticmethod
+    def _find_match_bbox(m, dict_lines, pg_text_lines, pg_map, pn):
+        from difflib import SequenceMatcher
+        gidx = m.line_num - 1
+        pg_start = next((i for i in range(len(pg_map)) if pg_map[i] == pn), 0)
+        page_local_pos = gidx - pg_start
+        local_idx = sum(bool(line.strip())
+                        for line in pg_text_lines[:page_local_pos])
+        if 0 <= local_idx < len(dict_lines):
+            return dict_lines[local_idx][1], f"index[{local_idx}]"
+        best, best_bbox = 0.0, None
+        for dt, db in dict_lines:
+            r = SequenceMatcher(None, m.line.strip(), dt).ratio()
+            if r > best:
+                best, best_bbox = r, db
+        return (best_bbox, f"fuzzy({best:.0%})") if best > 0.35 else (None, "—")
+
     def test_visual_highlight_opens_in_preview(self, rich_pdf):
         """
         Runs a search, highlights all matches by line-number bbox,
@@ -351,7 +379,6 @@ class TestVisualHighlight:
         """
         fitz = pytest.importorskip("fitz")
         import subprocess, tempfile as tf
-        from difflib import SequenceMatcher
 
         query = "subject"
         print(f"\n{'='*60}")
@@ -359,16 +386,15 @@ class TestVisualHighlight:
         print(f"  Query: '{query}'")
         print(f"{'='*60}")
 
-        # ── Search ──────────────────────────────────────────────────
         lines, matches = _search(rich_pdf, query, case_sensitive=False, threshold=70)
         assert matches, "Expected matches for 'subject'"
-        print(f"\n  {len(lines)} lines extracted across {max(fuzzer._pdf_page_map.get(rich_pdf, [1]))} pages")
+        print(f"\n  {len(lines)} lines extracted across "
+              f"{max(fuzzer._pdf_page_map.get(rich_pdf, [1]))} pages")
         print(f"\n  Found {len(matches)} match(es):\n")
         for m in matches:
             kind = "EXACT" if m.score == 100 else f"FUZZY({m.score})"
             print(f"    [{kind}] page {m.page_num}, line {m.line_num}: {m.line.strip()!r}")
 
-        # ── Highlight ────────────────────────────────────────────────
         pg_map = fuzzer._pdf_page_map.get(rich_pdf, [])
         doc = fitz.open(rich_pdf)
         total_highlights = 0
@@ -377,42 +403,20 @@ class TestVisualHighlight:
         for m in matches:
             page_matches.setdefault(m.page_num or 1, []).append(m)
 
-        print(f"\n  Highlighting by line-number bbox:\n")
+        print("\n  Highlighting by line-number bbox:\n")
         for pn, ms in sorted(page_matches.items()):
             pg = doc[pn - 1]
-            pg_dict: dict = pg.get_text("dict", sort=True)  # type: ignore[assignment]
-            dict_lines = []
-            for blk in pg_dict.get("blocks", []):
-                if blk.get("type") != 0:
-                    continue
-                for ln in blk.get("lines", []):
-                    lt = "".join(s.get("text", "") for s in ln.get("spans", []))
-                    dict_lines.append((lt.strip(), ln.get("bbox")))
-
+            dict_lines = self._collect_dict_lines(pg)
             pg_text_lines = pg.get_text("text", sort=True).splitlines()  # type: ignore[union-attr]
             for m in ms:
-                gidx = m.line_num - 1
-                pg_start = next((i for i in range(len(pg_map)) if pg_map[i] == pn), 0)
-                page_local_pos = gidx - pg_start
-                local_idx = sum(1 for line in pg_text_lines[:page_local_pos] if line.strip())
-                bbox = None
-                method = "—"
-                if 0 <= local_idx < len(dict_lines):
-                    bbox = dict_lines[local_idx][1]
-                    method = f"index[{local_idx}]"
-                if not bbox:
-                    best, best_bbox = 0.0, None
-                    for dt, db in dict_lines:
-                        r = SequenceMatcher(None, m.line.strip(), dt).ratio()
-                        if r > best:
-                            best, best_bbox = r, db
-                    if best > 0.35:
-                        bbox = best_bbox
-                        method = f"fuzzy({best:.0%})"
+                bbox, method = self._find_match_bbox(
+                    m, dict_lines, pg_text_lines, pg_map, pn
+                )
                 if bbox:
                     pg.add_highlight_annot(fitz.Rect(bbox))
                     total_highlights += 1
-                    print(f"    page {pn}, line {m.line_num}: {method} → bbox={tuple(round(x,1) for x in bbox)}")
+                    print(f"    page {pn}, line {m.line_num}: {method} → "
+                          f"bbox={tuple(round(x,1) for x in bbox)}")
                 else:
                     print(f"    page {pn}, line {m.line_num}: NO BBOX FOUND")
 
@@ -426,4 +430,101 @@ class TestVisualHighlight:
         print(f"  Opening in Preview…\n{'='*60}\n")
 
         subprocess.Popen(["open", "-a", "Preview", tmp])
-        assert total_highlights > 0, "Should have highlighted at least one line"
+        try:
+            assert total_highlights > 0, "Should have highlighted at least one line"
+        finally:
+            # Give Preview a moment to render, then close just the window we opened
+            # (matched by exact filename so we don't close the user's other PDFs).
+            import time
+            time.sleep(1.5)
+            tmp_name = os.path.basename(tmp)
+            subprocess.run(
+                ["osascript", "-e",
+                 f'tell application "Preview" to close '
+                 f'(every window whose name is "{tmp_name}")'],
+                capture_output=True, check=False,
+            )
+
+
+# ── Real-world corpus: ~50 public PDFs fetched by `make test-corpus` ─────────
+# Skipped entirely when test_pdfs/ is empty so plain `make test` still passes
+# without the corpus. Filenames encode language:
+#   arxiv_*.pdf    → English (arXiv papers)
+#   wiki_ar_*.pdf  → Arabic  (Arabic Wikipedia PDF export)
+
+_CORPUS_DIR  = Path(__file__).parent / "test_pdfs"
+_CORPUS_PDFS = sorted(_CORPUS_DIR.glob("*.pdf")) if _CORPUS_DIR.exists() else []
+_ENGLISH     = [p for p in _CORPUS_PDFS if p.name.startswith("arxiv_")]
+_ARABIC      = [p for p in _CORPUS_PDFS if p.name.startswith("wiki_ar_")]
+
+
+@pytest.mark.skipif(
+    not _CORPUS_PDFS,
+    reason="test_pdfs/ is empty — run `make test-corpus` to fetch PDFs",
+)
+class TestRealCorpus:
+    """Run the extraction + search pipeline against real-world public PDFs.
+
+    Each test parametrizes over the corpus, so pytest reports a row per file
+    and a single bad PDF doesn't mask the rest. The corpus is intentionally
+    diverse (Arabic + English, varied layouts, varied sizes) — these tests
+    exist to surface regressions that synthetic fixtures miss."""
+
+    @pytest.mark.parametrize("pdf_path", _CORPUS_PDFS, ids=lambda p: p.name)
+    def test_read_lines_succeeds(self, pdf_path):
+        lines = fuzzer.read_lines(str(pdf_path))
+        assert lines is not None, f"read_lines returned None for {pdf_path.name}"
+        assert len(lines) > 0, f"no lines extracted from {pdf_path.name}"
+        # If page-map was built, at least one entry should be a real page number.
+        pg_map = fuzzer._pdf_page_map.get(str(pdf_path), [])
+        if pg_map:
+            assert any(p > 0 for p in pg_map), (
+                f"page map for {pdf_path.name} has no non-zero entries"
+            )
+            assert len(pg_map) == len(lines), (
+                f"page map length ({len(pg_map)}) != lines length ({len(lines)}) "
+                f"for {pdf_path.name} — alignment invariant broken"
+            )
+
+    @pytest.mark.parametrize("pdf_path", _CORPUS_PDFS[:8], ids=lambda p: p.name)
+    def test_search_does_not_crash(self, pdf_path):
+        """Run a handful of common queries — both languages — and verify the
+        pipeline returns well-formed Match objects without raising."""
+        lines = fuzzer.read_lines(str(pdf_path))
+        assert lines is not None
+        for query in ("the", "of", "and", "في", "من", "على"):
+            _lines, matches = _search(str(pdf_path), query)
+            for m in matches[:3]:
+                assert isinstance(m, fuzzer.Match)
+                assert 1 <= m.line_num <= len(lines)
+                assert m.score == 100 or 0 <= m.score < 100
+                assert m.page_num >= 0
+
+    def test_corpus_has_arabic_and_english(self):
+        assert _ENGLISH, "corpus has no English PDFs (arxiv_*.pdf)"
+        assert _ARABIC,  "corpus has no Arabic PDFs (wiki_ar_*.pdf)"
+
+    def test_arabic_normalization_on_real_pdf(self):
+        """Verify _normalize_arabic processes real PDF Arabic without
+        crashing and that the extracted text actually contains Arabic."""
+        if not _ARABIC:
+            pytest.skip("no Arabic PDFs in corpus")
+        lines = fuzzer.read_lines(str(_ARABIC[0]))
+        assert lines
+        sample = "\n".join(lines[:200])
+        has_arabic = any("؀" <= c <= "ۿ" for c in sample)
+        assert has_arabic, f"no Arabic characters in {_ARABIC[0].name}"
+        # Should not raise on real-world text with diacritics + ligatures.
+        normalized = fuzzer._normalize_arabic(sample)
+        assert isinstance(normalized, str)
+        assert len(normalized) > 0
+
+    def test_english_arxiv_finds_common_words(self):
+        """Sanity check: a well-known arXiv paper should contain stopwords
+        like 'the' on plenty of lines once extraction works."""
+        if not _ENGLISH:
+            pytest.skip("no English PDFs in corpus")
+        _lines, matches = _search(str(_ENGLISH[0]), "the")
+        assert len(matches) > 5, (
+            f"expected many 'the' matches in {_ENGLISH[0].name}, got {len(matches)}"
+        )

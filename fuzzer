@@ -16,9 +16,11 @@ Flags:
   -o  export results to FILE (.csv .tsv .json .txt .xlsx)
   --no-color
 """
+
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import sys
@@ -67,25 +69,29 @@ def _extract_plain(fp: str) -> Optional[List[str]]:
 
 _pdf_page_map: Dict[str, List[int]] = {}  # fp → page_num per line (1-based)
 
+def _extract_pdf_pymupdf(fp: str, lines: List[str], page_nums: List[int]) -> List[str]:
+    import fitz  # PyMuPDF
+    doc = fitz.open(fp)
+    for page_idx in range(1, len(doc) + 1):
+        page = doc[page_idx - 1]
+        # sort=True re-orders glyphs by position, fixing ligature order in
+        # Arabic PDFs that use non-standard glyph sequences.
+        text: str = page.get_text("text", sort=True) or ""  # type: ignore[attr-defined]
+        page_lines = text.splitlines()
+        lines.extend(page_lines)
+        page_nums.extend([page_idx] * len(page_lines))
+    doc.close()
+    _pdf_page_map[fp] = page_nums
+    return lines
+
+
 def _extract_pdf(fp: str) -> Optional[List[str]]:
     # PyMuPDF preserves logical Unicode character order for Arabic text;
     # fall back to pdfplumber if fitz is not installed.
     lines: List[str] = []
     page_nums: List[int] = []
     try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(fp)
-        for page_idx in range(1, len(doc) + 1):
-            page = doc[page_idx - 1]
-            # sort=True re-orders glyphs by position, fixing ligature order in
-            # Arabic PDFs that use non-standard glyph sequences.
-            text: str = page.get_text("text", sort=True) or ""  # type: ignore[attr-defined]
-            page_lines = text.splitlines()
-            lines.extend(page_lines)
-            page_nums.extend([page_idx] * len(page_lines))
-        doc.close()
-        _pdf_page_map[fp] = page_nums
-        return lines
+        return _extract_pdf_pymupdf(fp, lines, page_nums)
     except ImportError:
         pass
     except Exception as e:
@@ -138,23 +144,147 @@ _EXT_MAP = {
     ".htm":  _extract_plain,
 }
 
+# ── Extraction cache (SQLite, keyed by path + mtime) ──────────────────────────
+
+_CACHE_DB = Path.home() / ".fuzzer_cache.sqlite"
+_cache_conn = None  # type: ignore[var-annotated]
+
+def _get_cache():
+    global _cache_conn
+    if _cache_conn is None:
+        import sqlite3
+        _cache_conn = sqlite3.connect(str(_CACHE_DB), check_same_thread=False)
+        _cache_conn.executescript("""
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY, mtime REAL, n_lines INT
+            );
+            CREATE TABLE IF NOT EXISTS lines (
+                path TEXT, line_no INT, page_num INT, text TEXT,
+                PRIMARY KEY (path, line_no)
+            );
+            CREATE INDEX IF NOT EXISTS lines_path ON lines(path);
+        """)
+    return _cache_conn
+
+def _cache_get(fp: str):
+    try:
+        mtime = os.path.getmtime(fp)
+    except OSError:
+        return None
+    conn = _get_cache()
+    row = conn.execute("SELECT mtime FROM files WHERE path = ?", (fp,)).fetchone()
+    if not row or row[0] != mtime:
+        return None
+    rows = conn.execute(
+        "SELECT page_num, text FROM lines WHERE path = ? ORDER BY line_no",
+        (fp,),
+    ).fetchall()
+    return [r[1] for r in rows], [r[0] for r in rows]
+
+def _cache_put(fp: str, lines: List[str], page_nums: List[int]) -> None:
+    try:
+        mtime = os.path.getmtime(fp)
+    except OSError:
+        return
+    conn = _get_cache()
+    with contextlib.suppress(Exception):
+        with conn:
+            conn.execute("DELETE FROM files WHERE path = ?", (fp,))
+            conn.execute("DELETE FROM lines WHERE path = ?", (fp,))
+            conn.execute("INSERT INTO files VALUES (?, ?, ?)", (fp, mtime, len(lines)))
+            conn.executemany(
+                "INSERT INTO lines VALUES (?, ?, ?, ?)",
+                [(fp, i + 1,
+                  page_nums[i] if i < len(page_nums) else 0,
+                  lines[i]) for i in range(len(lines))],
+            )
+
 def read_lines(fp: str) -> Optional[List[str]]:
+    # Try cache first. For PDFs we also require real page numbers — old cache
+    # entries from before page-tracking landed have page_nums = [0, 0, ...],
+    # which silently breaks "open at matched page" until the user clears the
+    # cache. Treat such entries as a miss and re-extract.
+    is_pdf = Path(fp).suffix.lower() == ".pdf"
+    _cached = _cache_get(fp)
+    if _cached is not None:
+        _lines, _page_nums = _cached
+        has_pages = bool(_page_nums) and any(p > 0 for p in _page_nums)
+        if has_pages:
+            _pdf_page_map[fp] = _page_nums
+        if has_pages or not is_pdf:
+            return _lines
+        # PDF cached without page info — fall through to re-extract.
+
     ext = Path(fp).suffix.lower()
     fn = _EXT_MAP.get(ext, _extract_plain)
-    return fn(fp)
+    lines = fn(fp)
+    if lines is not None:
+        page_nums = _pdf_page_map.get(fp, [0] * len(lines))
+        _cache_put(fp, lines, page_nums)
+    return lines
 
 # ── Arabic text normalization ──────────────────────────────────────────────────
+# Preference order: native C extension (_ar_norm) > pyarabic > pure-Python regex.
+# The C extension is ~10x faster and is loaded from the directory containing
+# this script (see native/ar_normalize.c, build with `make build-native`).
 
-_AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")  # short vowels + tatweel (kashida)
-_ALEF_VARIANTS = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
-_YEH_VARIANTS = str.maketrans({"ى": "ي", "ئ": "ي"})
+# Make the script's directory importable so the .so can be found regardless of cwd.
+_script_dir = str(Path(__file__).resolve().parent)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
-def _normalize_arabic(s: str) -> str:
-    """Strip tatweel, diacritics, and normalize alef/yeh variants for fuzzy
-    matching. Leaves non-Arabic chars untouched."""
-    s = _AR_DIACRITICS.sub("", s)
-    s = s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
-    return s
+try:
+    import _ar_norm  # type: ignore[import-not-found]
+
+    def _normalize_arabic(s: str) -> str:
+        """C-accelerated: strip diacritics + tatweel, normalize alef/yeh."""
+        return _ar_norm.normalize(s)
+except ImportError:
+    try:
+        from pyarabic.normalize import normalize_searchtext as _ar_norm_search  # type: ignore[import-not-found]
+
+        def _normalize_arabic(s: str) -> str:
+            """pyarabic.normalize_searchtext: strips diacritics + tatweel,
+            normalizes alef/yeh/teh-marbuta and presentation forms."""
+            return _ar_norm_search(s)
+    except ImportError:
+        _AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")
+        _ALEF_VARIANTS = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
+        _YEH_VARIANTS = str.maketrans({"ى": "ي", "ئ": "ي"})
+
+        def _normalize_arabic(s: str) -> str:
+            s = _AR_DIACRITICS.sub("", s)
+            return s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
+
+# ── native-call instrumentation (toggleable at runtime via the GUI) ──────────
+# When debug mode is ON, every call to _normalize_arabic is recorded into
+# _NORM_CALLS so the GUI's "Native debug" panel can show it.
+# --test on the command line just starts the GUI with debug mode ON.
+_DEBUG_NATIVE = "--test" in sys.argv
+if _DEBUG_NATIVE:
+    sys.argv = [a for a in sys.argv if a != "--test"]
+
+_NORM_CALLS: List[Tuple[float, str, str, float]] = []  # (ts, input, output, µs)
+_NORM_CALLS_MAX = 500
+_orig_normalize_arabic = _normalize_arabic
+
+def _dbg_wrapped_normalize(s: str) -> str:
+    import time as _t
+    t0 = _t.perf_counter()
+    out = _orig_normalize_arabic(s)
+    _NORM_CALLS.append((_t.time(), s, out, (_t.perf_counter() - t0) * 1e6))
+    if len(_NORM_CALLS) > _NORM_CALLS_MAX:
+        del _NORM_CALLS[: len(_NORM_CALLS) - _NORM_CALLS_MAX]
+    return out
+
+def _set_debug_native(enable: bool) -> None:
+    """Install or uninstall the recording wrapper. Toggleable from the GUI."""
+    global _normalize_arabic, _DEBUG_NATIVE
+    _normalize_arabic = _dbg_wrapped_normalize if enable else _orig_normalize_arabic
+    _DEBUG_NATIVE = bool(enable)
+
+if _DEBUG_NATIVE:
+    _set_debug_native(True)
 
 _TOKEN_RE = re.compile(r"[؀-ۿa-zA-Z0-9]+")
 
@@ -200,18 +330,24 @@ def _builtin_ratio(a: str, b: str) -> int:
     total = len(a) + len(b)
     return int((1 - dist / total) * 100) if total else 100
 
+try:
+    from rapidfuzz import fuzz as _rf_fuzz
+    _RATIO_FN   = lambda a, b: int(_rf_fuzz.ratio(a, b))
+    _PARTIAL_FN = lambda a, b: int(_rf_fuzz.partial_ratio(a, b))
+    _TOKEN_FN   = lambda a, b: int(_rf_fuzz.token_set_ratio(a, b))
+except ImportError:
+    try:
+        from thefuzz import fuzz as _tf_fuzz
+        _RATIO_FN   = _tf_fuzz.ratio
+        _PARTIAL_FN = _tf_fuzz.partial_ratio
+        _TOKEN_FN   = _tf_fuzz.token_set_ratio
+    except ImportError:
+        _RATIO_FN   = _builtin_ratio
+        _PARTIAL_FN = None  # type: ignore[assignment]
+        _TOKEN_FN   = None  # type: ignore[assignment]
+
 def fuzzy_score(pattern: str, line: str) -> int:
     """Best similarity score (0-100) of pattern against tokens in line."""
-    try:
-        from thefuzz import fuzz
-        ratio_fn = fuzz.ratio
-        partial_fn = fuzz.partial_ratio
-        token_fn = fuzz.token_set_ratio
-    except ImportError:
-        ratio_fn = _builtin_ratio  # type: ignore[assignment]
-        partial_fn = None
-        token_fn = None
-
     words = line.split()
     pw = pattern.split()
     n = len(pw)
@@ -219,15 +355,15 @@ def fuzzy_score(pattern: str, line: str) -> int:
 
     if n == 1:
         for w in words:
-            best = max(best, ratio_fn(pattern, w))
+            best = max(best, _RATIO_FN(pattern, w))
     else:
         for i in range(max(1, len(words) - n + 1)):
             window = " ".join(words[i: i + n])
-            best = max(best, ratio_fn(pattern, window))
-        if partial_fn:
-            best = max(best, partial_fn(pattern, line))
-        if token_fn:
-            best = max(best, token_fn(pattern, line))
+            best = max(best, _RATIO_FN(pattern, window))
+        if _PARTIAL_FN:
+            best = max(best, _PARTIAL_FN(pattern, line))
+        if _TOKEN_FN:
+            best = max(best, _TOKEN_FN(pattern, line))
 
     return best
 
@@ -378,6 +514,50 @@ def _score_tag(score: int) -> str:
         return f" {_c(_CYN)}[AI]{_r()}"
     return f" {_c(_YEL)}[~{score}%]{_r()}"
 
+def _print_verbose(
+    m: "Match", lines: List[str], full_text: str, pattern: str,
+    case_sensitive: bool, show_nums: bool, tag: str,
+) -> None:
+    offset = sum(len(l) + 1 for l in lines[:m.line_num - 1])
+    sentence = extract_sentence(full_text, offset + max(0, len(m.line) // 2))
+    flags = 0 if case_sensitive else re.IGNORECASE
+    hl = re.sub(re.escape(pattern), _c(_RED, _BOLD) + r"\g<0>" + _r(),
+                sentence, flags=flags)
+    num = f"{_c(_GRN)}{m.line_num}:{_r()} " if show_nums else ""
+    print(f"  {num}{hl}{tag}")
+
+
+def _print_context(
+    m: "Match", lines: List[str], pattern: str, case_sensitive: bool,
+    show_nums: bool, context_lines: int, tag: str, shown: set,
+) -> None:
+    ln = m.line_num
+    lo = max(1, ln - context_lines)
+    hi = min(len(lines), ln + context_lines)
+    if shown and min(k for k in range(lo, hi + 1) if k not in shown) > lo:
+        print(f"{_c(_DIM)}--{_r()}")
+    for ctx in range(lo, hi + 1):
+        if ctx in shown:
+            continue
+        shown.add(ctx)
+        ctx_line = lines[ctx - 1]
+        if ctx == ln:
+            num = f"{_c(_GRN)}{ctx}:{_r()}" if show_nums else ""
+            print(f"{num}{_highlight(ctx_line, pattern, case_sensitive)}{tag}")
+        else:
+            num = f"{_c(_DIM)}{ctx}-{_r()}" if show_nums else ""
+            print(f"{num}{_c(_DIM)}{ctx_line}{_r()}")
+
+
+def _print_single(
+    m: "Match", pattern: str, case_sensitive: bool, show_nums: bool,
+    ai_mode: bool, tag: str,
+) -> None:
+    num = f"{_c(_GRN)}{m.line_num}:{_r()}" if show_nums else ""
+    body = m.line if ai_mode else _highlight(m.line, pattern, case_sensitive)
+    print(f"{num}{body}{tag}")
+
+
 def print_results(
     results: Dict[str, Tuple[List[str], List[Match]]],
     *,
@@ -402,46 +582,16 @@ def print_results(
         shown: set = set()
 
         for m in matches:
-            ln = m.line_num
             tag = _score_tag(m.score)
-
             if verbose:
-                # find sentence containing this line
-                # compute char offset of this line's start
-                offset = sum(len(l) + 1 for l in lines[:ln - 1])
-                sentence = extract_sentence(full_text, offset + max(0, len(m.line) // 2))
-                if case_sensitive:
-                    hl = re.sub(re.escape(pattern),
-                                _c(_RED, _BOLD) + r"\g<0>" + _r(),
-                                sentence)
-                else:
-                    hl = re.sub(re.escape(pattern), _c(_RED, _BOLD) + r"\g<0>" + _r(),
-                                sentence, flags=re.IGNORECASE)
-                num = (_c(_GRN) + f"{ln}:" + _r() + " ") if show_nums else ""
-                print(f"  {num}{hl}{tag}")
-
+                _print_verbose(m, lines, full_text, pattern,
+                               case_sensitive, show_nums, tag)
             elif context_lines > 0:
-                lo = max(1, ln - context_lines)
-                hi = min(len(lines), ln + context_lines)
-                if shown and min(k for k in range(lo, hi + 1) if k not in shown) > lo:
-                    print(_c(_DIM) + "--" + _r())
-                for ctx in range(lo, hi + 1):
-                    if ctx in shown:
-                        continue
-                    shown.add(ctx)
-                    ctx_line = lines[ctx - 1]
-                    if ctx == ln:
-                        num = (_c(_GRN) + f"{ctx}:" + _r()) if show_nums else ""
-                        print(f"{num}{_highlight(ctx_line, pattern, case_sensitive)}{tag}")
-                    else:
-                        num = (_c(_DIM) + f"{ctx}-" + _r()) if show_nums else ""
-                        print(f"{num}{_c(_DIM)}{ctx_line}{_r()}")
+                _print_context(m, lines, pattern, case_sensitive,
+                               show_nums, context_lines, tag, shown)
             else:
-                num = (_c(_GRN) + f"{ln}:" + _r()) if show_nums else ""
-                if ai_mode:
-                    print(f"{num}{m.line}{tag}")
-                else:
-                    print(f"{num}{_highlight(m.line, pattern, case_sensitive)}{tag}")
+                _print_single(m, pattern, case_sensitive,
+                              show_nums, ai_mode, tag)
 
     return total
 
@@ -483,6 +633,71 @@ def _build_rows(
     return rows
 
 
+_DEFAULT_EXPORT_FIELDS = ["file", "line", "match_type", "score", "content"]
+
+
+def _fields_for(rows: List[Dict[str, object]]) -> List[str]:
+    return list(rows[0].keys()) if rows else list(_DEFAULT_EXPORT_FIELDS)
+
+
+def _export_csv(rows: List[Dict[str, object]], out_path: str, delim: str) -> None:
+    import csv
+    fields = _fields_for(rows)
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, delimiter=delim)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _export_json(rows: List[Dict[str, object]], out_path: str) -> None:
+    import json
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+
+def _export_xlsx(rows: List[Dict[str, object]], out_path: str) -> bool:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        _err("Excel export requires openpyxl — pip install openpyxl")
+        return False
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "fuzzer results"
+    fields = _fields_for(rows)
+    ws.append(fields)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        ws.append([row.get(k, "") for k in fields])
+    for col_idx, name in enumerate(fields, start=1):
+        max_len = max([len(str(name))] + [len(str(r.get(name, ""))) for r in rows])
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 80)
+    wb.save(out_path)
+    return True
+
+
+def _txt_tag(row: Dict[str, object]) -> str:
+    if row["match_type"] == "fuzzy":
+        return f" [~{row['score']}%]"
+    return " [AI]" if row["match_type"] == "ai" else ""
+
+
+def _export_txt(rows: List[Dict[str, object]], out_path: str, verbose: bool) -> None:
+    with open(out_path, "w", encoding="utf-8") as f:
+        current_file: Optional[str] = None
+        for r in rows:
+            if r["file"] != current_file:
+                current_file = str(r["file"])
+                f.write(f"\n{current_file}\n")
+            f.write(f"  {r['line']}: {r['content']}{_txt_tag(r)}\n")
+            if verbose and "sentence" in r:
+                f.write(f"     {r['sentence']}\n")
+
+
 def export_results(
     results: Dict[str, Tuple[List[str], List[Match]]],
     out_path: str,
@@ -493,65 +708,19 @@ def export_results(
     ext = Path(out_path).suffix.lower()
 
     if ext in (".csv", ".tsv"):
-        import csv
-        delim = "\t" if ext == ".tsv" else ","
-        fields = list(rows[0].keys()) if rows else \
-            ["file", "line", "match_type", "score", "content"]
-        with open(out_path, "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields, delimiter=delim)
-            w.writeheader()
-            w.writerows(rows)
-
+        _export_csv(rows, out_path, "\t" if ext == ".tsv" else ",")
     elif ext == ".json":
-        import json
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
-
+        _export_json(rows, out_path)
     elif ext in (".xlsx", ".xls"):
-        try:
-            from openpyxl import Workbook
-            from openpyxl.styles import Font
-        except ImportError:
-            _err("Excel export requires openpyxl — pip install openpyxl")
+        if not _export_xlsx(rows, out_path):
             return
-        from openpyxl.utils import get_column_letter
-        wb = Workbook()
-        ws = wb.active
-        assert ws is not None
-        ws.title = "fuzzer results"
-        fields = list(rows[0].keys()) if rows else \
-            ["file", "line", "match_type", "score", "content"]
-        ws.append(fields)
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-        for row in rows:
-            ws.append([row.get(k, "") for k in fields])
-        for col_idx, name in enumerate(fields, start=1):
-            max_len = max(
-                [len(str(name))] + [len(str(r.get(name, ""))) for r in rows]
-            )
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 80)
-        wb.save(out_path)
-
     else:
-        # plain text — mirror the console layout, no colours
-        with open(out_path, "w", encoding="utf-8") as f:
-            current_file: Optional[str] = None
-            for r in rows:
-                if r["file"] != current_file:
-                    current_file = str(r["file"])
-                    f.write(f"\n{current_file}\n")
-                tag = ""
-                if r["match_type"] == "fuzzy":
-                    tag = f" [~{r['score']}%]"
-                elif r["match_type"] == "ai":
-                    tag = " [AI]"
-                f.write(f"  {r['line']}: {r['content']}{tag}\n")
-                if verbose and "sentence" in r:
-                    f.write(f"     {r['sentence']}\n")
+        _export_txt(rows, out_path, verbose)
 
-    print(_c(_CYN) + f"exported {len(rows)} rows to {out_path}" + _r(),
-          file=sys.stderr)
+    print(
+        f"{_c(_CYN)}exported {len(rows)} rows to {out_path}{_r()}",
+        file=sys.stderr,
+    )
 
 # ── file collection ────────────────────────────────────────────────────────────
 
@@ -561,9 +730,11 @@ def collect_files(paths: List[str], recursive: bool) -> List[str]:
         path = Path(p)
         if path.is_dir():
             if recursive:
-                for f in sorted(path.rglob("*")):
-                    if f.is_file() and f.suffix.lower() in _EXT_MAP:
-                        out.append(str(f))
+                out.extend(
+                    str(f)
+                    for f in sorted(path.rglob("*"))
+                    if f.is_file() and f.suffix.lower() in _EXT_MAP
+                )
             else:
                 _err(f"{p} is a directory — use -r to search recursively")
         elif path.is_file():
@@ -598,29 +769,25 @@ def run_gui() -> int:
             return {}
 
     def _save_state(data: Dict[str, object]) -> None:
-        try:
+        with contextlib.suppress(Exception):
             _STATE_FILE.write_text(_json.dumps(data))
-        except Exception:
-            pass
 
     _gui_state = _load_state()
 
+    # Restore debug mode from last session (also settable via Mode menu / ⌘D).
+    if _gui_state.get("debug_mode") and not _DEBUG_NATIVE:
+        _set_debug_native(True)
+
     # Clean up old highlighted PDFs from previous sessions (>1 day old)
-    try:
+    with contextlib.suppress(Exception):
         import time as _time
         _tmp_dir = Path.home() / ".fuzzer_tmp"
         if _tmp_dir.is_dir():
             _now = _time.time()
             for _f in _tmp_dir.glob("fuzzer_*.pdf"):
-                try:
+                with contextlib.suppress(Exception):
                     if _now - _f.stat().st_mtime > 86400:  # 24h
                         _f.unlink()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-
     # tkinter Treeview cells are always LTR containers, so we need
     # bidi.get_display() to reorder Arabic words for correct visual order.
     # On macOS, CoreText handles letter-level shaping (connecting glyphs)
@@ -632,7 +799,7 @@ def run_gui() -> int:
     # 1000x720 with no resize flash. Uses `defaults write` against Preview's
     # main PDF window frame key.
     if _platform.system() == "Darwin":
-        try:
+        with contextlib.suppress(Exception):
             import subprocess as _sp
             _frame = "120 80 1000 720 0 0 1920 1080 "
             _sp.run(
@@ -640,20 +807,12 @@ def run_gui() -> int:
                  "NSWindow Frame PVMainPDFWindow", _frame],
                 capture_output=True, check=False,
             )
-        except Exception:
-            pass
-
     _bidi_display = None
     _arabic_reshaper = None
-    try:
+    with contextlib.suppress(ImportError):
         from bidi.algorithm import get_display as _bidi_display  # type: ignore[assignment]
-    except ImportError:
-        pass
-    try:
+    with contextlib.suppress(ImportError):
         import arabic_reshaper as _arabic_reshaper  # type: ignore[assignment]
-    except ImportError:
-        pass
-
     _WS_RUN = re.compile(r"\s+")
     _HAS_ARABIC = re.compile(r"[؀-ۿ]")
     # Mirror pairs — bidi RTL rendering flips these visually. Pre-swap them in
@@ -715,7 +874,7 @@ def run_gui() -> int:
         if lo > 0:
             snippet = "… " + snippet
         if hi < len(tokens):
-            snippet = snippet + " …"
+            snippet += " …"
         return snippet
 
     class _Tooltip:
@@ -742,9 +901,34 @@ def run_gui() -> int:
                 self._tip.destroy()
                 self._tip = None
 
-    root = tk.Tk()
+    # tkinterdnd2 provides a drag-and-drop-aware Tk root; fall back to plain Tk
+    try:
+        from tkinterdnd2 import TkinterDnD, DND_FILES  # type: ignore[import-not-found]
+        root = TkinterDnD.Tk()
+        _dnd_available = True
+    except ImportError:
+        root = tk.Tk()
+        DND_FILES = None
+        _dnd_available = False
     root.title("fuzzer")
-    root.geometry("1150x720")
+    # If the user has resized previously, restore that geometry. Otherwise let
+    # _auto_fit() (scheduled below, after all widgets are packed) size the
+    # window to fit its contents.
+    _saved_geom = _gui_state.get("window_geometry")
+    if _saved_geom:
+        root.geometry(str(_saved_geom))
+
+    def _auto_fit(grow_only: bool = True) -> None:
+        """Resize the window to fit its requested content.
+        With grow_only=True, only enlarge — never shrink past the user's size.
+        """
+        root.update_idletasks()
+        w_req, h_req = root.winfo_reqwidth(), root.winfo_reqheight()
+        w_cur, h_cur = root.winfo_width(), root.winfo_height()
+        new_w = max(w_req, w_cur) if grow_only else w_req
+        new_h = max(h_req, h_cur) if grow_only else h_req
+        if (new_w, new_h) != (w_cur, h_cur):
+            root.geometry(f"{new_w}x{new_h}")
 
     # ── theme + styling ──────────────────────────────────────────────────────
     _BG       = "#f4f5f7"
@@ -759,10 +943,8 @@ def run_gui() -> int:
 
     root.configure(background=_BG)
     _style = ttk.Style()
-    try:
+    with contextlib.suppress(tk.TclError):
         _style.theme_use("clam")  # consistent across platforms; honours colours
-    except tk.TclError:
-        pass
     _style.configure(".", background=_BG, foreground=_TEXT,
                      font=(_ui_font_family, 12))
     _style.configure("TFrame", background=_BG)
@@ -804,6 +986,8 @@ def run_gui() -> int:
     state: Dict[str, object] = {
         "results": {},   # Dict[str, Tuple[List[str], List[Match]]]
         "searching": False,
+        "cancel_search": False,
+        "pattern": "",
     }
     msg_q: "queue.Queue[tuple]" = queue.Queue()
 
@@ -823,6 +1007,30 @@ def run_gui() -> int:
     files_entry = ttk.Entry(form, textvariable=files_var)
     files_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=4, pady=2)
 
+    # Drag-and-drop file paths onto the files entry (or anywhere on the window)
+    if _dnd_available and DND_FILES is not None:
+        def _on_drop(event: object) -> str:
+            raw = getattr(event, "data", "") or ""
+            # tk's "files" payload is space-separated, with braces around paths
+            # containing spaces. tk.splitlist handles both.
+            try:
+                paths = list(root.tk.splitlist(raw))
+            except Exception:
+                paths = [raw]
+            if not paths:
+                return "break"
+            quoted = " ".join(f'"{p}"' for p in paths)
+            existing = files_var.get().strip()
+            files_var.set(f"{existing} {quoted}".strip() if existing else quoted)
+            # If any dropped path is a directory, default to recursive
+            if any(Path(p).is_dir() for p in paths):
+                recursive_var.set(True)
+            return "break"
+
+        for _w in (files_entry, root):
+            with contextlib.suppress(Exception):
+                _w.drop_target_register(DND_FILES)  # type: ignore[attr-defined]
+                _w.dnd_bind("<<Drop>>", _on_drop)  # type: ignore[attr-defined]
     def pick_files() -> None:
         paths = filedialog.askopenfilenames(title="Select files to search")
         if paths:
@@ -880,6 +1088,8 @@ def run_gui() -> int:
 
     search_btn = ttk.Button(actions, text="Search", style="Accent.TButton")
     search_btn.pack(side="left", padx=2)
+    stop_btn = ttk.Button(actions, text="Stop", state="disabled")
+    stop_btn.pack(side="left", padx=2)
     clear_btn = ttk.Button(actions, text="Clear results")
     clear_btn.pack(side="left", padx=2)
     export_btn = ttk.Button(actions, text="Export…", state="disabled")
@@ -934,42 +1144,551 @@ def run_gui() -> int:
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
 
+    # ── selected-match bar ─────────────────────────────────────────────────
+    selected_var = tk.StringVar(
+        value="Select a result row to preview it here (double-click to open)"
+    )
+    selected = ttk.Label(root, textvariable=selected_var, anchor="w",
+                          relief="flat", padding=(6, 2))
+    selected.pack(fill="x", side="bottom")
+
     # ── status bar (packed before table so it always reserves space) ─────────
     status_var = tk.StringVar(value="Ready")
     status = ttk.Label(root, textvariable=status_var, anchor="w",
                        relief="sunken", padding=(6, 2))
     status.pack(fill="x", side="bottom")
 
+    # ── debug panel: live native-call inspector for py_normalize ─────────────
+    # Always built so it can be toggled at runtime (View menu / Cmd+D); only
+    # packed/visible when debug mode is on.
+    if True:
+        import time as _dbg_time
+        import subprocess as _dbg_sp
+
+        def _compute_disasm() -> str:
+            so = Path(__file__).resolve().parent / "_ar_norm.cpython-314-darwin.so"
+            if not so.exists():
+                return f"(no .so found at {so})"
+            try:
+                r = _dbg_sp.run(["otool", "-tV", str(so)],
+                                capture_output=True, text=True, timeout=10)
+                if r.returncode != 0:
+                    return f"otool failed: {r.stderr}"
+                out, in_fn = [], False
+                for ln in r.stdout.splitlines():
+                    if "_py_normalize:" in ln or "py_normalize:" in ln:
+                        in_fn = True
+                        out.append(ln)
+                        continue
+                    if in_fn:
+                        if ln and not ln.startswith((" ", "\t")) and ln.endswith(":"):
+                            break
+                        out.append(ln)
+                return "\n".join(out[:60]) if out else "(py_normalize symbol not found)"
+            except Exception as e:
+                return f"disasm error: {e}"
+
+        dbg_frame = ttk.LabelFrame(root, text="Native debug — py_normalize "
+                                              "(_ar_norm.cpython-314-darwin.so)",
+                                   padding=(6, 4))
+        if _DEBUG_NATIVE:
+            dbg_frame.pack(fill="x", side="bottom", padx=10, pady=(2, 2))
+
+        # Pause / pin state.  When pinned, the hex view shows that specific
+        # call (or that ad-hoc bytes object) and does not follow new calls.
+        _dbg_paused = [False]
+        _dbg_pin: List[Optional[Tuple[bytes, bytes, str]]] = [None]  # (raw_in, raw_out, label)
+
+        # Header row: stats + buttons
+        dbg_top = ttk.Frame(dbg_frame)
+        dbg_top.pack(fill="x")
+        dbg_stats_var = tk.StringVar(value="calls=0   last=—   live")
+        ttk.Label(dbg_top, textvariable=dbg_stats_var,
+                  font=("Menlo", 11)).pack(side="left")
+
+        def _show_disasm() -> None:
+            w = tk.Toplevel(root)
+            w.title("py_normalize — disassembly (otool -tV)")
+            w.geometry("900x600")
+            t = tk.Text(w, font=("Menlo", 11), wrap="none",
+                        bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4")
+            t.insert("1.0", _compute_disasm())
+            t.config(state="disabled")
+            t.pack(fill="both", expand=True)
+
+        ttk.Button(dbg_top, text="Show disassembly",
+                   command=_show_disasm).pack(side="right", padx=(4, 0))
+
+        def _toggle_pause() -> None:
+            _dbg_paused[0] = not _dbg_paused[0]
+            pause_btn.configure(text=("▶ Resume" if _dbg_paused[0] else "⏸ Pause"))
+            _render()
+
+        pause_btn = ttk.Button(dbg_top, text="⏸ Pause", command=_toggle_pause)
+        pause_btn.pack(side="right", padx=(4, 0))
+
+        def _unpin() -> None:
+            _dbg_pin[0] = None
+            unpin_btn.state(["disabled"])
+            _render()
+
+        unpin_btn = ttk.Button(dbg_top, text="Unpin", command=_unpin)
+        unpin_btn.pack(side="right", padx=(4, 0))
+        unpin_btn.state(["disabled"])
+
+        # Live hex memory view — shows the actual bytes py_normalize reads
+        # on the latest call, with highlighting:
+        #   red    = byte will be DROPPED (diacritic / tatweel / superscript-alef)
+        #   yellow = byte will be SUBSTITUTED (alef-variant → ا, yeh-variant → ي)
+        #   plain  = passes through unchanged
+        #
+        # The C function classifies by 2-byte UTF-8 codepoint. We mirror its
+        # rules below to colorize the input hex dump.
+        def _classify(raw: bytes) -> List[str]:
+            """Return per-byte tag: 'drop' / 'sub' / '' (one entry per byte)."""
+            tags = [""] * len(raw)
+            i = 0
+            while i < len(raw):
+                b = raw[i]
+                if b < 0x80:
+                    i += 1; continue
+                if (b & 0xE0) == 0xC0 and i + 1 < len(raw):
+                    cp = ((b & 0x1F) << 6) | (raw[i + 1] & 0x3F)
+                    if (0x064B <= cp <= 0x0652) or cp == 0x0670 or cp == 0x0640:
+                        tags[i] = tags[i + 1] = "drop"
+                    elif cp in (0x0623, 0x0625, 0x0622, 0x0671,
+                                0x0649, 0x0626):
+                        tags[i] = tags[i + 1] = "sub"
+                    i += 2; continue
+                if (b & 0xF0) == 0xE0: i += 3; continue
+                if (b & 0xF8) == 0xF0: i += 4; continue
+                i += 1
+            return tags
+
+        def _insert_hex(widget: tk.Text, raw: bytes, tags: List[str]) -> None:
+            widget.config(state="normal")
+            widget.delete("1.0", "end")
+            for idx, b in enumerate(raw[:96]):
+                widget.insert("end", f"{b:02x} ", tags[idx] or ())
+                if (idx + 1) % 16 == 0:
+                    widget.insert("end", "\n")
+            if len(raw) > 96:
+                widget.insert("end", f"  … (+{len(raw) - 96} B)")
+            widget.config(state="disabled")
+
+        def _mk_hex(parent: tk.Misc, label: str) -> tk.Text:
+            row = ttk.Frame(parent); row.pack(fill="x", pady=(2, 0))
+            ttk.Label(row, text=label, width=8,
+                      font=("Menlo", 11, "bold")).pack(side="left", anchor="n")
+            t = tk.Text(row, height=4, font=("Menlo", 11), wrap="none",
+                        bg="#1e1e1e", fg="#d4d4d4",
+                        insertbackground="#d4d4d4")
+            t.tag_configure("drop", background="#5a1d1d", foreground="#ff8a8a")
+            t.tag_configure("sub",  background="#5a4a1d", foreground="#ffd66b")
+            t.pack(side="left", fill="x", expand=True)
+            t.config(state="disabled")
+            return t
+
+        dbg_in_hex  = _mk_hex(dbg_frame, "INPUT")
+        dbg_out_hex = _mk_hex(dbg_frame, "OUTPUT")
+
+        # Clickable recent-calls list. Single-click pins to that call (which
+        # implicitly freezes the hex view); click again or press Unpin to
+        # resume live following.
+        dbg_row = ttk.Frame(dbg_frame)
+        dbg_row.pack(fill="x", expand=False, pady=(4, 0))
+        ttk.Label(dbg_row, text="CALLS", width=8,
+                  font=("Menlo", 11, "bold")).pack(side="left", anchor="n")
+        dbg_list = tk.Listbox(dbg_row, height=5, font=("Menlo", 11),
+                              bg="#1e1e1e", fg="#9cdcfe",
+                              selectbackground="#264f78", selectforeground="#ffffff",
+                              activestyle="none", exportselection=False)
+        dbg_list.pack(side="left", fill="x", expand=True)
+
+        def _render() -> None:
+            """Repaint hex panes + stats line based on pause/pin state."""
+            pin = _dbg_pin[0]
+            if pin is not None:
+                raw_in, raw_out, label = pin
+                dbg_stats_var.set(
+                    f"calls={len(_NORM_CALLS)}   "
+                    f"PINNED: {label}   "
+                    f"in {len(raw_in)}B → out {len(raw_out)}B   "
+                    f"Δ={len(raw_out) - len(raw_in):+d}B"
+                )
+            elif _NORM_CALLS:
+                ts, inp, out, dt = _NORM_CALLS[-1]
+                raw_in  = inp.encode("utf-8")
+                raw_out = out.encode("utf-8")
+                state = "PAUSED" if _dbg_paused[0] else "live"
+                dbg_stats_var.set(
+                    f"calls={len(_NORM_CALLS)}   last={dt:.1f}µs   "
+                    f"in@0x{id(inp):x} ({len(raw_in)}B) → "
+                    f"out@0x{id(out):x} ({len(raw_out)}B)   "
+                    f"Δ={len(raw_out) - len(raw_in):+d}B   {state}"
+                )
+            else:
+                dbg_stats_var.set("calls=0   waiting for first call…   live")
+                raw_in = raw_out = b""
+            _insert_hex(dbg_in_hex,  raw_in,  _classify(raw_in))
+            _insert_hex(dbg_out_hex, raw_out, [""] * len(raw_out))
+
+        def _refill_listbox() -> None:
+            """Repopulate the listbox to reflect the latest _NORM_CALLS slice."""
+            dbg_list.delete(0, "end")
+            recent = _NORM_CALLS[-12:]
+            for ts, inp, out, dt in recent:
+                tm = _dbg_time.strftime("%H:%M:%S", _dbg_time.localtime(ts))
+                dbg_list.insert("end",
+                    f"[{tm}] {dt:6.1f}µs  {inp[:24]!r:26s} → {out[:24]!r}")
+
+        def _on_list_click(_event: object) -> None:
+            sel = dbg_list.curselection()
+            if not sel:
+                return
+            recent = _NORM_CALLS[-12:]
+            idx = sel[0]
+            if idx >= len(recent):
+                return
+            ts, inp, out, dt = recent[idx]
+            _dbg_pin[0] = (inp.encode("utf-8"), out.encode("utf-8"),
+                           f"[{_dbg_time.strftime('%H:%M:%S', _dbg_time.localtime(ts))}] "
+                           f"{inp[:24]!r}")
+            unpin_btn.state(["!disabled"])
+            _render()
+
+        dbg_list.bind("<<ListboxSelect>>", _on_list_click)
+
+        # Click-to-inspect: selecting a row in the main results tree runs the
+        # text through _normalize_arabic (recording a call) and pins the result
+        # so you can examine what was processed.
+        def _on_tree_select(_event: object) -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            row = tree.item(sel[0])
+            vals = row.get("values") or []
+            # columns: ("file", "line", "page", "match", "score", "content")
+            content = str(vals[5]) if len(vals) > 5 else ""
+            if not content:
+                return
+            normalized = _normalize_arabic(content)  # records into _NORM_CALLS
+            _dbg_pin[0] = (content.encode("utf-8"), normalized.encode("utf-8"),
+                           f"row: {content[:24]!r}")
+            unpin_btn.state(["!disabled"])
+            _render()
+
+        tree.bind("<<TreeviewSelect>>", _on_tree_select, add="+")
+
+        _dbg_seen = [0]
+        def _dbg_tick() -> None:
+            n = len(_NORM_CALLS)
+            if n != _dbg_seen[0]:
+                _refill_listbox()
+                if not _dbg_paused[0] and _dbg_pin[0] is None:
+                    _render()
+                _dbg_seen[0] = n
+            root.after(150, _dbg_tick)
+        root.after(150, _dbg_tick)
+        _render()
+
+        # Runtime toggle for the debug panel (View menu / Cmd+D).
+        def _toggle_debug_panel(_event: object = None) -> str:
+            on = not _DEBUG_NATIVE
+            _set_debug_native(on)
+            if on:
+                dbg_frame.pack(fill="x", side="bottom", padx=10, pady=(2, 2))
+                root.after(10, lambda: _auto_fit(grow_only=True))
+            else:
+                dbg_frame.pack_forget()
+            try:
+                view_menu.entryconfigure(0, label=("✓ Debug panel"
+                                                  if on else "  Debug panel"))
+            except Exception:
+                pass
+            return "break"
+
+        menubar   = tk.Menu(root)
+        view_menu = tk.Menu(menubar, tearoff=False)
+        view_menu.add_command(
+            label=("✓ Debug panel" if _DEBUG_NATIVE else "  Debug panel"),
+            accelerator="Cmd+D",
+            command=_toggle_debug_panel,
+        )
+        view_menu.add_command(
+            label="Auto-fit window",
+            accelerator="Cmd+0",
+            command=lambda: _auto_fit(grow_only=False),
+        )
+        menubar.add_cascade(label="View", menu=view_menu)
+        root.config(menu=menubar)
+        root.bind("<Command-d>", _toggle_debug_panel)
+        root.bind("<Control-d>", _toggle_debug_panel)  # Linux/Win fallback
+        root.bind("<Command-0>", lambda _e: _auto_fit(grow_only=False))
+        root.bind("<Control-0>", lambda _e: _auto_fit(grow_only=False))
+
     # ── Claude chat panel (packed before table so it always gets its space) ──
+    # Conversational mode: maintains history, auto-grounds answers in the files
+    # listed in the Files/folders field. When that field changes, the
+    # conversation is reset with the new file content as context.
     _chat_font = (_arabic_font[0] if _arabic_font else "Menlo", 13)
     chat_frame = ttk.LabelFrame(root, text="Claude Chat", padding=(6, 4))
     chat_frame.pack(fill="x", side="bottom", padx=10, pady=(2, 2))
 
-    # terminal-style log: dark bg, light text
+    chat_context_var = tk.StringVar(value="Context: (none — add files above to ground answers)")
+    chat_context_lbl = ttk.Label(chat_frame, textvariable=chat_context_var,
+                                 foreground="#6b6b6b")
+    chat_context_lbl.pack(fill="x", anchor="w", pady=(0, 2))
+
+    # Warm "paper" theme — easier on the eyes than the previous black terminal
+    # look. Light cream bg, near-black text, restrained accent colours for
+    # speaker tags.
+    _CHAT_BG       = "#fbf8f1"
+    _CHAT_FG       = "#2b2b2b"
+    _CHAT_BORDER   = "#d8d2c4"
+    _CHAT_SEL_BG   = "#d4e4f7"
+    _CHAT_ENTRY_BG = "#ffffff"
+
+    chat_log_wrap = tk.Frame(chat_frame, bg=_CHAT_BORDER, padx=1, pady=1)
+    chat_log_wrap.pack(fill="both", expand=True, pady=(0, 4))
     chat_log = tk.Text(
-        chat_frame, height=5, state="disabled", wrap="word",
+        chat_log_wrap, height=8, state="disabled", wrap="word",
         font=_chat_font,
-        background="#1e1e1e", foreground="#d4d4d4",
-        insertbackground="#ffffff", relief="flat", borderwidth=0,
+        background=_CHAT_BG, foreground=_CHAT_FG,
+        insertbackground=_CHAT_FG, relief="flat", borderwidth=0,
+        padx=10, pady=8,
+        selectbackground=_CHAT_SEL_BG, selectforeground="#000000",
     )
-    chat_log.pack(fill="x", expand=False, pady=(0, 4))
-    chat_log.tag_config("you",    foreground="#4fc1ff", font=(*_chat_font[:1], _chat_font[1], "bold"))
-    chat_log.tag_config("claude", foreground="#89d185")
-    chat_log.tag_config("err",    foreground="#f44747")
-    chat_log.tag_config("sys",    foreground="#808080")
+    chat_log.pack(fill="both", expand=True)
+    # Bold prefix + colored body for each speaker. spacing1/3 = breathing room
+    # above/below each block so the conversation reads as discrete turns.
+    _chat_fam, _chat_sz = _chat_font[:2]
+    chat_log.tag_config("you",         foreground="#0a5cb0",
+                        font=(_chat_fam, _chat_sz, "bold"),
+                        spacing1=6, spacing3=2,
+                        background="#eef4fb", lmargin1=8, lmargin2=8, rmargin=8)
+    chat_log.tag_config("claude",      foreground="#1a6e34",
+                        font=(_chat_fam, _chat_sz),
+                        spacing1=6, spacing3=4,
+                        background="#eef7ee", lmargin1=8, lmargin2=8, rmargin=8)
+    chat_log.tag_config("err",         foreground="#a8302b",
+                        font=(_chat_fam, _chat_sz, "bold"),
+                        background="#fdecec", lmargin1=8, lmargin2=8, rmargin=8)
+    chat_log.tag_config("sys",         foreground="#8a7f6a",
+                        font=(_chat_fam, _chat_sz, "italic"),
+                        spacing1=2, spacing3=2)
+    # Tool calls — distinct purple, easy to scan
+    chat_log.tag_config("tool",        foreground="#6b3aa0",
+                        font=(_chat_fam, _chat_sz, "bold"),
+                        background="#f3eefa", lmargin1=8, lmargin2=8, rmargin=8,
+                        spacing1=3, spacing3=1)
+    # Tool results — teal, muted body so it's distinct from tool calls
+    chat_log.tag_config("tool_result", foreground="#0e6a72",
+                        font=(_chat_fam, _chat_sz),
+                        background="#eaf6f7", lmargin1=8, lmargin2=8, rmargin=8,
+                        spacing1=1, spacing3=4)
+    # Animated "thinking" indicator
+    chat_log.tag_config("thinking",    foreground="#7a7a7a",
+                        font=(_chat_fam, _chat_sz, "italic"),
+                        spacing1=2, spacing3=2)
 
     chat_input_row = ttk.Frame(chat_frame)
     chat_input_row.pack(fill="x")
+    chat_entry_wrap = tk.Frame(chat_input_row, bg=_CHAT_BORDER, padx=1, pady=1)
+    chat_entry_wrap.pack(side="left", fill="x", expand=True, padx=(0, 4))
     chat_entry = tk.Entry(
-        chat_input_row,
+        chat_entry_wrap,
         font=_chat_font,
-        background="#2d2d2d", foreground="#d4d4d4",
-        insertbackground="#ffffff", relief="flat",
-        disabledbackground="#1e1e1e", disabledforeground="#555555",
+        background=_CHAT_ENTRY_BG, foreground=_CHAT_FG,
+        insertbackground=_CHAT_FG, relief="flat",
+        disabledbackground="#efece4", disabledforeground="#a8a8a8",
     )
-    chat_entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 4))
+    chat_entry.pack(fill="x", expand=True, ipady=5)
     chat_send_btn = ttk.Button(chat_input_row, text="Send", width=8)
     chat_send_btn.pack(side="left")
+    chat_reset_btn = ttk.Button(chat_input_row, text="Reset", width=8)
+    chat_reset_btn.pack(side="left", padx=(4, 0))
+
+    # ── chat state ───────────────────────────────────────────────────────────
+    # messages: full conversation, including the leading "context" turn pair
+    # if files are loaded. files_sig: signature of the files currently loaded
+    # into context (used to detect when the user changed the file selection).
+    chat_state: Dict[str, object] = {
+        "messages": [],          # List[{"role": ..., "content": ...}]
+        "files_sig": "",
+        "context_files": [],     # List[str]
+        "context_chars": 0,
+    }
+    _CHAT_CONTEXT_BUDGET = 60_000     # ~15k tokens
+    _CHAT_MAX_HISTORY    = 20         # user/assistant turns kept after the context pair
+    _CHAT_TOOL_ROUNDS    = 8          # max tool-use rounds per turn
+
+    # ── Claude file tools — let chat operate on algorithmic search results ───
+    # Tools are passed on every chat turn. Claude decides whether to use them.
+    # All file paths must resolve under a search-result file OR the currently
+    # selected files/folders, so chat can only act on files the user has
+    # already chosen.
+    _CHAT_TOOLS = [
+        {
+            "name": "list_results",
+            "description": "List files found by the most recent (algorithmic) search, "
+                           "with per-file match counts and a few sample matched lines. "
+                           "Use this first to see what the algorithm found.",
+            "input_schema": {"type": "object", "properties": {}, "required": []},
+        },
+        {
+            "name": "read_file_chunk",
+            "description": "Read a slice of a UTF-8 text file. Use 1-based line numbers. "
+                           "Returns lines prefixed with their line number. "
+                           "For PDF/DOCX, you usually want the pre-extracted text in "
+                           "the chat context — only use this for plain text/markdown/code.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path":       {"type": "string"},
+                    "start_line": {"type": "integer", "description": "1-based first line (default 1)"},
+                    "max_lines":  {"type": "integer", "description": "max lines to return (default 200, max 1000)"},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "write_file",
+            "description": "Overwrite a file with new content. Use this for creating "
+                           "summaries, extracts, or transformed versions of search results.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
+            "name": "append_to_file",
+            "description": "Append content to an existing file (creates it if missing).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    ]
+
+    def _allowed_paths() -> set:
+        """Paths Claude is permitted to read/write: current results + selected
+        files/folders. Folders allow any file *within* them."""
+        roots = set()
+        roots.update(state.get("results", {}).keys())  # type: ignore[union-attr]
+        roots.update(parse_files_field(files_var.get()))
+        return roots
+
+    def _path_allowed(p: str) -> bool:
+        try:
+            rp = Path(p).resolve()
+        except Exception:
+            return False
+        for root_p in _allowed_paths():
+            try:
+                root_resolved = Path(root_p).resolve()
+            except Exception:
+                continue
+            if rp == root_resolved:
+                return True
+            if root_resolved.is_dir() and root_resolved in rp.parents:
+                return True
+        return False
+
+    def _tool_list_results() -> str:
+        results = state.get("results", {})  # type: ignore[assignment]
+        if not results:
+            return ("No search results loaded. Run a search first "
+                    "(the user can do this; you cannot trigger it).")
+        out = []
+        for fp, (_lines, matches) in results.items():  # type: ignore[misc]
+            sample = []
+            for m in matches[:5]:
+                pg = f" p.{m.page_num}" if m.page_num else ""
+                sample.append(f"L{m.line_num}{pg} (score={m.score}): "
+                              f"{m.line.strip()[:120]}")
+            out.append({
+                "path":        fp,
+                "match_count": len(matches),
+                "samples":     sample,
+            })
+        import json as _json
+        return _json.dumps(out, ensure_ascii=False, indent=2)
+
+    def _tool_read_chunk(path: str, start_line: int = 1, max_lines: int = 200) -> str:
+        if not path:
+            return "error: path is required"
+        if not _path_allowed(path):
+            return (f"error: {path!r} is outside the current search-results / "
+                    f"selected-files scope. The user must select it first.")
+        max_lines = max(1, min(int(max_lines or 200), 1000))
+        start_line = max(1, int(start_line or 1))
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+        except Exception as e:
+            return f"error reading {path}: {type(e).__name__}: {e}"
+        chunk = all_lines[start_line - 1 : start_line - 1 + max_lines]
+        if not chunk:
+            return (f"(empty slice — file has {len(all_lines)} lines, "
+                    f"requested start_line={start_line})")
+        body = "".join(f"{start_line + i}: {ln}" for i, ln in enumerate(chunk))
+        suffix = ""
+        if start_line - 1 + max_lines < len(all_lines):
+            suffix = f"\n… (file has {len(all_lines)} lines total)"
+        return body + suffix
+
+    def _tool_write(path: str, content: str, append: bool = False) -> str:
+        if not path:
+            return "error: path is required"
+        if not _path_allowed(path):
+            # Allow writing NEW files inside an allowed directory.
+            parent_ok = False
+            try:
+                parent = Path(path).resolve().parent
+                for root_p in _allowed_paths():
+                    root_resolved = Path(root_p).resolve()
+                    if root_resolved.is_dir() and (root_resolved == parent
+                                                   or root_resolved in parent.parents):
+                        parent_ok = True; break
+            except Exception:
+                pass
+            if not parent_ok:
+                return (f"error: {path!r} is outside the allowed scope. Write "
+                        f"under a selected file or folder.")
+        try:
+            mode = "a" if append else "w"
+            with open(path, mode, encoding="utf-8") as f:
+                f.write(content)
+            return (f"{'appended' if append else 'wrote'} {len(content)} chars "
+                    f"to {path}")
+        except Exception as e:
+            return f"error writing {path}: {type(e).__name__}: {e}"
+
+    def _dispatch_tool(name: str, args: dict) -> str:
+        if name == "list_results":
+            return _tool_list_results()
+        if name == "read_file_chunk":
+            return _tool_read_chunk(
+                args.get("path", ""),
+                args.get("start_line", 1),
+                args.get("max_lines", 200),
+            )
+        if name == "write_file":
+            return _tool_write(args.get("path", ""), args.get("content", ""),
+                               append=False)
+        if name == "append_to_file":
+            return _tool_write(args.get("path", ""), args.get("content", ""),
+                               append=True)
+        return f"unknown tool: {name}"
 
     def _chat_has_key() -> bool:
         return bool(_gui_state.get("api_key") or os.environ.get("ANTHROPIC_API_KEY"))
@@ -978,9 +1697,11 @@ def run_gui() -> int:
         if _chat_has_key():
             chat_entry.config(state="normal")
             chat_send_btn.config(state="normal")
+            chat_reset_btn.config(state="normal")
         else:
             chat_entry.config(state="disabled")
             chat_send_btn.config(state="disabled")
+            chat_reset_btn.config(state="disabled")
             chat_log.config(state="normal")
             chat_log.insert("end", "system: Set an API key via 'API Key…' to use chat.\n", "sys")
             chat_log.see("end")
@@ -991,6 +1712,120 @@ def run_gui() -> int:
         chat_log.insert("end", f"{prefix}: {text}\n", tag)
         chat_log.see("end")
         chat_log.config(state="disabled")
+
+    # Inline streaming helpers: write a prefix once, then append deltas, then
+    # finish with newline. Lets text appear character-by-character while
+    # Claude is still generating.
+    def _chat_begin_turn(tag: str, prefix: str) -> None:
+        chat_log.config(state="normal")
+        chat_log.insert("end", f"{prefix}: ", tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+
+    def _chat_append_text(tag: str, text: str) -> None:
+        chat_log.config(state="normal")
+        chat_log.insert("end", text, tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+
+    def _chat_end_turn(tag: str) -> None:
+        chat_log.config(state="normal")
+        chat_log.insert("end", "\n", tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+
+    # Animated "claude is thinking…" indicator. Insert returns a handle; pass
+    # it back to _stop_thinking() to remove the line when the response lands.
+    _thinking_handles: Dict[str, dict] = {}
+
+    _thinking_counter = [0]
+
+    def _start_thinking(label: str = "claude is thinking") -> str:
+        _thinking_counter[0] += 1
+        handle_id = f"thk_{_thinking_counter[0]}"
+        chat_log.config(state="normal")
+        start_idx = chat_log.index("end-1c")
+        chat_log.insert("end", f"{label}\n", "thinking")
+        chat_log.config(state="disabled")
+        chat_log.see("end")
+        info = {"start": start_idx, "label": label, "alive": True, "dots": 0}
+        _thinking_handles[handle_id] = info
+        def _tick():
+            if not info["alive"]:
+                return
+            info["dots"] = (info["dots"] + 1) % 4
+            dots = "." * info["dots"] + " " * (3 - info["dots"])
+            chat_log.config(state="normal")
+            line_end = f"{info['start']} lineend"
+            chat_log.delete(info["start"], line_end)
+            chat_log.insert(info["start"], f"{label}{dots}", "thinking")
+            chat_log.config(state="disabled")
+            root.after(350, _tick)
+        root.after(350, _tick)
+        return handle_id
+
+    def _stop_thinking(handle_id: str) -> None:
+        info = _thinking_handles.pop(handle_id, None)
+        if not info:
+            return
+        info["alive"] = False
+        try:
+            chat_log.config(state="normal")
+            # Remove the entire line (the indicator + its trailing newline).
+            chat_log.delete(info["start"], f"{info['start']} lineend +1c")
+            chat_log.config(state="disabled")
+        except Exception:
+            pass
+
+    def _update_chat_context_label() -> None:
+        included = chat_state["context_files"]  # type: ignore[index]
+        chars = int(chat_state["context_chars"])  # type: ignore[arg-type]
+        if included:
+            names = ", ".join(os.path.basename(p) for p in included[:3])  # type: ignore[union-attr]
+            if len(included) > 3:  # type: ignore[arg-type]
+                names += f" + {len(included) - 3} more"  # type: ignore[arg-type]
+            chat_context_var.set(f"Context: {names}  ·  {chars/1000:.1f}k chars")
+        else:
+            chat_context_var.set("Context: (none — add files above to ground answers)")
+
+    def _build_chat_context(paths: List[str], recursive: bool
+                            ) -> Tuple[str, List[str], int]:
+        """Read the user's selected files into one numbered text blob for Claude.
+        Returns (body, included_paths, total_chars). Truncates at _CHAT_CONTEXT_BUDGET."""
+        files = collect_files(paths, recursive)
+        chunks: List[str] = []
+        included: List[str] = []
+        used = 0
+        for fp in files:
+            if used >= _CHAT_CONTEXT_BUDGET:
+                break
+            lines = read_lines(fp)
+            if not lines:
+                continue
+            pg_map = _pdf_page_map.get(fp, [])
+            body_lines: List[str] = []
+            for i, line in enumerate(lines, 1):
+                pg = pg_map[i - 1] if pg_map and i - 1 < len(pg_map) else 0
+                tag = f"[p.{pg} L{i}]" if pg else f"[L{i}]"
+                body_lines.append(f"{tag} {line}")
+            section = f"=== {os.path.basename(fp)} ({fp}) ===\n" + "\n".join(body_lines)
+            if used + len(section) > _CHAT_CONTEXT_BUDGET:
+                section = section[: _CHAT_CONTEXT_BUDGET - used] + "\n…[truncated]"
+            chunks.append(section)
+            included.append(fp)
+            used += len(section)
+        return "\n\n".join(chunks), included, used
+
+    def _reset_chat(_event: object = None) -> None:
+        chat_state["messages"] = []
+        chat_state["files_sig"] = ""
+        chat_state["context_files"] = []
+        chat_state["context_chars"] = 0
+        chat_log.config(state="normal")
+        chat_log.delete("1.0", "end")
+        chat_log.config(state="disabled")
+        _update_chat_context_label()
+        _append_chat("sys", "system", "Conversation reset.")
 
     def _send_chat(_event: object = None) -> None:
         msg = chat_entry.get().strip()
@@ -1003,19 +1838,235 @@ def run_gui() -> int:
         _append_chat("you", "you", msg)
         chat_entry.config(state="disabled")
         chat_send_btn.config(state="disabled")
+        chat_reset_btn.config(state="disabled")
+
+        # If the Files/folders selection changed (or this is the first turn
+        # with files), rebuild file context and reset the conversation.
+        paths = parse_files_field(files_var.get())
+        sig = "\0".join(sorted(paths))
+        if paths and sig != chat_state["files_sig"]:
+            _append_chat("sys", "system", "Loading files into context…")
+            body, included, used = _build_chat_context(paths, recursive_var.get())
+            chat_state["files_sig"] = sig
+            chat_state["context_files"] = included
+            chat_state["context_chars"] = used
+            if body:
+                chat_state["messages"] = [
+                    {
+                        "role": "user",
+                        "content": (
+                            "I'll ask you questions about the files below. When you "
+                            "quote or reference specific passages, cite the line tags "
+                            "like [L42] or [p.3 L42] so I can jump to the spot.\n\n"
+                            + body
+                        ),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": f"Loaded {len(included)} file(s) ({used:,} chars). Ask away.",
+                    },
+                ]
+            else:
+                chat_state["messages"] = []
+            _update_chat_context_label()
+
+        # Build the request payload (cap history but always keep the leading
+        # context turn pair so file content stays available across many turns).
+        history = list(chat_state["messages"])  # type: ignore[arg-type]
+        if chat_state["context_files"]:
+            head = history[:2]
+            tail = history[2:][-_CHAT_MAX_HISTORY:]
+            messages = head + tail + [{"role": "user", "content": msg}]
+        else:
+            tail = history[-_CHAT_MAX_HISTORY:]
+            messages = tail + [{"role": "user", "content": msg}]
 
         def _worker() -> None:
             try:
                 import anthropic as _ant
                 client = _ant.Anthropic(api_key=api_key)
-                resp = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=2048,
-                    messages=[{"role": "user", "content": msg}],
+                system_prompt = (
+                    "You are a research assistant embedded in a file-search tool.\n\n"
+                    "When the user has loaded files, ground every answer in their "
+                    "content and cite line tags like [L42] or [p.3 L42] when "
+                    "quoting specific passages.\n\n"
+                    "Tools available:\n"
+                    "  • list_results — see files the user's last (non-AI) search hit\n"
+                    "  • read_file_chunk — read a slice of a file (text only)\n"
+                    "  • write_file — overwrite a file (e.g. summaries, extracts)\n"
+                    "  • append_to_file — add to a file\n\n"
+                    "Use tools when the user asks you to inspect, transform, or "
+                    "produce files from the search results. Read before you "
+                    "write. If a question can be answered from the in-context "
+                    "files alone, answer directly without using tools."
                 )
-                from anthropic.types import TextBlock as _TB
-                reply = next((b.text for b in resp.content if isinstance(b, _TB)), "")
-                root.after(0, lambda: _append_chat("claude", "claude", reply))
+
+                current = list(messages)
+                final_text_parts: List[str] = []
+                think_box = {"id": None}  # mutable so the lambda below can read it
+
+                def _begin_think(label: str) -> None:
+                    think_box["id"] = _start_thinking(label)
+
+                def _end_think() -> None:
+                    if think_box["id"]:
+                        _stop_thinking(think_box["id"])
+                        think_box["id"] = None
+
+                for _round in range(_CHAT_TOOL_ROUNDS):
+                    label = ("claude is thinking" if _round == 0
+                             else f"claude is working (round {_round + 1})")
+                    root.after(0, _begin_think, label)
+
+                    # Streaming state for this round
+                    text_for_round: List[str] = []
+                    text_turn_open = [False]
+                    thinking_turn_open = [False]
+
+                    def _close_open_turns() -> None:
+                        if thinking_turn_open[0]:
+                            _chat_end_turn("thinking")
+                            thinking_turn_open[0] = False
+                        if text_turn_open[0]:
+                            _chat_end_turn("claude")
+                            text_turn_open[0] = False
+
+                    # Try with extended thinking enabled; if the SDK or model
+                    # rejects it, fall back to a plain streaming call.
+                    def _open_stream(with_thinking: bool):
+                        kwargs = dict(
+                            model="claude-sonnet-4-6",
+                            max_tokens=4096,
+                            system=system_prompt,
+                            tools=_CHAT_TOOLS,
+                            messages=current,
+                        )
+                        if with_thinking:
+                            kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4000}
+                        return client.messages.stream(**kwargs)
+
+                    try:
+                        stream_ctx = _open_stream(with_thinking=True)
+                    except Exception:
+                        stream_ctx = _open_stream(with_thinking=False)
+
+                    try:
+                        with stream_ctx as stream:
+                            for event in stream:
+                                etype = getattr(event, "type", None)
+                                if etype == "content_block_start":
+                                    cb = getattr(event, "content_block", None)
+                                    cbt = getattr(cb, "type", None)
+                                    if cbt == "thinking":
+                                        root.after(0, _end_think)
+                                        root.after(0, _chat_begin_turn,
+                                                   "thinking", "💭 thinking")
+                                        thinking_turn_open[0] = True
+                                    elif cbt == "text":
+                                        root.after(0, _end_think)
+                                        if thinking_turn_open[0]:
+                                            root.after(0, _chat_end_turn, "thinking")
+                                            thinking_turn_open[0] = False
+                                        root.after(0, _chat_begin_turn,
+                                                   "claude", "claude")
+                                        text_turn_open[0] = True
+                                elif etype == "content_block_delta":
+                                    delta = getattr(event, "delta", None)
+                                    dtype = getattr(delta, "type", None)
+                                    if dtype == "text_delta":
+                                        t = delta.text or ""
+                                        text_for_round.append(t)
+                                        root.after(0, _chat_append_text, "claude", t)
+                                    elif dtype == "thinking_delta":
+                                        t = getattr(delta, "thinking", "") or ""
+                                        root.after(0, _chat_append_text, "thinking", t)
+                                elif etype == "content_block_stop":
+                                    if thinking_turn_open[0]:
+                                        root.after(0, _chat_end_turn, "thinking")
+                                        thinking_turn_open[0] = False
+                            final_msg = stream.get_final_message()
+                    finally:
+                        root.after(0, _end_think)
+                        # Always close any open turn so the next prefix lands fresh
+                        root.after(0, _close_open_turns)
+
+                    # Reconstruct assistant block list for the next round's request.
+                    tool_uses: List[object] = []
+                    assistant_blocks: List[dict] = []
+                    for b in final_msg.content:
+                        btype = getattr(b, "type", None)
+                        if btype == "text":
+                            assistant_blocks.append({"type": "text", "text": b.text})
+                        elif btype == "tool_use":
+                            tool_uses.append(b)
+                            assistant_blocks.append({
+                                "type":  "tool_use",
+                                "id":    b.id,
+                                "name":  b.name,
+                                "input": b.input,
+                            })
+                        elif btype == "thinking":
+                            # Required by the API to be echoed back in subsequent
+                            # turns when interleaved thinking is in use.
+                            assistant_blocks.append({
+                                "type":      "thinking",
+                                "thinking":  getattr(b, "thinking", ""),
+                                "signature": getattr(b, "signature", ""),
+                            })
+
+                    full_text = "".join(text_for_round).strip()
+                    if full_text:
+                        final_text_parts.append(full_text)
+
+                    if final_msg.stop_reason != "tool_use" or not tool_uses:
+                        break
+
+                    # Execute tools and feed results back. Show each call AND
+                    # a brief preview of its result so the user can see progress.
+                    current.append({"role": "assistant", "content": assistant_blocks})
+                    tool_results = []
+                    for tu in tool_uses:
+                        tu_input = getattr(tu, "input", {}) or {}
+                        preview_args = ", ".join(
+                            f"{k}={str(v)[:60]!r}" + ("…" if len(str(v)) > 60 else "")
+                            for k, v in tu_input.items()
+                        )
+                        root.after(0, lambda n=tu.name, p=preview_args:
+                                   _append_chat("tool", "→ tool", f"{n}({p})"))
+                        try:
+                            result = _dispatch_tool(tu.name, tu_input)
+                        except Exception as te:
+                            result = f"error in tool {tu.name}: {type(te).__name__}: {te}"
+                        # First-line preview for the chat; full result still goes to Claude.
+                        first_line = result.splitlines()[0] if result else "(empty)"
+                        preview = first_line[:160] + ("…" if len(first_line) > 160 else "")
+                        if "\n" in result:
+                            preview += f"  (+{result.count(chr(10))} more lines)"
+                        root.after(0, lambda r=preview:
+                                   _append_chat("tool_result", "← result", r))
+                        # Cap tool output so we don't blow context.
+                        if len(result) > 12_000:
+                            result = result[:12_000] + f"\n… (+{len(result) - 12_000} chars)"
+                        tool_results.append({
+                            "type":        "tool_result",
+                            "tool_use_id": tu.id,
+                            "content":     result,
+                        })
+                    current.append({"role": "user", "content": tool_results})
+                else:
+                    root.after(0, _end_think)
+                    root.after(0, lambda: _append_chat(
+                        "sys", "system",
+                        f"(stopped after {_CHAT_TOOL_ROUNDS} tool rounds)"))
+
+                final_reply = "\n\n".join(final_text_parts)
+
+                def _commit() -> None:
+                    msgs = list(chat_state["messages"])  # type: ignore[arg-type]
+                    msgs.append({"role": "user", "content": msg})
+                    msgs.append({"role": "assistant", "content": final_reply or "(no text reply)"})
+                    chat_state["messages"] = msgs
+                root.after(0, _commit)
             except Exception as exc:
                 root.after(0, lambda: _append_chat("err", "error", str(exc)))
             finally:
@@ -1024,8 +2075,10 @@ def run_gui() -> int:
         threading.Thread(target=_worker, daemon=True).start()
 
     chat_send_btn.config(command=_send_chat)
+    chat_reset_btn.config(command=_reset_chat)
     chat_entry.bind("<Return>", _send_chat)
     _update_chat_state()
+    _update_chat_context_label()
 
     # ── argument parsing for the files field ─────────────────────────────────
     import shlex
@@ -1053,6 +2106,11 @@ def run_gui() -> int:
                 return
             results: Dict[str, Tuple[List[str], List[Match]]] = {}
             for i, fp in enumerate(files, 1):
+                # Honour Stop button between files. (Mid-file cancellation
+                # isn't supported — the current file finishes first.)
+                if state.get("cancel_search"):
+                    msg_q.put(("cancelled", results))
+                    return
                 msg_q.put(("status", f"Searching {i}/{len(files)}: {fp}"))
                 if ai:
                     _api_key = str(_gui_state.get("api_key") or os.environ.get("ANTHROPIC_API_KEY") or "")
@@ -1104,9 +2162,11 @@ def run_gui() -> int:
         _gui_state["threshold"]      = threshold_var.get()
         _save_state(_gui_state)
         state["searching"] = True
+        state["cancel_search"] = False
         state["results"] = {}
         state["pattern"] = pat
         search_btn.config(state="disabled", text="Searching…")
+        stop_btn.config(state="normal")
         export_btn.config(state="disabled")
         tree.delete(*tree.get_children())
         status_var.set("Starting…")
@@ -1120,7 +2180,15 @@ def run_gui() -> int:
         t.start()
 
     _row_paths: Dict[str, str] = {}       # iid → full file path
+    _row_full_lines: Dict[str, str] = {}  # iid → full match text for tooltips
     _highlighted_pdfs: Dict[str, str] = {}  # original path → highlighted copy path
+
+    # Monotonic counter so each highlighted-copy filename is unique. We used to
+    # use id(_doc) here, but CPython reuses object IDs after the doc is closed
+    # and GC'd — that caused two different searches to write the same tmp path,
+    # which made Preview show its cached first-open page on subsequent opens.
+    import itertools as _itertools
+    _tmp_counter = _itertools.count(1)
 
     def _build_highlighted_pdf(fp: str, matches: List[Match]) -> str:
         """Highlight matched lines in a PDF copy. For complex layouts (RTL,
@@ -1214,7 +2282,11 @@ def run_gui() -> int:
                         if _best_bbox:
                             _pg.add_highlight_annot(_fitz.Rect(_best_bbox))
 
-            _tmp = str(_tmp_dir / f"fuzzer_{os.getpid()}_{id(_doc)}.pdf")
+            import time as _t
+            _tmp = str(
+                _tmp_dir
+                / f"fuzzer_{os.getpid()}_{next(_tmp_counter)}_{_t.time_ns()}.pdf"
+            )
             _doc.save(_tmp)
             _doc.close()
             return _tmp
@@ -1242,6 +2314,7 @@ def run_gui() -> int:
                     display_name, m.line_num, page_text, match_type, score_text,
                     _fix_arabic(_snippet)), tags=(_tag,))
                 _row_paths[iid] = fp
+                _row_full_lines[iid] = _fix_arabic(m.line)
                 total += 1
             # Pre-build highlighted copy for every PDF in results
             if Path(fp).suffix.lower() == ".pdf":
@@ -1253,8 +2326,15 @@ def run_gui() -> int:
             f"in {n_files} file{'s' if n_files != 1 else ''}"
         )
 
+    def stop_search() -> None:
+        if not state["searching"]:
+            return
+        state["cancel_search"] = True
+        stop_btn.config(state="disabled")
+        status_var.set("Cancelling… (current file will finish first)")
+
     def poll_queue() -> None:
-        try:
+        with contextlib.suppress(queue.Empty):
             while True:
                 kind, payload = msg_q.get_nowait()
                 if kind == "status":
@@ -1262,25 +2342,41 @@ def run_gui() -> int:
                 elif kind == "done":
                     state["results"] = payload  # type: ignore[assignment]
                     state["searching"] = False
+                    state["cancel_search"] = False
                     search_btn.config(state="normal", text="Search")
+                    stop_btn.config(state="disabled")
                     if payload:
                         populate(payload)  # type: ignore[arg-type]
                         export_btn.config(state="normal")
                     else:
                         status_var.set("No matches found.")
                         export_btn.config(state="disabled")
+                elif kind == "cancelled":
+                    state["results"] = payload  # type: ignore[assignment]
+                    state["searching"] = False
+                    state["cancel_search"] = False
+                    search_btn.config(state="normal", text="Search")
+                    stop_btn.config(state="disabled")
+                    if payload:
+                        populate(payload)  # type: ignore[arg-type]
+                        export_btn.config(state="normal")
+                        status_var.set(f"Stopped — {sum(len(m) for _, m in payload.values())} "  # type: ignore[union-attr]
+                                       f"match(es) in {len(payload)} file(s) before cancel")
+                    else:
+                        status_var.set("Stopped — no results yet")
                 elif kind == "error":
                     state["searching"] = False
+                    state["cancel_search"] = False
                     search_btn.config(state="normal", text="Search")
+                    stop_btn.config(state="disabled")
                     status_var.set(f"Error: {payload}")
                     messagebox.showerror("fuzzer", str(payload))
-        except queue.Empty:
-            pass
         root.after(100, poll_queue)
 
     def clear_results() -> None:
         tree.delete(*tree.get_children())
         _row_paths.clear()
+        _row_full_lines.clear()
         state["results"] = {}
         export_btn.config(state="disabled")
         status_var.set("Ready")
@@ -1448,15 +2544,220 @@ def run_gui() -> int:
         dlg.bind("<Return>", lambda _e: _save())
 
     search_btn.config(command=start_search)
+    stop_btn.config(command=stop_search)
     clear_btn.config(command=clear_results)
     export_btn.config(command=export_to_file)
     apikey_btn.config(command=set_api_key)
+    def _set_selected_preview_from_iid(iid: str) -> None:
+        vals = tree.item(iid, "values")
+        if not vals:
+            selected_var.set("")
+            return
+
+        filepath = _row_paths.get(iid, "")
+        filename = os.path.basename(filepath) if filepath else str(vals[0]) if len(vals) > 0 else ""
+
+        # values order: (file, line, page, match, score, content)
+        try:
+            line_num = int(vals[1])
+        except Exception:
+            line_num = 1
+
+        page_text = str(vals[2]) if len(vals) > 2 else ""
+        match_type = str(vals[3]) if len(vals) > 3 else ""
+        score_text = str(vals[4]) if len(vals) > 4 else ""
+        content = str(vals[5]) if len(vals) > 5 else ""
+
+        score_suffix = ""
+        if match_type == "fuzzy" and score_text:
+            score_suffix = f" {score_text}%"
+
+        page_suffix = f" (page {page_text})" if page_text else ""
+
+        short = content.strip().replace("\n", " ")
+        if len(short) > 160:
+            short = short[:157] + "…"
+
+        selected_var.set(
+            f"{filename}:{line_num} {match_type}{score_suffix}{page_suffix} — {short}"
+        )
+
+    def on_tree_select(_event: object = None) -> None:
+        sel = tree.selection()
+        if not sel:
+            return
+        _set_selected_preview_from_iid(str(sel[0]))
+
+    def copy_selected(_event: object = None) -> str:
+        sel = tree.selection()
+        if not sel:
+            return "break"
+        iid = str(sel[0])
+
+        filepath = _row_paths.get(iid, "")
+        vals = tree.item(iid, "values")
+        if not vals:
+            return "break"
+
+        try:
+            line_num = int(vals[1])
+        except Exception:
+            line_num = 1
+
+        page_text = str(vals[2]) if len(vals) > 2 else ""
+        match_type = str(vals[3]) if len(vals) > 3 else ""
+        score_text = str(vals[4]) if len(vals) > 4 else ""
+        content = str(vals[5]) if len(vals) > 5 else ""
+
+        score_suffix = ""
+        if match_type == "fuzzy" and score_text:
+            score_suffix = f" {score_text}%"
+
+        page_suffix = f" (page {page_text})" if page_text else ""
+        text = (
+            f"{filepath}:{line_num}{page_suffix}\n"
+            f"[{match_type}{score_suffix}]\n"
+            f"{content}"
+        )
+
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        status_var.set("Copied selected match")
+        return "break"
+
+    tree.bind("<<TreeviewSelect>>", on_tree_select, add="+")
+    tree.bind("<Control-c>", copy_selected, add="+")
+
+    # ── hover tooltip for full "Content" text ───────────────────────────
+    _hover_tip: List[Optional[tk.Toplevel]] = [None]
+    _hover_label: List[Optional[ttk.Label]] = [None]
+    _hover_iid: List[str] = [""]
+
+    def _hide_hover_tooltip() -> None:
+        if _hover_tip[0] is not None:
+            with contextlib.suppress(Exception):
+                _hover_tip[0].destroy()
+            _hover_tip[0] = None
+            _hover_label[0] = None
+        _hover_iid[0] = ""
+
+    def _ensure_hover_tip() -> None:
+        if _hover_tip[0] is not None:
+            return
+        _hover_tip[0] = tk.Toplevel(root)
+        _hover_tip[0].wm_overrideredirect(True)
+        _hover_tip[0].attributes("-topmost", True)
+        _hover_label[0] = ttk.Label(
+            _hover_tip[0],
+            background="#ffffc0",
+            relief="solid",
+            borderwidth=1,
+            padding=(6, 3),
+            wraplength=720,
+        )
+        _hover_label[0].pack(fill="both", expand=True)
+
+    def _on_tree_motion(event: object = None) -> None:
+        if event is None:
+            return
+        # Treeview x/y are widget-relative
+        x = getattr(event, "x", 0)
+        y = getattr(event, "y", 0)
+
+        col = tree.identify_column(x)  # e.g. "#6"
+        # content column index is 6 (("file","line","page","match","score","content"))
+        if col != "#6":
+            _hide_hover_tooltip()
+            return
+
+        iid = tree.identify_row(y)
+        if not iid:
+            _hide_hover_tooltip()
+            return
+
+        text = _row_full_lines.get(iid, "")
+        if not text:
+            _hide_hover_tooltip()
+            return
+
+        if _hover_tip[0] is None:
+            _ensure_hover_tip()
+
+        if iid != _hover_iid[0]:
+            _hover_iid[0] = iid
+            if _hover_label[0] is not None:
+                _hover_label[0].config(text=text)
+
+        # position tooltip near cursor
+        tip_x = tree.winfo_rootx() + x + 16
+        tip_y = tree.winfo_rooty() + y + 20
+        if _hover_tip[0] is not None:
+            _hover_tip[0].wm_geometry(f"+{tip_x}+{tip_y}")
+
+    def _on_tree_leave(_event: object = None) -> None:
+        _hide_hover_tooltip()
+
+    tree.bind("<Motion>", _on_tree_motion, add="+")
+    tree.bind("<Leave>", _on_tree_leave, add="+")
+
     tree.bind("<Double-1>", open_selected)
     tree.bind("<Return>", open_selected)
     pattern_entry.bind("<Return>", lambda _e: start_search())
     files_entry.bind("<Return>", lambda _e: start_search())
 
+    # ── top menu: Mode → Debug toggle ────────────────────────────────────────
+    # Wired here (rather than near root.title) so dbg_frame already exists and
+    # the toggle can pack/forget it directly.
+    menubar = tk.Menu(root)
+    root.config(menu=menubar)
+    mode_menu = tk.Menu(menubar, tearoff=False)
+    debug_mode_var = tk.BooleanVar(value=_DEBUG_NATIVE)
+
+    def _toggle_debug_mode() -> None:
+        enable = bool(debug_mode_var.get())
+        _set_debug_native(enable)
+        if enable:
+            dbg_frame.pack(fill="x", side="bottom", padx=10, pady=(2, 2))
+            status_var.set("Debug mode ON — native call inspector visible")
+        else:
+            dbg_frame.pack_forget()
+            status_var.set("Debug mode OFF — normal view")
+        _gui_state["debug_mode"] = enable
+        _save_state(_gui_state)
+
+    mode_menu.add_checkbutton(
+        label="Debug mode",
+        variable=debug_mode_var,
+        command=_toggle_debug_mode,
+        accelerator="⌘D" if sys.platform == "darwin" else "Ctrl+D",
+    )
+    mode_menu.add_separator()
+    mode_menu.add_command(label="Normal mode",
+                          command=lambda: (debug_mode_var.set(False),
+                                           _toggle_debug_mode()))
+    menubar.add_cascade(label="Mode", menu=mode_menu)
+
+    def _kbd_toggle(_e: object = None) -> str:
+        debug_mode_var.set(not debug_mode_var.get())
+        _toggle_debug_mode()
+        return "break"
+
+    root.bind_all("<Command-d>", _kbd_toggle)
+    root.bind_all("<Control-d>", _kbd_toggle)
+
     pattern_entry.focus_set()
+
+    def _on_close() -> None:
+        with contextlib.suppress(Exception):
+            _gui_state["window_geometry"] = root.geometry()
+            _save_state(_gui_state)
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+
+    # On first launch (no saved geometry), size the window to fit content.
+    if not _saved_geom:
+        root.after(50, lambda: _auto_fit(grow_only=False))
+
     root.after(100, poll_queue)
     root.mainloop()
     return 0
@@ -1492,6 +2793,7 @@ examples:
   fuzzer -o hits.xlsx "topic" *.pdf              export to Excel
   fuzzer -o hits.json "topic" *.pdf              export to JSON
   fuzzer --gui                                   launch graphical interface
+  fuzzer --test                                  GUI + live native-call inspector
   fuzzer                                         (no args also launches the GUI)
 """,
     )
@@ -1554,7 +2856,7 @@ examples:
             results[fp] = (lines, matches)
 
     if not results:
-        print(_c(_YEL) + "no matches found" + _r(), file=sys.stderr)
+        print(f"{_c(_YEL)}no matches found{_r()}", file=sys.stderr)
         return 1
 
     total = print_results(

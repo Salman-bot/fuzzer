@@ -4,3 +4,23 @@ __pycache__/
 .vscode/
 *.pyc
 .DS_Store
+
+# Generated codebase overview — regenerate with `make doc`.
+project_info.md
+project_info__*.md
+
+# Test PDF corpus — fetched on demand with `make test-corpus`.
+# (Tarball lives outside the repo; pattern guards against accidental drops.)
+test_pdfs/
+test_pdfs.tar.gz
+
+# Local tool / editor state, not shared.
+.sixth/
+
+# Built C extension (regenerate with `make build-native`).
+_ar_norm*.so
+native/build/
+native/_ar_norm*.so
+
+# HTML docs build output (regenerate with `make docs`).
+doc/_build/
