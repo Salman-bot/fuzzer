@@ -1931,8 +1931,9 @@ def run_gui() -> int:
                             _chat_end_turn("claude")
                             text_turn_open[0] = False
 
-                    # Try with extended thinking enabled; if the SDK or model
-                    # rejects it, fall back to a plain streaming call.
+                    # Try with extended thinking enabled (interleaved with tools,
+                    # via beta header). If the API rejects it on enter, fall
+                    # back to a plain streaming call.
                     def _open_stream(with_thinking: bool):
                         kwargs = dict(
                             model="claude-sonnet-4-6",
@@ -1943,16 +1944,15 @@ def run_gui() -> int:
                         )
                         if with_thinking:
                             kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4000}
+                            kwargs["extra_headers"] = {
+                                "anthropic-beta": "interleaved-thinking-2025-05-14"
+                            }
                         return client.messages.stream(**kwargs)
 
-                    try:
-                        stream_ctx = _open_stream(with_thinking=True)
-                    except Exception:
-                        stream_ctx = _open_stream(with_thinking=False)
-
-                    try:
-                        with stream_ctx as stream:
-                            for event in stream:
+                    def _consume_stream(with_thinking: bool):
+                        text_for_round.clear()
+                        with _open_stream(with_thinking=with_thinking) as _s:
+                            for event in _s:
                                 etype = getattr(event, "type", None)
                                 if etype == "content_block_start":
                                     cb = getattr(event, "content_block", None)
@@ -1984,10 +1984,26 @@ def run_gui() -> int:
                                     if thinking_turn_open[0]:
                                         root.after(0, _chat_end_turn, "thinking")
                                         thinking_turn_open[0] = False
-                            final_msg = stream.get_final_message()
+                            return _s.get_final_message()
+
+                    try:
+                        try:
+                            final_msg = _consume_stream(with_thinking=True)
+                        except Exception as e:
+                            err_text = str(e).lower()
+                            if "thinking" in err_text or "beta" in err_text:
+                                root.after(0, lambda: _append_chat(
+                                    "sys", "system",
+                                    "(extended thinking not available — "
+                                    "retrying without)"))
+                                # Close any partial blocks before retry
+                                root.after(0, _close_open_turns)
+                                root.after(0, _begin_think, "claude is working")
+                                final_msg = _consume_stream(with_thinking=False)
+                            else:
+                                raise
                     finally:
                         root.after(0, _end_think)
-                        # Always close any open turn so the next prefix lands fresh
                         root.after(0, _close_open_turns)
 
                     # Reconstruct assistant block list for the next round's request.
