@@ -26,7 +26,7 @@ is a small piece you can read top-to-bottom without juggling files.
 
 | Section | Lines | Purpose |
 | ------- | ----- | ------- |
-| Colour | ~30–50 | ANSI helpers (`_c`, `_r`, `_err`) |
+| Color | ~30–50 | ANSI helpers (`_c`, `_r`, `_err`) |
 | Types | ~52–60 | `Match` NamedTuple |
 | Text extraction | ~62–146 | `_extract_pdf`, `_extract_docx`, `_extract_plain`, `_EXT_MAP` |
 | Extraction cache | ~148–218 | SQLite-backed cache keyed by `(path, mtime)` |
@@ -69,6 +69,30 @@ The GUI runs the search on a background thread and posts updates through a
 searches and avoids the GIL contention that would arise from direct widget
 updates from the worker thread (Tk widgets are not thread-safe).
 
+### Streaming results
+
+The worker emits a `("match", fp, lines, matches)` message for **each file**
+as soon as it finishes, rather than accumulating all results and sending a
+single `("done", results)` at the end. This means:
+
+- Matches appear in the tree as soon as each file is scanned — the GUI never
+  looks frozen while a large file is being processed last.
+- Results from completed files survive a crash on a later file.
+- PDF highlight copies are built file-by-file (inside `_append_file_results`)
+  so they are ready to open before the full search finishes.
+
+A bare `("done",)` message (no payload) is sent once all files are exhausted
+or after a Stop, using `state["results"]` (populated incrementally by
+`"match"` messages) for the final summary.
+
+### PDF extraction robustness
+
+`_extract_pdf_pymupdf` wraps each page's `page.get_text()` call in a
+try/except. If `sort=True` raises (e.g., on a malformed Arabic page with
+complex glyph ordering), it retries with `sort=False`. If that also fails the
+page is silently skipped. A single bad page therefore does not abort extraction
+of the rest of the document.
+
 ### PDF highlighting (macOS)
 
 When a PDF result row is opened:
@@ -92,6 +116,71 @@ Tmp files older than 24 h are cleaned on every GUI launch.
 The full GUI/worker/Claude/cache interaction is in
 [sequence-diagram.md](sequence-diagram.md) (rendered to
 [sequence-diagram.png](sequence-diagram.png)).
+
+## Lazy file context in the chat panel
+
+The chat panel does **not** preload file content into Claude's context.
+Instead, when the user selects files/folders, `_build_chat_context` produces
+a small **manifest** (path, line count, page count, one-line preview per
+file) and ships that as the leading user message. Claude then uses tools to
+fetch what it needs:
+
+| Tool | Purpose |
+| ---- | ------- |
+| `search_in_context` | Fuzzy-search across all loaded files (reuses `search_file`). First call when answering most questions. |
+| `read_file_chunk` | Read a specific line range from one file by path. |
+| `list_results` | List files the last (non-AI) search hit. |
+| `write_file` / `append_to_file` | Write or append output to disk. |
+| `create_directory` / `delete_path` / `copy_file` / `move_file` | File ops. |
+| `run_command` | Run a shell command (with optional UAC elevation). |
+
+The motivation is rate-limit pressure: on tier-1 / free accounts the input
+budget can be as low as 10 K tokens per minute. Preloading 50 K tokens of
+file context fired a 429 on every turn. Manifests are typically a few
+hundred to a few thousand tokens, so the model has headroom for tools.
+
+## Token budgets and warnings
+
+AI mode and the chat panel route everything through Claude Sonnet 4.6 (200 K-
+token context window). Per-call caps are kept as tunable constants so the
+budget is visible in one place rather than scattered as magic numbers.
+
+| Constant | Where | Default | Purpose |
+| -------- | ----- | ------- | ------- |
+| `_AI_DOC_CHAR_CAP` | module-level, above `ai_search_file` | 120 000 chars | Hard truncate for the document sent to Claude in AI search |
+| `_AI_DOC_CHAR_WARN` | same | 80 000 chars | Threshold for the "large document" GUI note |
+| `_AI_MAX_TOKENS` | same | 8 192 | `max_tokens` on the AI-search response |
+| `_CHAT_CONTEXT_BUDGET` | inside `run_gui` | 20 000 chars | Total manifest budget (paths + previews, not content) |
+| `_CHAT_CONTEXT_WARN` | same | 15 000 chars | Threshold for the "large manifest" chat note |
+| `_CHAT_MAX_HISTORY` | same | 40 turns | User/assistant turns kept after the leading context pair |
+| `_CHAT_TOOL_ROUNDS` | same | 8 | Max tool-use rounds per chat turn |
+| `_CHAT_MAX_TOKENS` | same | 16 384 | `max_tokens` on each chat-response round |
+| `_CHAT_THINKING_BUDGET` | same | 10 000 | `budget_tokens` for extended-thinking blocks |
+| `_CHAT_TOOL_RESULT_CAP` | same | 40 000 chars | Per-tool-call cap on output fed back to Claude |
+| `_CHAT_SEARCH_DEFAULT_THRESHOLD` | same | 70 | Default fuzzy-score threshold for `search_in_context` |
+| `_CHAT_SEARCH_DEFAULT_MAX` | same | 50 | Default match cap for `search_in_context` |
+
+When a request would exceed a cap, the GUI surfaces a warning:
+
+- AI search emits `warning` rows in the chat log: *Document truncated …*,
+  *Large document …*, or *Response hit max_tokens cap …* when
+  `resp.stop_reason == "max_tokens"`.
+- Chat emits a `warning` row when `final_msg.stop_reason == "max_tokens"`,
+  when a tool result is capped, and when the manifest overflows the budget
+  (some files are not listed but still reachable by exact path).
+
+These warnings let the user notice silently-clipped output without having to
+diff prompts byte-for-byte.
+
+## Launch behavior
+
+- Window starts maximized on first launch and whenever the user closed it
+  maximized last time (`_gui_state["window_state"] == "zoomed"`).
+- Otherwise the window restores its saved geometry, auto-fits to the
+  requested layout (so the chat panel isn't clipped), then centers itself
+  on the screen via `_center_window()`.
+- The chat panel always opens **expanded** on launch, regardless of how it
+  was left last session. The collapse toggle still works during the session.
 
 ## Caching
 

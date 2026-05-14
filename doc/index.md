@@ -1,14 +1,16 @@
 # fuzzer — documentation
 
 `fuzzer` is a fuzzy file-content search tool. It works on plain text, PDF, and
-DOCX files; supports Arabic + English; has a CLI and a Tk GUI; and can
-optionally use Claude for semantic search.
+DOCX files; supports Arabic + English; and can optionally use Claude for
+semantic search and grounded chat.
+
+> **The CLI is no longer maintained.** All development is focused on the GUI.
 
 ## Table of contents
 
 | Doc | What it covers |
 | --- | -------------- |
-| [usage.md](usage.md) | CLI flags, examples, GUI walkthrough |
+| [usage.md](usage.md) | GUI walkthrough and reference |
 | [architecture.md](architecture.md) | High-level overview + sequence diagram |
 | [c-extension.md](c-extension.md) | `_ar_norm` C extension reference |
 | [development.md](development.md) | Build, test, contribute |
@@ -18,19 +20,13 @@ optionally use Claude for semantic search.
 ## Quick start
 
 ```sh
-# Search PDFs for an Arabic phrase
-fuzzer "التواصل الإداري" report.pdf
+# Install (Windows)
+.\install.ps1
 
-# Recursive English search across a folder, 70 % fuzzy threshold
-fuzzer -r -t 70 "climate" ./papers/
+# Install (Linux / macOS)
+./install.sh
 
-# AI semantic search (needs ANTHROPIC_API_KEY)
-fuzzer -a "what does the author say about renewable energy?" paper.pdf
-
-# Export
-fuzzer -o hits.xlsx "topic" *.pdf
-
-# GUI
+# Launch the GUI
 fuzzer
 ```
 
