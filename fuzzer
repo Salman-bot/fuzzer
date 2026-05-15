@@ -1659,35 +1659,33 @@ def run_gui() -> int:
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
 
-    # ── status + selected bars ──────────────────────────────────────────────
-    # Both bars live INSIDE the chat panel now — visually grouped with the
-    # chat input rather than orphaned at the bottom of the root window. The
-    # selected row preview, the search status, and the "where you are" path
-    # prefix in the chat input all read as one cohesive info strip.
-    # Pack order matters: side="bottom" first claims the bottom of chat_outer.
-    # status (bottom-most) → selected (just above) → chat content sits above.
+    # ── status + selected state ─────────────────────────────────────────────
+    # Just declare the shared StringVars + handlers here. The actual labels
+    # are built later inside the chat input panel so they read as part of
+    # the chat textbox (terminal-style status header + selected hint line +
+    # `~/bin ❯` prompt) rather than as orphaned strips at the bottom of root.
     status_var = tk.StringVar(value="Ready")
-    status = ttk.Label(chat_outer, textvariable=status_var, anchor="w",
-                       relief="sunken", padding=(6, 2))
-    status.pack(fill="x", side="bottom")
-
     selected_var = tk.StringVar(
         value="Select a result row to preview it here (double-click to open)"
     )
-    selected = ttk.Label(chat_outer, textvariable=selected_var, anchor="w",
-                         relief="flat", padding=(6, 2))
-    selected.pack(fill="x", side="bottom")
 
     _EXPORT_PREFIX = "Exported to "
+
+    # Forward references — populated when the chat input panel builds them.
+    _status_widget_ref: list = [None]
+    _selected_widget_ref: list = [None]
 
     def _on_status_change(*_args: object) -> None:
         # Show a hand cursor on the status bar only while it announces an
         # exported file, so the click affordance matches the click handler.
+        w = _status_widget_ref[0]
+        if w is None:
+            return
         with contextlib.suppress(Exception):
             if str(status_var.get()).startswith(_EXPORT_PREFIX):
-                status.configure(cursor="hand2")
+                w.configure(cursor="hand2")
             else:
-                status.configure(cursor="")
+                w.configure(cursor="")
 
     def _on_status_click(_e: object = None) -> None:
         text = str(status_var.get())
@@ -1708,7 +1706,6 @@ def run_gui() -> int:
             _log_activity(f"Revealed export: {os.path.basename(path)}")
 
     status_var.trace_add("write", _on_status_change)
-    status.bind("<Button-1>", _on_status_click)
 
     # ── debug panel: live native-call inspector for py_normalize ─────────────
     # Always built so it can be toggled at runtime (View menu / Cmd+D); only
@@ -2026,8 +2023,7 @@ def run_gui() -> int:
         view_menu.add_command(
             label="Auto-fit window",
             accelerator="Cmd+0",
-            command=lambda: _auto_fit(grow_only=False),
-        )
+            command=lambda: _auto_fit(grow_only=False),     )
         menubar.add_cascade(label="View", menu=view_menu)
         root.config(menu=menubar)
         root.bind("<Command-d>", _toggle_debug_panel)
@@ -2144,7 +2140,7 @@ def run_gui() -> int:
     chat_log_wrap = tk.Frame(chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
     chat_log_wrap.pack(fill="both", expand=True, pady=(0, 4))
     chat_log = tk.Text(
-        chat_log_wrap, height=10, state="disabled", wrap="word",
+        chat_log_wrap, height=5, state="disabled", wrap="word",
         font=_chat_font,
         background=_T["CHAT_BG"], foreground=_T["CHAT_FG"],
         insertbackground=_T["CHAT_FG"], relief="flat", borderwidth=0,
@@ -2340,12 +2336,59 @@ def run_gui() -> int:
         finally:
             chat_log.config(state="disabled")
 
-    chat_input_row = ttk.Frame(chat_frame)
+    # ── unified input panel ─────────────────────────────────────────────────
+    # One bordered terminal-style box that visually groups three lines, top
+    # to bottom:
+    #   ┌──────────────────────────────────────────────────────────────────┐
+    #   │ status    ← what the app is doing right now (search, export, …) │
+    #   │ selected  ← the row the user has clicked in the results table   │
+    #   │ ~/bin ❯ [input area ......................]  [Send] [Reset]    │
+    #   └──────────────────────────────────────────────────────────────────┘
+    # Packed side="bottom" inside chat_frame so pack honors its full height
+    # FIRST and chat_log_wrap (with expand=True) takes the remainder. Result:
+    # the input panel can never be squeezed off-screen, no matter how small
+    # the chat pane gets.
+    chat_input_panel = tk.Frame(
+        chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
+    chat_input_panel.pack(fill="x", side="bottom", pady=(2, 0))
+
+    _input_inner = tk.Frame(chat_input_panel, bg=_T["CHAT_ENTRY_BG"])
+    _input_inner.pack(fill="x", expand=True)
+
+    # Status line (live "what's happening" — search progress, export path,
+    # debug toggles). Amber, monospace, looks like a shell prompt's pre-line.
+    _status_lbl = tk.Label(
+        _input_inner, textvariable=status_var, anchor="w",
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_SYS_FG"],
+        font=("Menlo", 11),
+        padx=10, pady=2,
+    )
+    _status_lbl.pack(fill="x", pady=(4, 0))
+    _status_widget_ref[0] = _status_lbl
+    _status_lbl.bind("<Button-1>", _on_status_click)
+
+    # Selected-row preview. Cyan, slightly indented so it reads as a sub-line.
+    _selected_lbl = tk.Label(
+        _input_inner, textvariable=selected_var, anchor="w",
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_TOOL_RES_FG"],
+        font=("Menlo", 11),
+        padx=10, pady=2,
+    )
+    _selected_lbl.pack(fill="x", pady=(0, 2))
+    _selected_widget_ref[0] = _selected_lbl
+
+    # Thin divider between the info lines and the actual input row, for visual
+    # separation without breaking the "one box" feel.
+    tk.Frame(_input_inner, bg=_T["CHAT_BORDER"], height=1).pack(
+        fill="x", padx=2)
+
+    chat_input_row = tk.Frame(_input_inner, bg=_T["CHAT_ENTRY_BG"])
     chat_input_row.pack(fill="x")
-    # Outer border (1-px coloured ring around the input box).
-    chat_entry_wrap = tk.Frame(
-        chat_input_row, bg=_T["CHAT_BORDER"], padx=1, pady=1)
-    chat_entry_wrap.pack(side="left", fill="x", expand=True, padx=(0, 4))
+    # Outer border around just the input box used to live here; the whole
+    # panel now provides the ring, so the input row is flush against the
+    # status/selected lines above it.
+    chat_entry_wrap = tk.Frame(chat_input_row, bg=_T["CHAT_ENTRY_BG"])
+    chat_entry_wrap.pack(side="left", fill="x", expand=True)
     # Inner box holds the zsh-style prompt prefix + the Text widget on one row.
     _chat_input_box = tk.Frame(chat_entry_wrap, bg=_T["CHAT_ENTRY_BG"])
     _chat_input_box.pack(fill="both", expand=True)
@@ -2501,7 +2544,13 @@ def run_gui() -> int:
                 selectforeground=t["TEXT"])
             _apply_chat_log_tags(t)
         with contextlib.suppress(Exception):
-            chat_entry_wrap.configure(bg=t["CHAT_BORDER"])
+            chat_input_panel.configure(bg=t["CHAT_BORDER"])
+            _input_inner.configure(bg=t["CHAT_ENTRY_BG"])
+            _status_lbl.configure(bg=t["CHAT_ENTRY_BG"], fg=t["TAG_SYS_FG"])
+            _selected_lbl.configure(
+                bg=t["CHAT_ENTRY_BG"], fg=t["TAG_TOOL_RES_FG"])
+            chat_input_row.configure(bg=t["CHAT_ENTRY_BG"])
+            chat_entry_wrap.configure(bg=t["CHAT_ENTRY_BG"])
             _chat_input_box.configure(bg=t["CHAT_ENTRY_BG"])
             chat_prompt_lbl.configure(
                 bg=t["CHAT_ENTRY_BG"], fg=t["TAG_CLAUDE_FG"])
@@ -4485,9 +4534,11 @@ def run_gui() -> int:
 
     tree.bind("<Double-1>", open_selected)
     tree.bind("<Return>", open_selected)
-    # Bottom selected-result bar opens the file on click (mirrors double-click on tree)
-    selected.bind("<Button-1>", lambda _e: open_selected())
-    selected.configure(cursor="hand2")
+    # Selected-result line opens the file on click (mirrors double-click on tree).
+    _sel_w = _selected_widget_ref[0]
+    if _sel_w is not None:
+        _sel_w.bind("<Button-1>", lambda _e: open_selected())
+        _sel_w.configure(cursor="hand2")
     pattern_entry.bind("<Return>", lambda _e: start_search())
     files_entry.bind("<Return>", lambda _e: start_search())
 
