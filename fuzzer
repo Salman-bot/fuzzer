@@ -465,6 +465,85 @@ def search_file(
 
     return lines, matches
 
+# ── rga (ripgrep-all) backend ────────────────────────────────────────────────
+# Optional external engine. When `rga` is on PATH and the user opts in via the
+# GUI checkbox, search is delegated to rga so we get text extraction for docx,
+# epub, xlsx, sqlite, mkv subtitles, etc. for free. Trade-off: substring-only,
+# no fuzzy fallback.
+import shutil as _shutil
+_RGA_PATH = _shutil.which("rga")
+
+
+def rga_search_file(
+    fp: str,
+    pattern: str,
+    *,
+    case_sensitive: bool,
+    exact_only: bool,
+    threshold: int,  # unused — rga is substring-only
+    whole_word: bool = False,
+) -> Tuple[List[str], List[Match]]:
+    """Search a single file via rga --json. On any failure (rga missing,
+    spawn error, parse error) falls back to the in-process search_file().
+    Returns (lines, matches); lines is empty for formats fuzzer can't read
+    natively (docx/epub/sqlite) — the GUI only relies on Match.line for those.
+    """
+    if not _RGA_PATH or not pattern:
+        return search_file(fp, pattern,
+                           case_sensitive=case_sensitive,
+                           exact_only=exact_only,
+                           threshold=threshold,
+                           whole_word=whole_word)
+    import subprocess as _sub
+    import json as _json
+    args = [_RGA_PATH, "--json", "--no-config",
+            "--fixed-strings", "--no-messages"]
+    if not case_sensitive:
+        args.append("--ignore-case")
+    if whole_word or exact_only:
+        args.append("--word-regexp")
+    args.extend(["--", pattern, fp])
+    try:
+        proc = _sub.run(args, capture_output=True, text=True, timeout=60,
+                        encoding="utf-8", errors="replace")
+    except (_sub.TimeoutExpired, OSError):
+        return search_file(fp, pattern,
+                           case_sensitive=case_sensitive,
+                           exact_only=exact_only,
+                           threshold=threshold,
+                           whole_word=whole_word)
+
+    matches: List[Match] = []
+    # rga's PDF adapter prefixes each emitted line with "Page N:" (e.g.
+    # "Page 7: matched content..."). Parse the prefix into Match.page_num
+    # and strip it off the displayed text so snippets show the actual content
+    # rather than the page marker.
+    _page_prefix_re = re.compile(r"^Page\s+(\d+):\s*(.*)$")
+    for ln in proc.stdout.splitlines():
+        if not ln:
+            continue
+        try:
+            obj = _json.loads(ln)
+        except (_json.JSONDecodeError, ValueError):
+            continue
+        if obj.get("type") != "match":
+            continue
+        data = obj.get("data") or {}
+        line_text = (data.get("lines") or {}).get("text") or ""
+        line_text = line_text.rstrip("\r\n")
+        line_num = int(data.get("line_number") or 0) or 1
+        page = 0
+        m_page = _page_prefix_re.match(line_text)
+        if m_page:
+            page = int(m_page.group(1))
+            line_text = m_page.group(2)
+        matches.append(Match(fp, line_num, line_text, 100, page))
+    # Try to also collect plain-text lines so the snippet builder works the
+    # same as the native path. For formats fuzzer can't read directly we
+    # return an empty list — _append_file_results only uses Match.line.
+    lines = read_lines(fp) or []
+    return lines, matches
+
 # ── AI search ─────────────────────────────────────────────────────────────────
 
 
@@ -1153,13 +1232,13 @@ def run_gui() -> int:
         CHAT_BG="#141220", CHAT_FG="#ddd6f3", CHAT_BORDER="#2d2842",
         CHAT_SEL_BG="#3b2d6e", CHAT_ENTRY_BG="#1c1929",
         CHAT_DISABLED_BG="#1e1b2e", CHAT_DISABLED_FG="#5a5470",
-        TAG_YOU_FG="#b39dff", TAG_YOU_BG="#1e1b38",
-        TAG_CLAUDE_FG="#7ec8a0", TAG_CLAUDE_BG="#152418",
-        TAG_ERR_FG="#ff8a8a", TAG_ERR_BG="#2e1b1b",
-        TAG_SYS_FG="#8b80b0",
-        TAG_TOOL_FG="#c4a0ff", TAG_TOOL_BG="#1e1535",
-        TAG_TOOL_RES_FG="#70bfca", TAG_TOOL_RES_BG="#10222e",
-        TAG_THINK_FG="#6a6488",
+        TAG_YOU_FG="#c4b5fd", TAG_YOU_BG="#241942",
+        TAG_CLAUDE_FG="#5eead4", TAG_CLAUDE_BG="#0f2e29",
+        TAG_ERR_FG="#ff7a7a", TAG_ERR_BG="#3a1717",
+        TAG_SYS_FG="#facc15",
+        TAG_TOOL_FG="#f0abfc", TAG_TOOL_BG="#2a1240",
+        TAG_TOOL_RES_FG="#67e8f9", TAG_TOOL_RES_BG="#0d2738",
+        TAG_THINK_FG="#94a3b8",
         TIP_BG="#2d2842", TIP_FG="#ddd6f3",
         BTN_GO_BG="#3b82f6", BTN_GO_HOVER="#2563eb",
         BTN_RUN_BG="#fbbf24", BTN_RUN_HOVER="#f59e0b",
@@ -1423,6 +1502,10 @@ def run_gui() -> int:
         value=bool(_gui_state.get("recursive", False)))
     ai_var = tk.BooleanVar(value=bool(_gui_state.get("ai_mode", False)))
     verbose_var = tk.BooleanVar(value=bool(_gui_state.get("verbose", False)))
+    # rga is an optional external backend. Disable the toggle when the binary
+    # isn't on PATH so the user sees the option exists but knows it needs install.
+    rga_var = tk.BooleanVar(
+        value=bool(_gui_state.get("rga_mode", False)) and bool(_RGA_PATH))
 
     _opt_tooltips = [
         ("Case-sensitive", case_var, "Match uppercase/lowercase exactly"),
@@ -1436,10 +1519,18 @@ def run_gui() -> int:
         ("AI mode", ai_var, "Use Claude AI for semantic/conceptual matches\n(requires ANTHROPIC_API_KEY env var)"),
         ("Verbose (sentence)", verbose_var,
          "Show the full sentence surrounding each match"),
+        ("rga engine", rga_var,
+         ("Use ripgrep-all (rga) as the search backend. Extends file coverage to "
+          "docx, epub, xlsx, sqlite, mkv subtitles, etc.\n"
+          "Trade-off: substring-only (no fuzzy fallback).\n\n"
+          + ("Detected: " + _RGA_PATH if _RGA_PATH else
+             "NOT INSTALLED — run `brew install ripgrep-all` to enable."))),
     ]
     for _label, _var, _tip in _opt_tooltips:
         _cb = ttk.Checkbutton(opts, text=_label, variable=_var)
         _cb.pack(side="left", padx=4)
+        if _label == "rga engine" and not _RGA_PATH:
+            _cb.state(["disabled"])
         _Tooltip(_cb, _tip)
 
     _thr_lbl = ttk.Label(opts, text="  Threshold:")
@@ -1483,9 +1574,46 @@ def run_gui() -> int:
     form.columnconfigure(1, weight=1)
     form.columnconfigure(2, weight=1)
 
-    # ── results table ────────────────────────────────────────────────────────
-    table_frame = ttk.Frame(root, padding=(10, 0, 10, 0))
-    table_frame.pack(fill="both", expand=True)
+    # ── main split: results table (top pane) and chat (bottom pane) ──────────
+    # A vertical PanedWindow lets the user drag the sash to give more vertical
+    # room to whichever pane they care about. Critically, when the window is
+    # resized small the chat panel can never be clipped off — it just gets
+    # smaller, and the user can drag the sash to grow it back.
+    main_paned = ttk.PanedWindow(root, orient="vertical")
+    main_paned.pack(fill="both", expand=True)
+
+    table_frame = ttk.Frame(main_paned, padding=(10, 0, 10, 0))
+    main_paned.add(table_frame, weight=2)
+    # chat_outer is created (and added as the second pane) here, before any
+    # widgets that want to parent to it (status, selected). The chat header,
+    # input box, and log are populated into chat_outer further down.
+    chat_outer = tk.Frame(main_paned, bg=_BORDER)
+    main_paned.add(chat_outer, weight=1)
+
+    # Floor for the chat pane height. Below this the chat input box gets
+    # crowded out by the status/selected strips. Enforced two ways:
+    #   • initial sashpos placed so chat starts at ~38 % of window height
+    #   • on every <Configure> we clamp the sash so chat ≥ _CHAT_PANE_MIN_PX
+    # User drags are honored as long as they leave at least the floor.
+    _CHAT_PANE_MIN_PX = 220
+    _sash_inited = [False]
+
+    def _ensure_chat_pane_visible(_e: object = None) -> None:
+        with contextlib.suppress(Exception):
+            h = main_paned.winfo_height()
+            if h < _CHAT_PANE_MIN_PX + 80:
+                return  # Window too tiny — let widgets size themselves.
+            if not _sash_inited[0]:
+                target_chat = max(_CHAT_PANE_MIN_PX, int(h * 0.38))
+                main_paned.sashpos(0, h - target_chat)
+                _sash_inited[0] = True
+                return
+            pos = main_paned.sashpos(0)
+            chat_h = h - pos
+            if chat_h < _CHAT_PANE_MIN_PX:
+                main_paned.sashpos(0, max(80, h - _CHAT_PANE_MIN_PX))
+
+    main_paned.bind("<Configure>", _ensure_chat_pane_visible)
 
     columns = ("file", "line", "page", "match", "score", "content")
     tree = ttk.Treeview(table_frame, columns=columns, show="headings")
@@ -1531,19 +1659,24 @@ def run_gui() -> int:
     table_frame.rowconfigure(0, weight=1)
     table_frame.columnconfigure(0, weight=1)
 
-    # ── selected-match bar ─────────────────────────────────────────────────
+    # ── status + selected bars ──────────────────────────────────────────────
+    # Both bars live INSIDE the chat panel now — visually grouped with the
+    # chat input rather than orphaned at the bottom of the root window. The
+    # selected row preview, the search status, and the "where you are" path
+    # prefix in the chat input all read as one cohesive info strip.
+    # Pack order matters: side="bottom" first claims the bottom of chat_outer.
+    # status (bottom-most) → selected (just above) → chat content sits above.
+    status_var = tk.StringVar(value="Ready")
+    status = ttk.Label(chat_outer, textvariable=status_var, anchor="w",
+                       relief="sunken", padding=(6, 2))
+    status.pack(fill="x", side="bottom")
+
     selected_var = tk.StringVar(
         value="Select a result row to preview it here (double-click to open)"
     )
-    selected = ttk.Label(root, textvariable=selected_var, anchor="w",
+    selected = ttk.Label(chat_outer, textvariable=selected_var, anchor="w",
                          relief="flat", padding=(6, 2))
     selected.pack(fill="x", side="bottom")
-
-    # ── status bar (packed before table so it always reserves space) ─────────
-    status_var = tk.StringVar(value="Ready")
-    status = ttk.Label(root, textvariable=status_var, anchor="w",
-                       relief="sunken", padding=(6, 2))
-    status.pack(fill="x", side="bottom")
 
     _EXPORT_PREFIX = "Exported to "
 
@@ -1908,9 +2041,8 @@ def run_gui() -> int:
     # conversation is reset with the new file content as context.
     _chat_font = (_arabic_font[0] if _arabic_font else "Menlo", 13)
 
-    # Outer wrapper — always visible at the bottom.
-    chat_outer = tk.Frame(root, bg=_BORDER)
-    chat_outer.pack(fill="x", side="bottom", padx=10, pady=(2, 4))
+    # chat_outer was created earlier (above the table_frame body) so status +
+    # selected labels could parent to it. Just keep building the chat content.
 
     # Header row with collapse toggle.
     # Chat always starts EXPANDED on launch so users see it immediately,
@@ -1975,7 +2107,7 @@ def run_gui() -> int:
     def _toggle_chat(_event: object = None) -> None:
         if _chat_collapsed.get():
             _chat_collapsed.set(False)
-            chat_frame.pack(fill="x")
+            chat_frame.pack(fill="both", expand=True)
             _chat_toggle_btn.config(text="▾ Claude Chat")
         else:
             _chat_collapsed.set(True)
@@ -1997,7 +2129,9 @@ def run_gui() -> int:
     root.bind_all("<Command-Shift-c>", _toggle_chat)
 
     # Always mount the chat body on launch (we force _chat_collapsed=False above).
-    chat_frame.pack(fill="x")
+    # fill="both", expand=True so dragging the PanedWindow sash actually grows
+    # the chat log instead of leaving blank space at the bottom of the pane.
+    chat_frame.pack(fill="both", expand=True)
 
     chat_context_var = tk.StringVar(
         value="Context: (none — add files above to ground answers)")
@@ -2208,20 +2342,40 @@ def run_gui() -> int:
 
     chat_input_row = ttk.Frame(chat_frame)
     chat_input_row.pack(fill="x")
+    # Outer border (1-px coloured ring around the input box).
     chat_entry_wrap = tk.Frame(
         chat_input_row, bg=_T["CHAT_BORDER"], padx=1, pady=1)
     chat_entry_wrap.pack(side="left", fill="x", expand=True, padx=(0, 4))
+    # Inner box holds the zsh-style prompt prefix + the Text widget on one row.
+    _chat_input_box = tk.Frame(chat_entry_wrap, bg=_T["CHAT_ENTRY_BG"])
+    _chat_input_box.pack(fill="both", expand=True)
+
+    # Terminal-style prompt: show the project dir, ~-relative if possible.
+    try:
+        _chat_prompt_text = f"~/{_PROJECT_DIR.relative_to(Path.home())} ❯"
+    except ValueError:
+        _chat_prompt_text = f"{_PROJECT_DIR.name} ❯"
+    chat_prompt_lbl = tk.Label(
+        _chat_input_box, text=_chat_prompt_text,
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_CLAUDE_FG"],
+        font=("Menlo", 13, "bold"),
+        padx=10, pady=6, anchor="nw", cursor="hand2",
+    )
+    chat_prompt_lbl.pack(side="left", anchor="n")
+
     # Multi-line input: Enter sends, Shift+Enter inserts a newline. Behaves
     # like any real OS text box — selectable, paste-friendly, undo via Cmd+Z.
     chat_entry = tk.Text(
-        chat_entry_wrap,
+        _chat_input_box,
         height=2, wrap="word",
         font=_chat_font,
         background=_T["CHAT_ENTRY_BG"], foreground=_T["CHAT_FG"],
         insertbackground=_T["CHAT_FG"], relief="flat", borderwidth=0,
-        padx=8, pady=6, undo=True,
+        padx=0, pady=6, undo=True,
     )
-    chat_entry.pack(fill="x", expand=True)
+    chat_entry.pack(side="left", fill="both", expand=True)
+    # Click the prompt → focus the input (matches terminal feel).
+    chat_prompt_lbl.bind("<Button-1>", lambda _e: chat_entry.focus_set())
 
     def _set_chat_entry_state(s: str) -> None:
         """Toggle chat_entry between normal/disabled and recolor accordingly.
@@ -2348,6 +2502,9 @@ def run_gui() -> int:
             _apply_chat_log_tags(t)
         with contextlib.suppress(Exception):
             chat_entry_wrap.configure(bg=t["CHAT_BORDER"])
+            _chat_input_box.configure(bg=t["CHAT_ENTRY_BG"])
+            chat_prompt_lbl.configure(
+                bg=t["CHAT_ENTRY_BG"], fg=t["TAG_CLAUDE_FG"])
             # tk.Text doesn't support disabledbackground/disabledforeground —
             # honor whatever state the widget is in and pick matching colors.
             if str(chat_entry.cget("state")) == "disabled":
@@ -3604,7 +3761,7 @@ def run_gui() -> int:
 
     def worker(pattern: str, paths: List[str], case_sensitive: bool,
                exact: bool, whole_word: bool, threshold: int,
-               recursive: bool, ai: bool) -> None:
+               recursive: bool, ai: bool, rga: bool = False) -> None:
         try:
             files = collect_files(paths, recursive)
             if not files:
@@ -3625,6 +3782,14 @@ def run_gui() -> int:
                     lines, matches = ai_search_file(
                         fp, pattern, log_fn=_chat_log_fn,
                         api_key=_api_key, model=_model_id)
+                elif rga and _RGA_PATH:
+                    lines, matches = rga_search_file(
+                        fp, pattern,
+                        case_sensitive=case_sensitive,
+                        exact_only=exact,
+                        threshold=threshold,
+                        whole_word=whole_word,
+                    )
                 else:
                     lines, matches = search_file(
                         fp, pattern,
@@ -3676,6 +3841,7 @@ def run_gui() -> int:
         _gui_state["ai_mode"] = ai_var.get()
         _gui_state["verbose"] = verbose_var.get()
         _gui_state["threshold"] = threshold_var.get()
+        _gui_state["rga_mode"] = rga_var.get()
         _save_state(_gui_state)
         state["searching"] = True
         state["cancel_search"] = False
@@ -3692,14 +3858,16 @@ def run_gui() -> int:
                  f"whole_word={'on' if whole_word_var.get() else 'off'} "
                  f"thr={threshold_var.get()} "
                  f"ai={'on' if ai_var.get() else 'off'} "
-                 f"recursive={'on' if recursive_var.get() else 'off'}")
+                 f"recursive={'on' if recursive_var.get() else 'off'} "
+                 f"rga={'on' if rga_var.get() else 'off'}")
         _log_activity(f"Search '{pat}' — {len(paths)} path(s)  [{_opts}]")
 
         t = threading.Thread(
             target=worker,
             args=(pat, paths, case_var.get(), exact_var.get(),
                   whole_word_var.get(), threshold_var.get(),
-                  recursive_var.get(), ai_var.get()),
+                  recursive_var.get(), ai_var.get(),
+                  rga_var.get() and bool(_RGA_PATH)),
             daemon=True,
         )
         t.start()
@@ -4400,6 +4568,7 @@ def run_gui() -> int:
         recursive_var.set(False)
         ai_var.set(False)
         verbose_var.set(False)
+        rga_var.set(False)
         threshold_var.set(80)
         debug_mode_var.set(False)
         _toggle_debug_mode()
@@ -4527,6 +4696,9 @@ examples:
                      help="fuzzy similarity threshold 0-100 (default: 80)")
     grp.add_argument("-a", "--ai", action="store_true",
                      help="AI semantic search via Claude (needs ANTHROPIC_API_KEY)")
+    grp.add_argument("--rga", action="store_true",
+                     help="use ripgrep-all (rga) backend: extends file coverage "
+                          "to docx/epub/xlsx/sqlite/etc. (substring-only)")
 
     grp2 = ap.add_argument_group("output options")
     grp2.add_argument("-v", "--verbose", action="store_true",
@@ -4559,9 +4731,23 @@ examples:
 
     results: Dict[str, Tuple[List[str], List[Match]]] = {}
 
+    if args.rga and not _RGA_PATH:
+        print("warning: --rga requested but `rga` is not on PATH; "
+              "falling back to fuzzer's native engine.\n"
+              "         install: brew install ripgrep-all",
+              file=sys.stderr)
+
     for fp in files:
         if args.ai:
             lines, matches = ai_search_file(fp, args.pattern)
+        elif args.rga and _RGA_PATH:
+            lines, matches = rga_search_file(
+                fp, args.pattern,
+                case_sensitive=args.case_sensitive,
+                exact_only=args.exact,
+                threshold=args.threshold,
+                whole_word=args.whole_word,
+            )
         else:
             lines, matches = search_file(
                 fp, args.pattern,
