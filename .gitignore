@@ -27,3 +27,9 @@ native/_ar_norm*.so
 
 # HTML docs build output (regenerate with `make docs`).
 doc/_build/
+
+# Chat-generated artifacts (Claude's write_file output lands in this folder).
+3_Pillars_of_Societal_Peace.html
+
+# Personal scratch script — not part of fuzzer.
+transcribe
