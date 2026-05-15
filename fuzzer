@@ -252,6 +252,11 @@ _script_dir = str(Path(__file__).resolve().parent)
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
+# Default landing zone for everything fuzzer (or Claude via chat tools) writes:
+# exports, chat-generated files, PDF highlight copies. Relative paths handed to
+# the chat tools are resolved against this directory. Set per user preference.
+_PROJECT_DIR = Path(_script_dir).resolve()
+
 try:
     import _ar_norm  # type: ignore[import-not-found]
 
@@ -260,25 +265,14 @@ try:
         return _ar_norm.normalize(s)
 
 except ImportError:
-    try:
-        from pyarabic.normalize import \
-            normalize_searchtext as \
-            _ar_norm_search  # type: ignore[import-not-found]
+    _AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")
+    _ALEF_VARIANTS = str.maketrans(
+        {"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
+    _YEH_VARIANTS = str.maketrans({"ى": "ي", "ئ": "ي"})
 
-        def _normalize_arabic(s: str) -> str:
-            """pyarabic.normalize_searchtext: strips diacritics + tatweel,
-            normalizes alef/yeh/teh-marbuta and presentation forms."""
-            return _ar_norm_search(s)
-
-    except ImportError:
-        _AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")
-        _ALEF_VARIANTS = str.maketrans(
-            {"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
-        _YEH_VARIANTS = str.maketrans({"ى": "ي", "ئ": "ي"})
-
-        def _normalize_arabic(s: str) -> str:
-            s = _AR_DIACRITICS.sub("", s)
-            return s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
+    def _normalize_arabic(s: str) -> str:
+        s = _AR_DIACRITICS.sub("", s)
+        return s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
 
 # ── native-call instrumentation (toggleable at runtime via the GUI) ──────────
 # When debug mode is ON, every call to _normalize_arabic is recorded into
@@ -372,7 +366,6 @@ try:
 except ImportError:
     try:
         from thefuzz import fuzz as _tf_fuzz
-        _RATIO_FN = _tf_fuzz.ratio
         _PARTIAL_FN = _tf_fuzz.partial_ratio
         _TOKEN_FN = _tf_fuzz.token_set_ratio
     except ImportError:
@@ -485,7 +478,8 @@ _AI_MAX_TOKENS = 8_192
 
 
 def ai_search_file(fp: str, query: str, log_fn=None,
-                   api_key: str = "") -> Tuple[List[str], List[Match]]:
+                   api_key: str = "",
+                   model: str = "claude-sonnet-4-6") -> Tuple[List[str], List[Match]]:
     """Use Claude to find semantically relevant passages.
     log_fn(tag, prefix, text) is called (thread-safe via root.after) to show
     the query and response in the GUI chat panel.
@@ -547,7 +541,7 @@ def ai_search_file(fp: str, query: str, log_fn=None,
 
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=model,
             max_tokens=_AI_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -888,12 +882,16 @@ def run_gui() -> int:
     if _gui_state.get("debug_mode") and not _DEBUG_NATIVE:
         _set_debug_native(True)
 
-    # Clean up old highlighted PDFs from previous sessions (>1 day old)
+    # Clean up old highlighted PDFs from previous sessions (>1 day old).
+    # Sweep both the new location (project dir) and the legacy home location
+    # so users upgrading from older fuzzer don't end up with two cache dirs.
     with contextlib.suppress(Exception):
         import time as _time
-        _tmp_dir = Path.home() / ".fuzzer_tmp"
-        if _tmp_dir.is_dir():
-            _now = _time.time()
+        _now = _time.time()
+        for _tmp_dir in (_PROJECT_DIR / ".fuzzer_tmp",
+                         Path.home() / ".fuzzer_tmp"):
+            if not _tmp_dir.is_dir():
+                continue
             for _f in _tmp_dir.glob("fuzzer_*.pdf"):
                 with contextlib.suppress(Exception):
                     if _now - _f.stat().st_mtime > 86400:  # 24h
@@ -958,16 +956,48 @@ def run_gui() -> int:
                 text) if _arabic_reshaper else text
             return _bidi_display(reshaped, base_dir='R') if _bidi_display else reshaped
 
+    # Tokens that look like word starts. Skips leading "[70]", "(2003)", "...",
+    # bracketed citations, bullet glyphs, lone digits, and combining diacritics
+    # so the Content column always begins with something a reader can parse.
+    _SNIPPET_WORD_START = re.compile(r"^[A-Za-z؀-ۿݐ-ݿ]")
+
+    def _strip_snippet_lead(tokens: List[str]) -> List[str]:
+        """Drop leading tokens that are pure punctuation, bracketed numbers,
+        or single digits — keeps the snippet starting on a real word."""
+        out = list(tokens)
+        while out:
+            t = out[0].strip("‎‏‪‬  \t")
+            if not t:
+                out.pop(0)
+                continue
+            # Bracketed/parenthesised citation like [70], (2003), {1}
+            if re.fullmatch(r"[\[\(\{][^\]\)\}]{1,8}[\]\)\}][.,;:]?", t):
+                out.pop(0)
+                continue
+            # Pure punctuation or symbol run
+            if re.fullmatch(r"[\W_…—–\-·•\.\"'`’‘”“]+", t):
+                out.pop(0)
+                continue
+            # Pure number ≤ 4 digits (page/index leftover); keep longer numbers
+            if re.fullmatch(r"\d{1,4}[.,;:]?", t):
+                out.pop(0)
+                continue
+            # First letter is a real word char — accept
+            if _SNIPPET_WORD_START.search(t):
+                break
+            # Otherwise unknown leading goop; drop it
+            out.pop(0)
+        return out
+
     def _line_context(line: str, query: str, around: int = 6) -> str:
-        """Return a snippet of `line` starting from the beginning, extended to
-        include the token best matching `query` plus N tokens after it.
-        Always starts at token 0 — no leading "… " — so the bidi algorithm
-        sees clean RTL text without LTR-neutral prefix chars that cause garbled
-        output in the Treeview content column."""
+        """Return a snippet of `line` starting at the first word-like token,
+        extended to include the token best matching `query` plus N tokens
+        after it. No leading "… " so the bidi algorithm sees clean RTL text
+        without LTR-neutral prefix chars that garble RTL in the Treeview."""
         from difflib import SequenceMatcher as _SM
         if not line:
             return line
-        tokens = line.split()
+        tokens = _strip_snippet_lead(line.split())
         if not tokens:
             return line
         q_norm = _normalize_arabic((query or "").strip())
@@ -1031,6 +1061,15 @@ def run_gui() -> int:
     _max_w = max(800, _screen_w - 80)
     _max_h = max(500, _screen_h - 80)
 
+    # Bump when the default geometry changes so old saved values are
+    # discarded once and users get the new default. Subsequent resizes are
+    # saved and restored normally.
+    _GEOM_VERSION = 3
+    if _gui_state.get("window_geom_version") != _GEOM_VERSION:
+        _gui_state.pop("window_geometry", None)
+        _gui_state.pop("window_state", None)
+        _gui_state["window_geom_version"] = _GEOM_VERSION
+
     _saved_geom = _gui_state.get("window_geometry")
     _saved_state = _gui_state.get("window_state", "")
     if _saved_geom:
@@ -1044,8 +1083,25 @@ def run_gui() -> int:
                 _saved_geom = f"{_cw}x{_ch}"
         except Exception:
             _saved_geom = None
+
+    def _default_geometry() -> str:
+        # Fixed default size on first launch. Subsequent runs use whatever the
+        # user resized to (saved in _on_close). Clamp to screen so smaller
+        # displays still fit comfortably.
+        w = min(1400, _max_w)
+        h = min(900, _max_h)
+        x = max(0, (_screen_w - w) // 2)
+        y = max(0, (_screen_h - h) // 2 - 20)
+        return f"{w}x{h}+{x}+{y}"
+
     if _saved_geom:
         root.geometry(str(_saved_geom))
+    else:
+        root.geometry(_default_geometry())
+
+    # Floor on window size so the chat panel (always at the bottom) can never
+    # be clipped off-screen. Smaller than this, the layout falls apart.
+    root.minsize(min(1100, _max_w), min(620, _max_h))
 
     def _auto_fit(grow_only: bool = True) -> None:
         """Resize the window to fit its requested content.
@@ -1058,21 +1114,6 @@ def run_gui() -> int:
         new_h = max(h_req, h_cur) if grow_only else h_req
         if (new_w, new_h) != (w_cur, h_cur):
             root.geometry(f"{new_w}x{new_h}")
-
-    def _center_window() -> None:
-        """Center the window on the screen. No-op while maximized (the OS
-        handles that case). Safe to call any time after geometry is known."""
-        with contextlib.suppress(Exception):
-            if root.state() == "zoomed":
-                return
-            root.update_idletasks()
-            w = root.winfo_width()
-            h = root.winfo_height()
-            sw = root.winfo_screenwidth()
-            sh = root.winfo_screenheight()
-            x = max(0, (sw - w) // 2)
-            y = max(0, (sh - h) // 2)
-            root.geometry(f"{w}x{h}+{x}+{y}")
 
     # ── theme + styling ──────────────────────────────────────────────────────
     _BG = "#f4f5f7"
@@ -1102,10 +1143,12 @@ def run_gui() -> int:
         TAG_TOOL_RES_FG="#0e6a72", TAG_TOOL_RES_BG="#eaf6f7",
         TAG_THINK_FG="#7a7a7a",
         TIP_BG="#ffffc0", TIP_FG="#1c1e22",
+        BTN_GO_BG="#2563eb", BTN_GO_HOVER="#1d4ed8",
+        BTN_RUN_BG="#f59e0b", BTN_RUN_HOVER="#d97706",
     )
     _DARK_PAL = dict(
         BG="#12101e", CARD_BG="#1c1929", BORDER="#2d2842",
-        TEXT="#e2ddf5", MUTED="#8b80b0", ACCENT="#a78bfa",
+        TEXT="#f5f0ff", MUTED="#a39ec5", ACCENT="#a78bfa",
         ROW_ALT="#181626", SEL_BG="#3b2d6e",
         CHAT_BG="#141220", CHAT_FG="#ddd6f3", CHAT_BORDER="#2d2842",
         CHAT_SEL_BG="#3b2d6e", CHAT_ENTRY_BG="#1c1929",
@@ -1118,6 +1161,8 @@ def run_gui() -> int:
         TAG_TOOL_RES_FG="#70bfca", TAG_TOOL_RES_BG="#10222e",
         TAG_THINK_FG="#6a6488",
         TIP_BG="#2d2842", TIP_FG="#ddd6f3",
+        BTN_GO_BG="#3b82f6", BTN_GO_HOVER="#2563eb",
+        BTN_RUN_BG="#fbbf24", BTN_RUN_HOVER="#f59e0b",
     )
     _theme_name = [str(_gui_state.get("theme", "light"))]
     _T = (_DARK_PAL if _theme_name[0] == "dark" else _LIGHT_PAL).copy()
@@ -1130,20 +1175,86 @@ def run_gui() -> int:
             _style.configure(".", background=t["BG"], foreground=t["TEXT"])
             _style.configure("TFrame", background=t["BG"])
             _style.configure("TLabel", background=t["BG"], foreground=t["TEXT"])
+            _style.configure("TLabelframe", background=t["BG"],
+                             foreground=t["MUTED"])
+            _style.configure("TLabelframe.Label", background=t["BG"],
+                             foreground=t["MUTED"])
             _style.configure("TCheckbutton",
                              background=t["BG"], foreground=t["TEXT"])
+            _style.map("TCheckbutton",
+                       background=[("active", t["BG"])],
+                       foreground=[("disabled", t["MUTED"])])
             _style.configure("TEntry", fieldbackground=t["CARD_BG"],
-                             foreground=t["TEXT"])
+                             foreground=t["TEXT"], insertcolor=t["TEXT"],
+                             bordercolor=t["BORDER"], lightcolor=t["BORDER"],
+                             darkcolor=t["BORDER"])
+            _style.map("TEntry",
+                       fieldbackground=[("!disabled", t["CARD_BG"]),
+                                        ("readonly", t["CARD_BG"])],
+                       foreground=[("!disabled", t["TEXT"]),
+                                   ("readonly", t["TEXT"])],
+                       selectbackground=[("!disabled", t["SEL_BG"])],
+                       selectforeground=[("!disabled", t["TEXT"])])
             _style.configure("TCombobox", fieldbackground=t["CARD_BG"],
-                             foreground=t["TEXT"])
+                             foreground=t["TEXT"], background=t["CARD_BG"],
+                             arrowcolor=t["TEXT"], bordercolor=t["BORDER"])
+            _style.map("TCombobox",
+                       fieldbackground=[("readonly", t["CARD_BG"]),
+                                        ("focus", t["CARD_BG"]),
+                                        ("active", t["CARD_BG"]),
+                                        ("!disabled", t["CARD_BG"])],
+                       foreground=[("readonly", t["TEXT"]),
+                                   ("focus", t["TEXT"]),
+                                   ("active", t["TEXT"]),
+                                   ("disabled", t["MUTED"]),
+                                   ("!disabled", t["TEXT"])],
+                       background=[("readonly", t["CARD_BG"]),
+                                   ("active", t["CARD_BG"])],
+                       selectbackground=[("readonly", t["SEL_BG"]),
+                                         ("focus", t["SEL_BG"]),
+                                         ("!disabled", t["SEL_BG"])],
+                       selectforeground=[("readonly", t["TEXT"]),
+                                         ("focus", t["TEXT"]),
+                                         ("!disabled", t["TEXT"])],
+                       insertcolor=[("!disabled", t["TEXT"])])
             _style.configure("TSpinbox", fieldbackground=t["CARD_BG"],
-                             foreground=t["TEXT"])
+                             foreground=t["TEXT"], background=t["CARD_BG"],
+                             arrowcolor=t["TEXT"], bordercolor=t["BORDER"])
+            _style.map("TSpinbox",
+                       fieldbackground=[("!disabled", t["CARD_BG"])],
+                       foreground=[("!disabled", t["TEXT"])],
+                       background=[("!disabled", t["CARD_BG"])])
             _style.configure("TButton", background=t["CARD_BG"],
-                             foreground=t["TEXT"])
+                             foreground=t["TEXT"], bordercolor=t["BORDER"])
+            _style.map("TButton",
+                       background=[("active", t["SEL_BG"]),
+                                   ("pressed", t["BORDER"]),
+                                   ("disabled", t["BG"])],
+                       foreground=[("disabled", t["MUTED"])])
             _style.configure("Treeview", background=t["CARD_BG"],
                              fieldbackground=t["CARD_BG"], foreground=t["TEXT"])
+            _style.map("Treeview",
+                       background=[("selected", t["SEL_BG"])],
+                       foreground=[("selected", t["TEXT"])])
             _style.configure("Treeview.Heading",
                              background=t["BORDER"], foreground=t["TEXT"])
+            _style.map("Treeview.Heading",
+                       background=[("active", t["SEL_BG"])])
+            _style.configure("TScrollbar",
+                             troughcolor=t["BG"], background=t["BORDER"],
+                             bordercolor=t["BG"], arrowcolor=t["TEXT"],
+                             lightcolor=t["BORDER"], darkcolor=t["BORDER"])
+            _style.map("TScrollbar",
+                       background=[("active", t["SEL_BG"]),
+                                   ("pressed", t["SEL_BG"])],
+                       arrowcolor=[("disabled", t["MUTED"])])
+            _style.configure("TSeparator", background=t["BORDER"])
+            _style.configure("TPanedwindow", background=t["BG"])
+            # Combobox dropdown listbox isn't a ttk widget — set via option db.
+            root.option_add("*TCombobox*Listbox.background", t["CARD_BG"])
+            root.option_add("*TCombobox*Listbox.foreground", t["TEXT"])
+            root.option_add("*TCombobox*Listbox.selectBackground", t["SEL_BG"])
+            root.option_add("*TCombobox*Listbox.selectForeground", t["TEXT"])
 
     if sys.platform == "win32":
         _ui_font_family = "Segoe UI"
@@ -1348,14 +1459,16 @@ def run_gui() -> int:
     actions = ttk.Frame(form)
     actions.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
 
-    # Use tk.Button (not ttk) so bg/fg colours apply under the vista theme too
-    search_btn = tk.Button(
+    # tk.Label-based "button" — both tk.Button and ttk.Button on macOS Aqua
+    # ignore background colours and render with the native white chrome, which
+    # is wrong for the blue-idle/amber-running affordance and breaks dark mode.
+    # Click and hover are wired manually below; state["searching"] gates clicks
+    # while a search is in flight.
+    search_btn = tk.Label(
         actions, text="Search",
-        bg=_ACCENT, fg="white",
-        activebackground="#1a6fc4", activeforeground="white",
-        disabledforeground="#aaaaaa",
-        relief="flat", padx=12, pady=5, borderwidth=0,
+        bg=_T["BTN_GO_BG"], fg="white",
         font=(_ui_font_family, 12, "bold"),
+        padx=18, pady=6, cursor="hand2",
     )
     search_btn.pack(side="left", padx=2)
     stop_btn = ttk.Button(actions, text="Stop", state="disabled")
@@ -1431,6 +1544,38 @@ def run_gui() -> int:
     status = ttk.Label(root, textvariable=status_var, anchor="w",
                        relief="sunken", padding=(6, 2))
     status.pack(fill="x", side="bottom")
+
+    _EXPORT_PREFIX = "Exported to "
+
+    def _on_status_change(*_args: object) -> None:
+        # Show a hand cursor on the status bar only while it announces an
+        # exported file, so the click affordance matches the click handler.
+        with contextlib.suppress(Exception):
+            if str(status_var.get()).startswith(_EXPORT_PREFIX):
+                status.configure(cursor="hand2")
+            else:
+                status.configure(cursor="")
+
+    def _on_status_click(_e: object = None) -> None:
+        text = str(status_var.get())
+        if not text.startswith(_EXPORT_PREFIX):
+            return
+        path = text[len(_EXPORT_PREFIX):]
+        if not path or not os.path.exists(path):
+            return
+        import subprocess
+        with contextlib.suppress(Exception):
+            if sys.platform == "darwin":
+                # -R reveals in Finder so the user sees where the file landed.
+                subprocess.Popen(["open", "-R", path])
+            elif sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path) or path])
+            _log_activity(f"Revealed export: {os.path.basename(path)}")
+
+    status_var.trace_add("write", _on_status_change)
+    status.bind("<Button-1>", _on_status_click)
 
     # ── debug panel: live native-call inspector for py_normalize ─────────────
     # Always built so it can be toggled at runtime (View menu / Cmd+D); only
@@ -1774,12 +1919,53 @@ def run_gui() -> int:
     _chat_collapsed = tk.BooleanVar(value=False)
     chat_header = tk.Frame(chat_outer, bg=_BG)
     chat_header.pack(fill="x")
-    _chat_toggle_btn = tk.Button(
+
+    _CHAT_MODEL_OPTIONS = (
+        ("Sonnet 4.6", "claude-sonnet-4-6"),
+        ("Haiku 4.5", "claude-haiku-4-5"),
+        ("Opus 4.7", "claude-opus-4-7"),
+    )
+    _model_label_to_id = {label: mid for label, mid in _CHAT_MODEL_OPTIONS}
+    _model_id_to_label = {mid: label for label, mid in _CHAT_MODEL_OPTIONS}
+    _saved_model_id = str(_gui_state.get("claude_model") or "claude-sonnet-4-6")
+    _chat_model_var = tk.StringVar(
+        value=_model_id_to_label.get(_saved_model_id, "Sonnet 4.6"))
+
+    def _on_model_change(_event: object = None) -> None:
+        _gui_state["claude_model"] = _model_label_to_id.get(
+            _chat_model_var.get(), "claude-sonnet-4-6")
+
+    _chat_model_picker = ttk.Combobox(
+        chat_header, textvariable=_chat_model_var,
+        values=[label for label, _ in _CHAT_MODEL_OPTIONS],
+        state="readonly", width=11,
+    )
+    _chat_model_picker.bind("<<ComboboxSelected>>", _on_model_change)
+    _chat_model_picker.pack(side="right", padx=(4, 4), pady=2)
+    _chat_model_lbl = tk.Label(
+        chat_header, text="Model:", bg=_BG, fg=_TEXT,
+        font=(_ui_font_family, 10),
+    )
+    _chat_model_lbl.pack(side="right", padx=(0, 2))
+
+    # Rate-limit indicator: filled in after each turn from anthropic-ratelimit-*
+    # response headers. Empty until the first chat round completes.
+    _chat_ratelimit_var = tk.StringVar(value="")
+    _chat_ratelimit_lbl = tk.Label(
+        chat_header, textvariable=_chat_ratelimit_var,
+        bg=_BG, fg=_MUTED,
+        font=(_ui_font_family, 10),
+    )
+    _chat_ratelimit_lbl.pack(side="right", padx=(0, 8))
+
+    # ttk.Label (not tk.Button) — macOS Aqua's tk.Button ignores bg and renders
+    # the native white face. ttk.Label honors the TLabel style and so picks up
+    # the dark BG. Click binding (set below) keeps the toggle-on-click behavior.
+    _chat_toggle_btn = tk.Label(
         chat_header, text="▾ Claude Chat",
         font=(_ui_font_family, 10, "bold"),
-        bg=_BG, fg=_TEXT, activebackground=_BG, activeforeground=_ACCENT,
-        relief="flat", bd=0, cursor="hand2",
-        anchor="w", padx=6, pady=3,
+        bg=_BG, fg=_TEXT,
+        anchor="w", cursor="hand2", padx=6, pady=3,
     )
     _chat_toggle_btn.pack(side="left", fill="x", expand=True)
 
@@ -1797,7 +1983,8 @@ def run_gui() -> int:
             _chat_toggle_btn.config(text="▸ Claude Chat")
         _gui_state["chat_collapsed"] = _chat_collapsed.get()
 
-    _chat_toggle_btn.config(command=_toggle_chat)
+    # Labels have no `command` option — bind click directly.
+    _chat_toggle_btn.bind("<Button-1>", _toggle_chat)
 
     # Add chat toggle to View menu and bind keyboard shortcut.
     with contextlib.suppress(Exception):
@@ -1823,7 +2010,7 @@ def run_gui() -> int:
     chat_log_wrap = tk.Frame(chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
     chat_log_wrap.pack(fill="both", expand=True, pady=(0, 4))
     chat_log = tk.Text(
-        chat_log_wrap, height=8, state="disabled", wrap="word",
+        chat_log_wrap, height=10, state="disabled", wrap="word",
         font=_chat_font,
         background=_T["CHAT_BG"], foreground=_T["CHAT_FG"],
         insertbackground=_T["CHAT_FG"], relief="flat", borderwidth=0,
@@ -1864,27 +2051,278 @@ def run_gui() -> int:
         chat_log.tag_config("thinking", foreground=t["TAG_THINK_FG"],
                             font=(_chat_fam, _chat_sz, "italic"),
                             spacing1=2, spacing3=2)
+        chat_log.tag_config("path", foreground=t["TAG_YOU_FG"],
+                            underline=True)
+        chat_log.tag_config("usage", foreground=t["TAG_SYS_FG"],
+                            font=(_chat_fam, max(9, _chat_sz - 1), "italic"),
+                            spacing1=1, spacing3=2,
+                            lmargin1=8, lmargin2=8)
+        # Markdown styling — applied by _scan_chat_markdown after each turn.
+        # Higher priority than the role tag (claude/you/...) so the bold/code
+        # styling shows through; raise() runs after tag_config below.
+        chat_log.tag_config("md_bold",
+                            font=(_chat_fam, _chat_sz, "bold"))
+        chat_log.tag_config("md_italic",
+                            font=(_chat_fam, _chat_sz, "italic"))
+        chat_log.tag_config("md_code_inline",
+                            font=("Menlo", max(9, _chat_sz - 1)),
+                            background=t["TAG_TOOL_BG"],
+                            foreground=t["TAG_TOOL_FG"])
+        chat_log.tag_config("md_code_block",
+                            font=("Menlo", max(9, _chat_sz - 1)),
+                            background=t["TAG_TOOL_BG"],
+                            foreground=t["TAG_TOOL_RES_FG"],
+                            lmargin1=20, lmargin2=20, rmargin=12,
+                            spacing1=4, spacing3=4)
+        chat_log.tag_config("md_h1",
+                            font=(_chat_fam, _chat_sz + 4, "bold"),
+                            foreground=t["TAG_CLAUDE_FG"],
+                            spacing1=8, spacing3=4)
+        chat_log.tag_config("md_h2",
+                            font=(_chat_fam, _chat_sz + 2, "bold"),
+                            foreground=t["TAG_CLAUDE_FG"],
+                            spacing1=6, spacing3=3)
+        chat_log.tag_config("md_h3",
+                            font=(_chat_fam, _chat_sz + 1, "bold"),
+                            foreground=t["TAG_YOU_FG"],
+                            spacing1=4, spacing3=2)
+        chat_log.tag_config("md_link",
+                            foreground=t["TAG_YOU_FG"],
+                            underline=True)
+        # Make sure markdown styling wins over role-tag colors/fonts.
+        for _md in ("md_code_block", "md_code_inline", "md_bold", "md_italic",
+                    "md_h1", "md_h2", "md_h3", "md_link"):
+            with contextlib.suppress(Exception):
+                chat_log.tag_raise(_md)
 
     _apply_chat_log_tags(_T)
+
+    # Track per-link tags so each detected path can be opened independently.
+    _chat_path_links: Dict[str, str] = {}
+    _chat_path_counter = [0]
+    _PATH_RE = re.compile(
+        r"`(/[^`\n]+?)`"             # backtick-quoted absolute path
+        r"|(?<![\w/])(/[\w./\-]+\.[A-Za-z0-9]{1,8})\b"  # bare absolute path
+    )
+
+    def _open_chat_path(path: str) -> None:
+        """Open a path from a chat link with the OS default handler."""
+        import subprocess
+        try:
+            if not os.path.exists(path):
+                _append_chat("err", "error", f"Path no longer exists: {path}")
+                return
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            _log_activity(f"Opened from chat: {os.path.basename(path)}")
+        except Exception as exc:
+            _append_chat("err", "error", f"Open failed: {exc}")
+
+    def _scan_chat_paths(start_idx: str) -> None:
+        """Find absolute file paths after start_idx in chat_log and tag them
+        as clickable. Each match gets a fresh per-instance tag bound to its
+        own path so duplicates don't collide."""
+        try:
+            text = chat_log.get(start_idx, "end-1c")
+        except Exception:
+            return
+        for m in _PATH_RE.finditer(text):
+            path = m.group(1) or m.group(2)
+            if not path or not os.path.isabs(path):
+                continue
+            grp = 1 if m.group(1) else 2
+            char_start, char_end = m.start(grp), m.end(grp)
+            try:
+                idx_a = chat_log.index(f"{start_idx}+{char_start}c")
+                idx_b = chat_log.index(f"{start_idx}+{char_end}c")
+            except Exception:
+                continue
+            _chat_path_counter[0] += 1
+            tag_name = f"path_{_chat_path_counter[0]}"
+            chat_log.tag_add("path", idx_a, idx_b)
+            chat_log.tag_add(tag_name, idx_a, idx_b)
+            _chat_path_links[tag_name] = path
+            chat_log.tag_bind(
+                tag_name, "<Button-1>",
+                lambda _e, p=path: _open_chat_path(p))
+            chat_log.tag_bind(
+                tag_name, "<Enter>",
+                lambda _e: chat_log.config(cursor="hand2"))
+            chat_log.tag_bind(
+                tag_name, "<Leave>",
+                lambda _e: chat_log.config(cursor=""))
+
+    # Light markdown rendering applied after each turn ends. Tags `md_*` are
+    # configured in _apply_chat_log_tags; we just stamp them over the right
+    # text ranges so the styling tracks the theme.
+    _MD_CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\n?(.*?)```", re.DOTALL)
+    _MD_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+    _MD_BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
+    _MD_ITALIC = re.compile(r"(?<![\*_\w])\*([^*\n]+?)\*(?!\*)")
+    _MD_HEADER = re.compile(r"^(#{1,3})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+
+    def _tag_range(start_idx: str, char_a: int, char_b: int, tag: str) -> None:
+        try:
+            ia = chat_log.index(f"{start_idx}+{char_a}c")
+            ib = chat_log.index(f"{start_idx}+{char_b}c")
+            chat_log.tag_add(tag, ia, ib)
+        except Exception:
+            pass
+
+    def _scan_chat_markdown(start_idx: str) -> None:
+        """Stamp markdown tags onto chat_log content from start_idx to end."""
+        try:
+            text = chat_log.get(start_idx, "end-1c")
+        except Exception:
+            return
+        chat_log.config(state="normal")
+        try:
+            # Code blocks first — strip later patterns from matching inside.
+            code_block_spans: List[Tuple[int, int]] = []
+            for m in _MD_CODE_BLOCK.finditer(text):
+                _tag_range(start_idx, m.start(1), m.end(1), "md_code_block")
+                code_block_spans.append((m.start(), m.end()))
+
+            def _outside_code(i: int) -> bool:
+                return all(not (a <= i < b) for a, b in code_block_spans)
+
+            for m in _MD_INLINE_CODE.finditer(text):
+                if _outside_code(m.start()):
+                    _tag_range(start_idx, m.start(1), m.end(1), "md_code_inline")
+            for m in _MD_BOLD.finditer(text):
+                if _outside_code(m.start()):
+                    _tag_range(start_idx, m.start(1), m.end(1), "md_bold")
+            for m in _MD_ITALIC.finditer(text):
+                if _outside_code(m.start()):
+                    _tag_range(start_idx, m.start(1), m.end(1), "md_italic")
+            for m in _MD_HEADER.finditer(text):
+                if _outside_code(m.start()):
+                    level = len(m.group(1))
+                    _tag_range(start_idx, m.start(2), m.end(2), f"md_h{level}")
+        finally:
+            chat_log.config(state="disabled")
 
     chat_input_row = ttk.Frame(chat_frame)
     chat_input_row.pack(fill="x")
     chat_entry_wrap = tk.Frame(
         chat_input_row, bg=_T["CHAT_BORDER"], padx=1, pady=1)
     chat_entry_wrap.pack(side="left", fill="x", expand=True, padx=(0, 4))
-    chat_entry = tk.Entry(
+    # Multi-line input: Enter sends, Shift+Enter inserts a newline. Behaves
+    # like any real OS text box — selectable, paste-friendly, undo via Cmd+Z.
+    chat_entry = tk.Text(
         chat_entry_wrap,
+        height=2, wrap="word",
         font=_chat_font,
         background=_T["CHAT_ENTRY_BG"], foreground=_T["CHAT_FG"],
-        insertbackground=_T["CHAT_FG"], relief="flat",
-        disabledbackground=_T["CHAT_DISABLED_BG"],
-        disabledforeground=_T["CHAT_DISABLED_FG"],
+        insertbackground=_T["CHAT_FG"], relief="flat", borderwidth=0,
+        padx=8, pady=6, undo=True,
     )
-    chat_entry.pack(fill="x", expand=True, ipady=5)
+    chat_entry.pack(fill="x", expand=True)
+
+    def _set_chat_entry_state(s: str) -> None:
+        """Toggle chat_entry between normal/disabled and recolor accordingly.
+        tk.Text doesn't honor disabledbackground/disabledforeground options,
+        so we set the colors explicitly."""
+        with contextlib.suppress(Exception):
+            chat_entry.configure(state=s)
+            if s == "disabled":
+                chat_entry.configure(
+                    background=_T["CHAT_DISABLED_BG"],
+                    foreground=_T["CHAT_DISABLED_FG"])
+            else:
+                chat_entry.configure(
+                    background=_T["CHAT_ENTRY_BG"],
+                    foreground=_T["CHAT_FG"])
     chat_send_btn = ttk.Button(chat_input_row, text="Send", width=8)
     chat_send_btn.pack(side="left")
     chat_reset_btn = ttk.Button(chat_input_row, text="Reset", width=8)
     chat_reset_btn.pack(side="left", padx=(4, 0))
+
+    def _wire_text_shortcuts(widget: tk.Widget, *,
+                             allow_edit: bool = True) -> None:
+        """Add Cmd/Ctrl+A select-all and a right-click context menu so the
+        widget feels like a normal OS text box. Works on tk.Text (including
+        state="disabled" — temporarily flips state for selection), tk.Entry,
+        and ttk.Combobox/Spinbox."""
+        is_text = isinstance(widget, tk.Text)
+
+        def _select_all(_e: object = None) -> str:
+            with contextlib.suppress(Exception):
+                if is_text:
+                    was_disabled = str(widget.cget("state")) == "disabled"
+                    if was_disabled:
+                        widget.configure(state="normal")
+                    widget.tag_add("sel", "1.0", "end-1c")
+                    widget.mark_set("insert", "end-1c")
+                    if was_disabled:
+                        widget.configure(state="disabled")
+                else:
+                    widget.select_range(0, "end")
+                    widget.icursor("end")
+            return "break"
+
+        widget.bind("<Command-a>", _select_all)
+        widget.bind("<Command-A>", _select_all)
+        widget.bind("<Control-a>", _select_all)
+        widget.bind("<Control-A>", _select_all)
+
+        menu = tk.Menu(widget, tearoff=False)
+        menu.add_command(
+            label="Copy",
+            command=lambda: widget.event_generate("<<Copy>>"))
+        if allow_edit:
+            menu.add_command(
+                label="Cut",
+                command=lambda: widget.event_generate("<<Cut>>"))
+            menu.add_command(
+                label="Paste",
+                command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Select All", command=_select_all)
+
+        def _show_menu(e: object) -> str:
+            try:
+                menu.tk_popup(int(e.x_root), int(e.y_root))  # type: ignore[attr-defined]
+            finally:
+                menu.grab_release()
+            return "break"
+
+        widget.bind("<Button-2>", _show_menu)
+        widget.bind("<Button-3>", _show_menu)
+        widget.bind("<Control-Button-1>", _show_menu)
+
+    _wire_text_shortcuts(chat_log, allow_edit=False)
+    _wire_text_shortcuts(chat_entry, allow_edit=True)
+    _wire_text_shortcuts(pattern_entry, allow_edit=True)
+    _wire_text_shortcuts(files_entry, allow_edit=True)
+
+    _search_btn_hover = [False]
+
+    def _apply_search_btn_colors() -> None:
+        """Recolor the Search button based on current run state. Blue when
+        idle, amber while a search is in progress."""
+        running = bool(state.get("searching", False))
+        bg = _T["BTN_RUN_BG"] if running else _T["BTN_GO_BG"]
+        hover_bg = _T["BTN_RUN_HOVER"] if running else _T["BTN_GO_HOVER"]
+        with contextlib.suppress(Exception):
+            search_btn.configure(
+                bg=(hover_bg if _search_btn_hover[0] else bg),
+                fg="white")
+
+    def _on_search_btn_enter(_e: object = None) -> None:
+        _search_btn_hover[0] = True
+        _apply_search_btn_colors()
+
+    def _on_search_btn_leave(_e: object = None) -> None:
+        _search_btn_hover[0] = False
+        _apply_search_btn_colors()
+
+    search_btn.bind("<Enter>", _on_search_btn_enter)
+    search_btn.bind("<Leave>", _on_search_btn_leave)
 
     def _apply_raw_colors(t: dict) -> None:
         """Recolor all raw tk (non-ttk) widgets and tree tags for palette t."""
@@ -1893,9 +2331,13 @@ def run_gui() -> int:
             chat_outer.configure(bg=t["BORDER"])
             chat_header.configure(bg=t["BG"])
             chat_frame.configure(bg=t["BG"])
-            _chat_toggle_btn.configure(
-                bg=t["BG"], fg=t["TEXT"],
-                activebackground=t["BG"], activeforeground=t["ACCENT"])
+            # tk.Label has no activebackground/activeforeground — including
+            # them in a single .configure() call atomically fails the whole
+            # call, which is why the chat header used to stay light in dark mode.
+            _chat_toggle_btn.configure(bg=t["BG"], fg=t["TEXT"])
+            _chat_model_lbl.configure(bg=t["BG"], fg=t["TEXT"])
+            _chat_ratelimit_lbl.configure(bg=t["BG"], fg=t["MUTED"])
+            chat_context_lbl.configure(foreground=t["MUTED"])
         with contextlib.suppress(Exception):
             chat_log_wrap.configure(bg=t["CHAT_BORDER"])
             chat_log.configure(
@@ -1906,14 +2348,21 @@ def run_gui() -> int:
             _apply_chat_log_tags(t)
         with contextlib.suppress(Exception):
             chat_entry_wrap.configure(bg=t["CHAT_BORDER"])
-            chat_entry.configure(
-                background=t["CHAT_ENTRY_BG"], foreground=t["CHAT_FG"],
-                insertbackground=t["CHAT_FG"],
-                disabledbackground=t["CHAT_DISABLED_BG"],
-                disabledforeground=t["CHAT_DISABLED_FG"])
+            # tk.Text doesn't support disabledbackground/disabledforeground —
+            # honor whatever state the widget is in and pick matching colors.
+            if str(chat_entry.cget("state")) == "disabled":
+                chat_entry.configure(
+                    background=t["CHAT_DISABLED_BG"],
+                    foreground=t["CHAT_DISABLED_FG"],
+                    insertbackground=t["CHAT_FG"])
+            else:
+                chat_entry.configure(
+                    background=t["CHAT_ENTRY_BG"], foreground=t["CHAT_FG"],
+                    insertbackground=t["CHAT_FG"])
         with contextlib.suppress(Exception):
             tree.tag_configure("odd", background=t["ROW_ALT"])
             tree.tag_configure("even", background=t["CARD_BG"])
+        _apply_search_btn_colors()
 
     # ── chat state ───────────────────────────────────────────────────────────
     # messages: full conversation, including the leading "context" turn pair
@@ -1925,6 +2374,14 @@ def run_gui() -> int:
         "context_files": [],  # List[str]
         "context_chars": 0,
     }
+    # Up/Down arrow input history for the chat entry. idx == -1 means
+    # "not navigating" — the entry shows whatever the user is currently typing.
+    _saved_input_history = _gui_state.get("chat_input_history")
+    _chat_input_history: List[str] = [
+        str(x) for x in _saved_input_history if str(x).strip()
+    ] if isinstance(_saved_input_history, list) else []
+    _CHAT_INPUT_HISTORY_CAP = 100
+    _chat_history_state: Dict[str, object] = {"idx": -1, "draft": ""}
     # Token budgets. We send Claude a tiny *manifest* of loaded files (paths,
     # line counts, one-line preview) rather than full content — Claude pulls
     # content on demand via search_in_context + read_file_chunk. This keeps
@@ -1935,7 +2392,7 @@ def run_gui() -> int:
     _CHAT_TOOL_ROUNDS = 8            # max tool-use rounds per turn
     _CHAT_MAX_TOKENS = 16_384        # response cap per round
     _CHAT_THINKING_BUDGET = 10_000   # extended-thinking token budget
-    _CHAT_TOOL_RESULT_CAP = 40_000   # max chars of tool output fed back
+    _CHAT_TOOL_RESULT_CAP = 8_000    # max chars of tool output fed back (~2K tokens — sized for Free-tier 10K/min cap)
     # default fuzzy threshold for search_in_context
     _CHAT_SEARCH_DEFAULT_THRESHOLD = 70
     _CHAT_SEARCH_DEFAULT_MAX = 50         # default match cap for search_in_context
@@ -2229,9 +2686,21 @@ def run_gui() -> int:
             suffix = f"\n… (file has {len(all_lines)} lines total)"
         return body + suffix
 
+    def _resolve_tool_path(path: str) -> str:
+        """Resolve a relative path the chat tools were given against the
+        project directory (/Users/salman/bin). Absolute paths and ~-paths
+        are honored as-is."""
+        if not path:
+            return path
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = _PROJECT_DIR / p
+        return str(p)
+
     def _tool_write(path: str, content: str, append: bool = False) -> str:
         if not path:
             return "error: path is required"
+        path = _resolve_tool_path(path)
         mode = "a" if append else "w"
         verb = "appended" if append else "wrote"
         try:
@@ -2274,6 +2743,7 @@ def run_gui() -> int:
     def _tool_create_dir(path: str) -> str:
         if not path:
             return "error: path is required"
+        path = _resolve_tool_path(path)
         try:
             Path(path).mkdir(parents=True, exist_ok=True)
             return f"created directory: {path}"
@@ -2297,6 +2767,7 @@ def run_gui() -> int:
     def _tool_delete(path: str, recursive: bool = False) -> str:
         if not path:
             return "error: path is required"
+        path = _resolve_tool_path(path)
         p = Path(path)
         try:
             if p.is_dir():
@@ -2330,6 +2801,8 @@ def run_gui() -> int:
     def _tool_copy(src: str, dst: str) -> str:
         if not src or not dst:
             return "error: src and dst are required"
+        src = _resolve_tool_path(src)
+        dst = _resolve_tool_path(dst)
         import shutil
         try:
             if Path(src).is_dir():
@@ -2344,6 +2817,8 @@ def run_gui() -> int:
     def _tool_move(src: str, dst: str) -> str:
         if not src or not dst:
             return "error: src and dst are required"
+        src = _resolve_tool_path(src)
+        dst = _resolve_tool_path(dst)
         import shutil
         try:
             Path(dst).parent.mkdir(parents=True, exist_ok=True)
@@ -2446,21 +2921,56 @@ def run_gui() -> int:
         return f"unknown tool: {name}"
 
     def _update_chat_state() -> None:
-        chat_entry.config(state="normal")
+        _set_chat_entry_state("normal")
         chat_send_btn.config(state="normal")
         chat_reset_btn.config(state="normal")
 
     def _append_chat(tag: str, prefix: str, text: str) -> None:
         chat_log.config(state="normal")
+        start = chat_log.index("end-1c")
         chat_log.insert("end", f"{prefix}: {text}\n", tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+        _scan_chat_paths(start)
+        _scan_chat_markdown(start)
+
+    # Cumulative token usage for this session — written by the chat worker,
+    # rendered after each Claude turn by _show_chat_usage().
+    _chat_session_usage: Dict[str, int] = {
+        "input": 0, "output": 0, "cache_read": 0, "cache_create": 0,
+        "turns": 0,
+    }
+
+    def _show_chat_usage(turn: dict, session: dict) -> None:
+        """Append a small italic 'usage' line after a Claude turn ends.
+        Shows this turn's token spend plus running session totals so the
+        user can keep an eye on rate-limit pressure."""
+        def _fmt(d: dict) -> str:
+            parts = [f"in {d.get('input', 0):,}",
+                     f"out {d.get('output', 0):,}"]
+            if d.get("cache_read"):
+                parts.append(f"cache {d['cache_read']:,} read")
+            if d.get("cache_create"):
+                parts.append(f"cache {d['cache_create']:,} new")
+            return "  ·  ".join(parts)
+
+        line = (f"📊  this turn: {_fmt(turn)}  tok"
+                f"   ·   session ({session.get('turns', 0)} turns): "
+                f"{_fmt(session)}  tok\n")
+        chat_log.config(state="normal")
+        chat_log.insert("end", line, "usage")
         chat_log.see("end")
         chat_log.config(state="disabled")
 
     # Inline streaming helpers: write a prefix once, then append deltas, then
     # finish with newline. Lets text appear character-by-character while
-    # Claude is still generating.
+    # Claude is still generating. _turn_start tracks where the current turn
+    # began so we can scan the whole turn for clickable paths at end.
+    _turn_start: Dict[str, str] = {}
+
     def _chat_begin_turn(tag: str, prefix: str) -> None:
         chat_log.config(state="normal")
+        _turn_start[tag] = chat_log.index("end-1c")
         chat_log.insert("end", f"{prefix}: ", tag)
         chat_log.see("end")
         chat_log.config(state="disabled")
@@ -2476,6 +2986,10 @@ def run_gui() -> int:
         chat_log.insert("end", "\n", tag)
         chat_log.see("end")
         chat_log.config(state="disabled")
+        start = _turn_start.pop(tag, None)
+        if start is not None:
+            _scan_chat_paths(start)
+            _scan_chat_markdown(start)
 
     # Animated "claude is thinking…" indicator. Insert returns a handle; pass
     # it back to _stop_thinking() to remove the line when the response lands.
@@ -2591,21 +3105,28 @@ def run_gui() -> int:
         _append_chat("sys", "system", "Conversation reset.")
         _log_activity("Chat conversation reset")
 
-    def _send_chat(_event: object = None) -> None:
-        msg = chat_entry.get().strip()
+    def _send_chat(_event: object = None) -> str:
+        msg = chat_entry.get("1.0", "end-1c").strip()
         if not msg:
-            return
+            return "break"
         api_key = str(_gui_state.get("api_key")
                       or os.environ.get("ANTHROPIC_API_KEY") or "")
         if not api_key:
             _append_chat("err", "error",
                          "No API key — click 'API Key…' to set your Anthropic key.")
             _log_activity("Chat blocked — no API key")
-            return
-        chat_entry.delete(0, "end")
+            return "break"
+        if msg in _chat_input_history:
+            _chat_input_history.remove(msg)
+        _chat_input_history.insert(0, msg)
+        del _chat_input_history[_CHAT_INPUT_HISTORY_CAP:]
+        _gui_state["chat_input_history"] = _chat_input_history
+        _chat_history_state["idx"] = -1
+        _chat_history_state["draft"] = ""
+        chat_entry.delete("1.0", "end")
         _append_chat("you", "you", msg)
         _log_activity(f"Chat sent: {msg[:80]}{'…' if len(msg) > 80 else ''}")
-        chat_entry.config(state="disabled")
+        _set_chat_entry_state("disabled")
         chat_send_btn.config(state="disabled")
         chat_reset_btn.config(state="disabled")
 
@@ -2704,12 +3225,20 @@ def run_gui() -> int:
                     "  • write_file / append_to_file — produce summaries, extracts, scripts\n"
                     "  • create_directory / delete_path / copy_file / move_file — file ops\n"
                     "  • run_command — run shell commands\n\n"
+                    f"OUTPUT DIRECTORY: When you write files, save them under "
+                    f"{_PROJECT_DIR} by default. Use a plain filename or a "
+                    "relative path (e.g. `notes.md`, `out/summary.txt`) — the "
+                    "tool resolves it against that directory automatically. "
+                    "Only use an absolute path when the user explicitly asks "
+                    "you to write somewhere else.\n\n"
                     "If the user asks a general question that doesn't need their "
                     "files, answer directly without calling tools."
                 )
 
                 current = list(messages)
                 final_text_parts: List[str] = []
+                turn_usage = {"input": 0, "output": 0,
+                              "cache_read": 0, "cache_create": 0}
                 # mutable so the lambda below can read it
                 think_box = {"id": None}
 
@@ -2743,8 +3272,10 @@ def run_gui() -> int:
                     # via beta header). If the API rejects it on enter, fall
                     # back to a plain streaming call.
                     def _open_stream(with_thinking: bool):
+                        model_id = str(_gui_state.get("claude_model")
+                                       or "claude-sonnet-4-6")
                         kwargs = dict(
-                            model="claude-sonnet-4-6",
+                            model=model_id,
                             max_tokens=_CHAT_MAX_TOKENS,
                             system=system_prompt,
                             tools=_CHAT_TOOLS,
@@ -2758,6 +3289,51 @@ def run_gui() -> int:
                                 "anthropic-beta": "interleaved-thinking-2025-05-14"
                             }
                         return client.messages.stream(**kwargs)
+
+                    def _capture_ratelimit(stream_obj) -> None:
+                        """Pull anthropic-ratelimit-* headers off the live
+                        stream's response and push a one-line summary to the
+                        chat header. Best-effort; the SDK exposes the response
+                        via a few different attributes depending on version."""
+                        try:
+                            resp = (getattr(stream_obj, "response", None)
+                                    or getattr(stream_obj, "_response", None))
+                            if resp is None:
+                                return
+                            h = getattr(resp, "headers", None) or {}
+                            def _g(k: str) -> str:
+                                v = h.get(k) if hasattr(h, "get") else None
+                                return str(v) if v is not None else ""
+                            in_rem = _g("anthropic-ratelimit-input-tokens-remaining")
+                            in_lim = _g("anthropic-ratelimit-input-tokens-limit")
+                            out_rem = _g("anthropic-ratelimit-output-tokens-remaining")
+                            out_lim = _g("anthropic-ratelimit-output-tokens-limit")
+                            req_rem = _g("anthropic-ratelimit-requests-remaining")
+
+                            def _fmt(n: str) -> str:
+                                try:
+                                    v = int(n)
+                                    if v >= 1_000_000:
+                                        return f"{v/1_000_000:.1f}M"
+                                    if v >= 1000:
+                                        return f"{v/1000:.1f}k"
+                                    return str(v)
+                                except (TypeError, ValueError):
+                                    return n or "?"
+                            parts = []
+                            if in_rem and in_lim:
+                                parts.append(f"in {_fmt(in_rem)}/{_fmt(in_lim)}")
+                            if out_rem and out_lim:
+                                parts.append(f"out {_fmt(out_rem)}/{_fmt(out_lim)}")
+                            if req_rem:
+                                parts.append(f"req {_fmt(req_rem)}")
+                            label = " · ".join(parts)
+                            if label:
+                                root.after(0,
+                                           lambda lbl=label:
+                                               _chat_ratelimit_var.set(lbl))
+                        except Exception:
+                            pass
 
                     def _consume_stream(with_thinking: bool):
                         text_for_round.clear()
@@ -2799,6 +3375,7 @@ def run_gui() -> int:
                                         root.after(
                                             0, _chat_end_turn, "thinking")
                                         thinking_turn_open[0] = False
+                            _capture_ratelimit(_s)
                             return _s.get_final_message()
 
                     try:
@@ -2822,6 +3399,18 @@ def run_gui() -> int:
                     finally:
                         root.after(0, _end_think)
                         root.after(0, _close_open_turns)
+
+                    # Tally token usage for this round.
+                    _u = getattr(final_msg, "usage", None)
+                    if _u is not None:
+                        turn_usage["input"] += int(
+                            getattr(_u, "input_tokens", 0) or 0)
+                        turn_usage["output"] += int(
+                            getattr(_u, "output_tokens", 0) or 0)
+                        turn_usage["cache_read"] += int(
+                            getattr(_u, "cache_read_input_tokens", 0) or 0)
+                        turn_usage["cache_create"] += int(
+                            getattr(_u, "cache_creation_input_tokens", 0) or 0)
 
                     # Reconstruct assistant block list for the next round's request.
                     tool_uses: List[object] = []
@@ -2915,6 +3504,14 @@ def run_gui() -> int:
                 root.after(0, lambda _r=_reply_preview: _log_activity(
                     f"Chat reply: {_r}"))
 
+                # Update session token totals and show a per-turn summary.
+                _sess = _chat_session_usage
+                for _k in ("input", "output", "cache_read", "cache_create"):
+                    _sess[_k] += turn_usage[_k]
+                _sess["turns"] += 1
+                root.after(0, _show_chat_usage,
+                           dict(turn_usage), dict(_sess))
+
                 def _commit() -> None:
                     # type: ignore[arg-type]
                     msgs = list(chat_state["messages"])
@@ -2932,9 +3529,59 @@ def run_gui() -> int:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _chat_history_up(_event: object = None) -> str:
+        # Only intercept when the cursor is on the FIRST visual line; otherwise
+        # let the default Text behavior move the cursor up within the message.
+        cur_line = int(str(chat_entry.index("insert")).split('.', 1)[0])
+        if cur_line > 1:
+            return ""
+        if not _chat_input_history:
+            return "break"
+        idx = int(_chat_history_state["idx"])  # type: ignore[arg-type]
+        if idx == -1:
+            _chat_history_state["draft"] = chat_entry.get("1.0", "end-1c")
+            new_idx = 0
+        else:
+            new_idx = min(idx + 1, len(_chat_input_history) - 1)
+        _chat_history_state["idx"] = new_idx
+        chat_entry.delete("1.0", "end")
+        chat_entry.insert("1.0", _chat_input_history[new_idx])
+        chat_entry.mark_set("insert", "end-1c")
+        return "break"
+
+    def _chat_history_down(_event: object = None) -> str:
+        # Only intercept on the LAST visual line; otherwise let default fire.
+        cur_line = int(str(chat_entry.index("insert")).split('.', 1)[0])
+        last_line = int(str(chat_entry.index("end-1c")).split('.', 1)[0])
+        if cur_line < last_line:
+            return ""
+        idx = int(_chat_history_state["idx"])  # type: ignore[arg-type]
+        if idx < 0:
+            return "break"
+        if idx == 0:
+            _chat_history_state["idx"] = -1
+            chat_entry.delete("1.0", "end")
+            chat_entry.insert("1.0", str(_chat_history_state["draft"]))
+            chat_entry.mark_set("insert", "end-1c")
+            _chat_history_state["draft"] = ""
+            return "break"
+        new_idx = idx - 1
+        _chat_history_state["idx"] = new_idx
+        chat_entry.delete("1.0", "end")
+        chat_entry.insert("1.0", _chat_input_history[new_idx])
+        chat_entry.mark_set("insert", "end-1c")
+        return "break"
+
     chat_send_btn.config(command=_send_chat)
     chat_reset_btn.config(command=_reset_chat)
-    chat_entry.bind("<Return>", _send_chat)
+    # Enter sends; Shift+Enter falls through to default newline insert.
+    # Lambda wrapper guarantees we return "break" even when _send_chat runs
+    # the long path (worker thread) and exits with an implicit None — otherwise
+    # Tk would still insert a newline into the now-cleared input.
+    chat_entry.bind("<Return>", lambda e: _send_chat(e) or "break")
+    chat_entry.bind("<KP_Enter>", lambda e: _send_chat(e) or "break")
+    chat_entry.bind("<Up>", _chat_history_up)
+    chat_entry.bind("<Down>", _chat_history_down)
     _update_chat_state()
     _update_chat_context_label()
 
@@ -2973,8 +3620,11 @@ def run_gui() -> int:
                 if ai:
                     _api_key = str(_gui_state.get("api_key")
                                    or os.environ.get("ANTHROPIC_API_KEY") or "")
+                    _model_id = str(_gui_state.get("claude_model")
+                                    or "claude-sonnet-4-6")
                     lines, matches = ai_search_file(
-                        fp, pattern, log_fn=_chat_log_fn, api_key=_api_key)
+                        fp, pattern, log_fn=_chat_log_fn,
+                        api_key=_api_key, model=_model_id)
                 else:
                     lines, matches = search_file(
                         fp, pattern,
@@ -3031,7 +3681,8 @@ def run_gui() -> int:
         state["cancel_search"] = False
         state["results"] = {}
         state["pattern"] = pat
-        search_btn.config(state="disabled", text="Searching…")
+        search_btn.config(text="Searching…", cursor="watch")
+        _apply_search_btn_colors()
         stop_btn.config(state="normal")
         export_btn.config(state="disabled")
         tree.delete(*tree.get_children())
@@ -3066,10 +3717,19 @@ def run_gui() -> int:
     _tmp_counter = _itertools.count(1)
 
     def _build_highlighted_pdf(fp: str, matches: List[Match]) -> str:
-        """Highlight query matches in a PDF copy using PyMuPDF's search_for."""
+        """Highlight query matches in a PDF copy.
+
+        Strategy in two layers, weakest-to-strongest:
+          1. PyMuPDF's exact search_for() for both the original and normalized
+             query — fast path that handles ligatures via PyMuPDF flags.
+          2. Word-level normalized comparison via page.get_text("words") —
+             catches Arabic matches where the PDF text has diacritics or
+             alef variants that the user's query didn't (the common case the
+             fuzzy search picked up but exact search_for missed).
+        """
         try:
             import fitz as _fitz
-            _tmp_dir = Path.home() / ".fuzzer_tmp"
+            _tmp_dir = _PROJECT_DIR / ".fuzzer_tmp"
             _tmp_dir.mkdir(exist_ok=True)
             _doc = _fitz.open(fp)
 
@@ -3081,15 +3741,42 @@ def run_gui() -> int:
 
             # Pages that actually had matches
             _hit_pages = set(m.page_num or 1 for m in matches)
+            # Multi-word queries split into per-word normalized tokens for
+            # word-level scanning; single-word queries fall straight into the
+            # token list.
+            _query_words = [_normalize_arabic(w)
+                            for w in _query.split() if w.strip()]
 
             for _pn in _hit_pages:
                 if not (1 <= _pn <= len(_doc)):
                     continue
                 _pg = _doc[_pn - 1]
+                _highlighted_any = False
+                # Pass 1: exact substring search via PyMuPDF
                 for _term in _terms:
-                    # quads=True gives tighter shapes for Arabic ligatures
                     for _quad in _pg.search_for(_term, quads=True):
                         _pg.add_highlight_annot(_quad)
+                        _highlighted_any = True
+                # Pass 2: normalized word match. Always runs (cheap) so we
+                # catch additional hits the exact pass missed — e.g. words
+                # with fatha/damma/kasra or أ/إ/ا differences.
+                with contextlib.suppress(Exception):
+                    _words = _pg.get_text("words")  # [(x0,y0,x1,y1,word,...)]
+                    for _w in _words:
+                        if len(_w) < 5:
+                            continue
+                        _word_text = str(_w[4])
+                        _word_norm = _normalize_arabic(_word_text)
+                        if not _word_norm:
+                            continue
+                        if any(qw and qw in _word_norm for qw in _query_words):
+                            _rect = _fitz.Rect(_w[0], _w[1], _w[2], _w[3])
+                            _pg.add_highlight_annot(_rect)
+                            _highlighted_any = True
+                if not _highlighted_any:
+                    _log_activity(
+                        f"PDF highlight: no match on page {_pn} of "
+                        f"{os.path.basename(fp)}")
 
             import time as _t
             _tmp = str(
@@ -3171,7 +3858,8 @@ def run_gui() -> int:
                     was_cancelled = state.get("cancel_search", False)
                     state["searching"] = False
                     state["cancel_search"] = False
-                    search_btn.config(state="normal", text="Search")
+                    search_btn.config(text="Search", cursor="hand2")
+                    _apply_search_btn_colors()
                     stop_btn.config(state="disabled")
                     results = state["results"]
                     if results:
@@ -3197,7 +3885,8 @@ def run_gui() -> int:
                 elif kind == "error":
                     state["searching"] = False
                     state["cancel_search"] = False
-                    search_btn.config(state="normal", text="Search")
+                    search_btn.config(text="Search", cursor="hand2")
+                    _apply_search_btn_colors()
                     stop_btn.config(state="disabled")
                     status_var.set(f"Error: {msg[1]}")
                     _log_activity(f"Error: {str(msg[1])[:120]}")
@@ -3220,6 +3909,7 @@ def run_gui() -> int:
         path = filedialog.asksaveasfilename(
             title="Export results",
             defaultextension=".xlsx",
+            initialdir=str(_PROJECT_DIR),
             filetypes=[
                 ("Excel workbook", "*.xlsx"),
                 ("CSV", "*.csv"),
@@ -3436,7 +4126,14 @@ def run_gui() -> int:
         key_entry.focus_set()
         dlg.bind("<Return>", lambda _e: _save())
 
-    search_btn.config(command=start_search)
+    # tk.Label has no "command" attribute — wire click manually and gate it on
+    # the running state so we don't try to launch a second search while one is
+    # in flight (which the original ttk.Button's state="disabled" handled).
+    def _on_search_btn_click(_e: object = None) -> None:
+        if state.get("searching", False):
+            return
+        start_search()
+    search_btn.bind("<Button-1>", _on_search_btn_click)
     stop_btn.config(command=stop_search)
     clear_btn.config(command=clear_results)
     export_btn.config(command=export_to_file)
@@ -3581,8 +4278,30 @@ def run_gui() -> int:
 
         if iid != _hover_iid[0]:
             _hover_iid[0] = iid
+            # Build a source header so the user knows where this snippet came
+            # from without selecting the row. Format: "<basename>  ·  line 42
+            # · page 7" (page omitted for non-PDF files).
+            src_path = _row_paths.get(iid, "")
+            vals = tree.item(iid, "values")
+            try:
+                _line_no = str(vals[1])
+            except (IndexError, TypeError):
+                _line_no = ""
+            try:
+                _page_no = str(vals[2]) if vals[2] else ""
+            except (IndexError, TypeError):
+                _page_no = ""
+            _src_bits = []
+            if src_path:
+                _src_bits.append(os.path.basename(src_path))
+            if _line_no:
+                _src_bits.append(f"line {_line_no}")
+            if _page_no:
+                _src_bits.append(f"page {_page_no}")
+            header = "  ·  ".join(_src_bits)
+            tip_text = f"{header}\n\n{text}" if header else text
             if _hover_label[0] is not None:
-                _hover_label[0].config(text=text)
+                _hover_label[0].config(text=tip_text)
 
         # position tooltip near cursor
         tip_x = tree.winfo_rootx() + x + 16
@@ -3598,6 +4317,9 @@ def run_gui() -> int:
 
     tree.bind("<Double-1>", open_selected)
     tree.bind("<Return>", open_selected)
+    # Bottom selected-result bar opens the file on click (mirrors double-click on tree)
+    selected.bind("<Button-1>", lambda _e: open_selected())
+    selected.configure(cursor="hand2")
     pattern_entry.bind("<Return>", lambda _e: start_search())
     files_entry.bind("<Return>", lambda _e: start_search())
 
@@ -3703,9 +4425,19 @@ def run_gui() -> int:
             _gui_state["window_geometry"] = root.geometry()
             _gui_state["window_state"] = root.state()
             _save_state(_gui_state)
-        root.destroy()
+        # PyMuPDF's C++ global destructor segfaults under Python 3.14 + Tcl/Tk 9
+        # at process exit (fz_flush_warnings → unicode_decode_utf8 on a freed
+        # context). Skip Python's atexit chain by hard-exiting after state is
+        # flushed to disk.
+        os._exit(0)
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
+    # macOS Cmd+Q routes through tk::mac::Quit, NOT WM_DELETE_WINDOW. Hook it
+    # so the os._exit short-circuit also runs there (otherwise Python proceeds
+    # to atexit and triggers the PyMuPDF destructor crash).
+    if _platform.system() == "Darwin":
+        with contextlib.suppress(Exception):
+            root.createcommand("tk::mac::Quit", _on_close)
 
     # Restore window state (maximized / normal). Apply after geometry so the
     # restore size is set before zooming — deiconify then zoom on Windows.
@@ -3713,15 +4445,22 @@ def run_gui() -> int:
     # center on screen.
     def _open_layout() -> None:
         with contextlib.suppress(Exception):
-            if _saved_state == "zoomed" or not _saved_geom:
-                root.state("zoomed")
-            else:
-                _auto_fit(grow_only=True)
-                _center_window()
+            if _saved_geom:
+                # User has a saved size — honor it exactly. No auto-fit
+                # (would override the user's chosen size).
+                pass
+            elif _saved_state == "zoomed":
+                # Legacy-saved zoomed state without geometry: unzoom and use default.
+                root.state("normal")
+                root.geometry(_default_geometry())
+            # else: _default_geometry() already applied above.
 
     root.after(10, _open_layout)
 
-    # Apply initial theme to all raw tk widgets (ttk styles already applied above).
+    # Apply initial theme. ttk styles above were configured with light-mode
+    # constants — reapply with the active palette so a saved dark theme takes
+    # effect on startup, not just after toggling.
+    _configure_ttk_styles(_T)
     _apply_raw_colors(_T)
 
     root.after(100, poll_queue)
@@ -3863,3 +4602,5 @@ examples:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
