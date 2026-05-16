@@ -45,19 +45,87 @@ is a small piece you can read top-to-bottom without juggling files.
 
 ## Search flow
 
+End-to-end data flow from the GUI form down to per-line matching. The
+checkbox / spinbox option boxes gate which branch each file takes.
+
 ```mermaid
-flowchart LR
-    A[GUI form] --> B[collect_files]
-    B --> C{For each file}
-    C --> D[read_lines]
-    D --> E{Cache hit?}
-    E -->|yes| F[(SQLite cache)]
-    E -->|no| G[_extract_pdf / _docx / _plain]
-    G --> H[_cache_put]
-    F & H --> K[search_file → fuzzy_score]
-    K --> L[Match list]
-    L --> P[Tree + Highlight PDF]
+flowchart TD
+    %% ── inputs ───────────────────────────────────────────────
+    subgraph IN["1. Inputs (form state)"]
+        P["Pattern (entry)"]
+        F["Files / folders<br/>(picker · drag-drop · history)"]
+        OPT_REC["☐ Recursive"]
+        OPT_CASE["☐ Case-sensitive"]
+        OPT_RGA["☐ rga engine"]
+        OPT_THR["Threshold 0–100"]
+    end
+
+    %% ── file collection ──────────────────────────────────────
+    F --> COL["collect_files(paths, recursive)"]
+    OPT_REC -. gates .-> COL
+    COL --> Q["File queue"]
+
+    %% ── per-file extraction ──────────────────────────────────
+    Q --> EACH{{"For each file<br/>(worker thread)"}}
+    EACH --> RL["read_lines(fp)"]
+    RL --> CACHE{"Cache hit?<br/>(path, mtime)"}
+    CACHE -- yes --> DB[("SQLite cache")]
+    CACHE -- no --> EXT{"Extension (_EXT_MAP)"}
+    EXT -- ".pdf"           --> EPDF["_extract_pdf<br/>(PyMuPDF → pdfplumber)"]
+    EXT -- ".docx / .doc"   --> EDOC["_extract_docx"]
+    EXT -- "text / md / csv / …" --> ETXT["_extract_plain"]
+    EPDF --> PUT["_cache_put"]
+    EDOC --> PUT
+    ETXT --> PUT
+    DB --> LINES["lines + page_nums"]
+    PUT --> LINES
+
+    %% ── engine routing ───────────────────────────────────────
+    LINES --> ENG{"rga box on?<br/>(and rga on PATH)"}
+    OPT_RGA -. gates .-> ENG
+    ENG -- yes --> RGA["rga_search_file<br/>(ripgrep-all · substring only)"]
+    ENG -- no  --> SF["search_file"]
+
+    %% ── matching pipeline (native path) ──────────────────────
+    SF --> LOOP{{"For each line"}}
+    LOOP --> SUB{"Substring hit?<br/>(case-folded if box off)"}
+    OPT_CASE -. gates .-> SUB
+    SUB -- yes --> EXACT["Match(score=100, page)"]
+    SUB -- no --> NORM["_normalize_arabic<br/>(C ext → pyarabic → regex)"]
+    NORM --> FUZZ["fuzzy_score<br/>(rapidfuzz · thefuzz · builtin)"]
+    FUZZ --> THR{"score ≥ threshold?"}
+    OPT_THR -. gates .-> THR
+    THR -- yes --> FUZZM["Match(score=N, page)"]
+    THR -- no --> DROP["drop line"]
+
+    %% ── results ──────────────────────────────────────────────
+    EXACT --> MQ["msg_q: (match, fp, lines, matches)"]
+    FUZZM --> MQ
+    RGA   --> MQ
+    MQ --> TREE["GUI Treeview<br/>(streaming, file-by-file)"]
+    TREE --> PV["Preview · highlight PDF · export"]
+
+    %% ── styling ──────────────────────────────────────────────
+    classDef box fill:#eef3ff,stroke:#5b7cba,color:#1c1e22;
+    classDef gate fill:#fff7e0,stroke:#c98a00,color:#1c1e22;
+    classDef store fill:#eaf6ec,stroke:#3b8c4c,color:#1c1e22;
+    class OPT_REC,OPT_CASE,OPT_RGA,OPT_THR box;
+    class CACHE,EXT,ENG,SUB,THR gate;
+    class DB store;
 ```
+
+Notes:
+
+- The four option boxes (dashed edges) don't sit in the pipeline themselves —
+  they gate branch decisions. `Recursive` only changes `collect_files`;
+  `Case-sensitive` only changes the substring compare; `rga engine` swaps
+  the whole matching backend; `Threshold` controls the fuzzy cut-off
+  (set to 100 → exact-only, set to 0 → keep everything).
+- The `rga` branch is substring-only by design — it trades fuzzy fallback
+  for much wider format coverage (epub, xlsx, sqlite, mkv subtitles, …).
+- Streaming: the worker emits one `("match", …)` message per file rather
+  than one big `("done", …)` at the end, so rows appear in the tree as
+  each file finishes.
 
 ## GUI internals
 
