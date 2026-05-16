@@ -1471,6 +1471,48 @@ def run_gui() -> int:
         lambda _e: _pat_ring.configure(bg=_T["BORDER"]),
         add="+")
 
+    # ── ghost-text placeholders for the top form ────────────────────────────
+    # When a StringVar-backed entry is empty and unfocused, drop a muted hint
+    # into the var ("Type a word…", "Drag a folder…"). The shared state dict
+    # tracks whether the value is the hint vs real user input so consumers
+    # (start_search, drop handler, picker) skip it cleanly.
+    def _install_entry_placeholder(widget, var, text) -> dict:
+        state = {"active": False, "text": text}
+
+        def show():
+            if not var.get():
+                state["active"] = True
+                var.set(text)
+
+        def hide():
+            if state["active"]:
+                state["active"] = False
+                # `var.set("")` retriggers the trace below; guard with the flag.
+                var.set("")
+
+        def on_focus_in(_e=None):
+            hide()
+
+        def on_focus_out(_e=None):
+            if not var.get().strip():
+                show()
+
+        # If anything else writes a real value while we thought placeholder
+        # was active, drop the active flag so reads pass through normally.
+        def on_var_change(*_):
+            if state["active"] and var.get() != text:
+                state["active"] = False
+
+        widget.bind("<FocusIn>", on_focus_in, add="+")
+        widget.bind("<FocusOut>", on_focus_out, add="+")
+        var.trace_add("write", on_var_change)
+        show()  # initial
+        return state
+
+    _pattern_ph = _install_entry_placeholder(
+        pattern_entry, pattern_var,
+        "Type a word or phrase…  e.g. machine learning")
+
     def _clear_pattern() -> None:
         pattern_var.set("")
         pattern_entry.focus_set()
@@ -1484,6 +1526,9 @@ def run_gui() -> int:
     files_entry = ttk.Entry(form, textvariable=files_var)
     files_entry.grid(row=1, column=1, columnspan=2,
                      sticky="ew", padx=4, pady=2)
+    _files_ph = _install_entry_placeholder(
+        files_entry, files_var,
+        "Drag a folder or file here, or paste a path…")
 
     # Drag-and-drop file paths onto the files entry (or anywhere on the window)
     if _dnd_available and DND_FILES is not None:
@@ -1499,7 +1544,10 @@ def run_gui() -> int:
             if not paths:
                 return "break"
             quoted = " ".join(f'"{p}"' for p in paths)
-            existing = files_var.get().strip()
+            # Skip the placeholder when concatenating — pretend the box is
+            # empty if the ghost-text hint is what's in there.
+            existing = ("" if _files_ph["active"]
+                        else files_var.get().strip())
             files_var.set(f"{existing} {quoted}".strip()
                           if existing else quoted)
             # If any dropped path is a directory, default to recursive
@@ -1516,7 +1564,8 @@ def run_gui() -> int:
     def pick_files() -> None:
         paths = filedialog.askopenfilenames(title="Select files to search")
         if paths:
-            existing = files_var.get().strip()
+            existing = ("" if _files_ph["active"]
+                        else files_var.get().strip())
             joined = " ".join(f'"{p}"' for p in paths)
             files_var.set(f"{existing} {joined}".strip()
                           if existing else joined)
@@ -1524,7 +1573,8 @@ def run_gui() -> int:
     def pick_folder() -> None:
         path = filedialog.askdirectory(title="Select folder")
         if path:
-            existing = files_var.get().strip()
+            existing = ("" if _files_ph["active"]
+                        else files_var.get().strip())
             quoted = f'"{path}"'
             files_var.set(f"{existing} {quoted}".strip()
                           if existing else quoted)
@@ -3801,7 +3851,10 @@ def run_gui() -> int:
 
         # If the Files/folders selection changed (or this is the first turn
         # with files), rebuild file context and reset the conversation.
-        paths = parse_files_field(files_var.get())
+        # Skip the placeholder when reading — an active hint means "no files
+        # selected," not "use the literal hint text as a path."
+        paths = parse_files_field(
+            "" if _files_ph["active"] else files_var.get())
         sig = "\0".join(sorted(paths))
         if paths and sig != chat_state["files_sig"]:
             _append_chat("sys", "system", "Loading files into context…")
@@ -4399,11 +4452,16 @@ def run_gui() -> int:
     def start_search() -> None:
         if state["searching"]:
             return
-        pat = pattern_var.get().strip()
+        # Skip the ghost-text placeholders when reading: an active placeholder
+        # means "the box is logically empty," even if the StringVar holds the
+        # hint text. Treat both as empty and prompt the user.
+        pat_raw = "" if _pattern_ph["active"] else pattern_var.get()
+        files_raw = "" if _files_ph["active"] else files_var.get()
+        pat = pat_raw.strip()
         if not pat:
             messagebox.showwarning("fuzzer", "Enter a search pattern.")
             return
-        paths = parse_files_field(files_var.get())
+        paths = parse_files_field(files_raw)
         if not paths:
             messagebox.showwarning(
                 "fuzzer", "Pick at least one file or folder.")
