@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""transcribe — turn a YouTube URL or local A/V file into a transcript PDF.
+"""transcribe — turn a YouTube URL, local A/V file, or .docx of links into transcripts.
 
 Pipeline: yt-dlp / ffmpeg  →  whisper (local)  →  PDF (pymupdf).
 
-Output lands in the current working directory by default — wherever you ran
-the command from. Pass -o PATH to override.
+Three input modes:
+  • single URL / local A/V file → one PDF, default <cwd>/<title>.pdf
+  • .docx file → batch mode: every YouTube hyperlink in the docx becomes an
+    NN_row.pdf in the output directory (default: the docx's parent folder),
+    plus a _combined.pdf master built in document order.
 
 Usage:
-    transcribe <url-or-file> [-o OUT.pdf] [--model M] [--lang L]
+    transcribe <url-or-file-or-docx> [-o OUT] [--model M] [--lang L]
                [--no-timestamps] [--also txt,md,srt]
-               [--append MASTER.pdf] [--keep-audio]
+               [--append MASTER.pdf] [--keep-audio] [--cookies BROWSER]
 
 Examples:
     transcribe https://youtu.be/dQw4w9WgXcQ
     transcribe lecture.mp4 -o lecture.pdf --model medium --lang ar
     transcribe podcast.m4a --also txt,srt
+    transcribe links.docx                      # PDFs land next to links.docx
+    transcribe links.docx -o transcripts/      # …or in transcripts/
 
 Languages: any Whisper-supported language (ar, ja, ko, es, fr, ru, tr, …).
 The PDF auto-picks a font with glyphs for the detected script (Arial Unicode
@@ -51,6 +56,41 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".flv", ".wmv"}
 
 def is_url(s: str) -> bool:
     return bool(re.match(r"^https?://", s, re.I))
+
+def is_docx(s: str) -> bool:
+    return s.lower().endswith(".docx") and not is_url(s)
+
+def extract_youtube_links_from_docx(path: Path) -> list[str]:
+    """Return YouTube URLs found as hyperlinks in a .docx, in document order, deduped."""
+    import zipfile
+    if not path.exists():
+        die(f"file not found: {path}")
+    try:
+        with zipfile.ZipFile(path) as z:
+            rels = z.read("word/_rels/document.xml.rels").decode("utf-8")
+            doc  = z.read("word/document.xml").decode("utf-8")
+    except (zipfile.BadZipFile, KeyError) as e:
+        die(f"not a valid .docx (missing Word parts): {e}")
+
+    # rId → URL map, External hyperlinks only.
+    rid_to_url: dict[str, str] = {}
+    for m in re.finditer(r"<Relationship\b([^>]*)/>", rels):
+        attrs = m.group(1)
+        if 'TargetMode="External"' not in attrs:
+            continue
+        id_m  = re.search(r'Id="([^"]+)"', attrs)
+        tgt_m = re.search(r'Target="([^"]+)"', attrs)
+        if id_m and tgt_m:
+            rid_to_url[id_m.group(1)] = tgt_m.group(1)
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'<w:hyperlink\b[^>]*?r:id="([^"]+)"', doc):
+        url = rid_to_url.get(m.group(1))
+        if url and ("youtu.be" in url or "youtube.com" in url) and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 def need(cmd: str, hint: str) -> str:
     p = shutil.which(cmd)
@@ -101,7 +141,7 @@ class WhisperSegment(TypedDict):
     text: str
 
 # ── audio acquisition ─────────────────────────────────────────────────────────
-def fetch_youtube(url: str, workdir: Path) -> tuple[Path, str]:
+def fetch_youtube(url: str, workdir: Path, cookies: str | None = None) -> tuple[Path, str]:
     """Download audio from YouTube, return (audio_path, title)."""
     need("yt-dlp", "brew install yt-dlp")
     step(f"downloading audio from {url}")
@@ -114,8 +154,10 @@ def fetch_youtube(url: str, workdir: Path) -> tuple[Path, str]:
         "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
         "--print", "after_move:%(title)s",
         "-o", template,
-        url,
     ]
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    cmd.append(url)
     out = subprocess.check_output(cmd, text=True).strip().splitlines()
     # Strip any stray empty lines / progress noise; the last non-empty line is the title.
     title = next((l for l in reversed(out) if l.strip()), "YouTube video").strip()
@@ -190,7 +232,17 @@ def _arabic_shape(text: str) -> str:
             _ARABIC_DEPS_WARNED = True
         return text
     lines = text.split("\n")
-    return "\n".join(get_display(arabic_reshaper.reshape(l)) for l in lines)
+    displays: list[str] = []
+    for l in lines:
+        reshaped = arabic_reshaper.reshape(l)
+        disp = get_display(reshaped)
+        # Type stubs for arabic-reshaper / bidi may report StrOrBytes; normalize
+        # so "\n".join(...) receives Iterable[str].
+        if isinstance(disp, (bytes, bytearray)):
+            displays.append(disp.decode("utf-8", errors="replace"))
+        else:
+            displays.append(str(disp))
+    return "\n".join(displays)
 
 def _pick_font(text: str) -> tuple[str, str | None]:
     """Return (fontname, fontfile|None) suitable for the given text.
@@ -243,7 +295,9 @@ def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: 
 
     fontname, fontfile = _pick_font(full_text + " " + title)
     rtl = has_arabic(full_text)
+    title_rtl = has_arabic(title)
     body_align = fitz.TEXT_ALIGN_RIGHT if rtl else fitz.TEXT_ALIGN_LEFT
+    title_align = fitz.TEXT_ALIGN_RIGHT if title_rtl else fitz.TEXT_ALIGN_LEFT
 
     doc = fitz.open()
     W, H = fitz.paper_size("a4")
@@ -266,9 +320,7 @@ def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: 
 
     if rtl:
         body = _arabic_shape(body)
-        title_disp = _arabic_shape(title)
-    else:
-        title_disp = title
+    title_disp = _arabic_shape(title) if title_rtl else title
 
     remaining = body
     first = True
@@ -282,7 +334,7 @@ def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: 
                 fitz.Rect(MARGIN, MARGIN, W - MARGIN, MARGIN + 30),
                 title_disp,
                 fontname=fontname, fontfile=fontfile,
-                fontsize=16, align=body_align,
+                fontsize=16, align=title_align,
             )
             page.insert_textbox(
                 fitz.Rect(MARGIN, MARGIN + 30, W - MARGIN, MARGIN + 55),
@@ -341,7 +393,13 @@ def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: 
         if not remaining.strip():
             break
 
-    doc.save(str(out))
+    # Subset the embedded TTF before saving — Arial Unicode is ~22 MB and would
+    # otherwise bloat each PDF; subsetting drops a typical transcript to <100 KB.
+    try:
+        doc.subset_fonts()
+    except Exception:
+        pass  # older pymupdf — accept the larger file rather than fail the run
+    doc.save(str(out), garbage=4, deflate=True, deflate_fonts=True, clean=True)
     doc.close()
 
 def write_txt(out: Path, title: str, segments: list[WhisperSegment], full_text: str,
@@ -373,17 +431,89 @@ def write_srt(out: Path, segments: list[WhisperSegment]) -> None:
         lines.append("")
     out.write_text("\n".join(lines), encoding="utf-8")
 
+# ── docx batch mode ───────────────────────────────────────────────────────────
+def _run_docx(args: argparse.Namespace) -> int:
+    """Iterate every YouTube hyperlink in args.source (.docx) and transcribe each.
+
+    Output dir = args.output if given, else the .docx's parent. Each video is
+    written as NN_row.pdf (+ matching .txt/.md/.srt if --also). A combined
+    master `_combined.pdf` is built in document order at the end. Resumable —
+    rows whose NN_row.pdf already exists are skipped.
+    """
+    docx = Path(args.source).expanduser().resolve()
+    urls = extract_youtube_links_from_docx(docx)
+    if not urls:
+        die("no YouTube hyperlinks found in the .docx")
+    out_dir = (Path(args.output).expanduser().resolve()
+               if args.output else docx.parent)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ok(f"docx mode: {len(urls)} link(s) → {out_dir}")
+
+    self_path = Path(__file__).resolve()
+    pdfs: list[Path] = []
+    width = max(2, len(str(len(urls))))
+    for i, url in enumerate(urls, 1):
+        out = out_dir / f"{i:0{width}d}_row.pdf"
+        tag = f"[{i:0{width}d}/{len(urls)}]"
+        if out.exists():
+            ok(f"{tag} skip — {out.name} already present")
+            pdfs.append(out)
+            continue
+        step(f"{tag} {url}")
+        cmd = [str(self_path), url, "-o", str(out), "--model", args.model]
+        if args.lang:           cmd += ["--lang", args.lang]
+        if args.cookies:        cmd += ["--cookies", args.cookies]
+        if args.no_timestamps:  cmd += ["--no-timestamps"]
+        if args.also:           cmd += ["--also", args.also]
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            warn(f"{tag} failed (rc={rc}) — continuing with next row")
+        else:
+            pdfs.append(out)
+
+    # Build combined master, skipping any rows that didn't make it.
+    existing = [p for p in pdfs if p.exists()]
+    if existing:
+        try:
+            import fitz
+        except ImportError:
+            die("pymupdf not installed — cannot build combined master")
+        master = out_dir / "_combined.pdf"
+        combined = fitz.open()
+        for p in existing:
+            src = fitz.open(p)
+            combined.insert_pdf(src)
+            src.close()
+        try:
+            combined.subset_fonts()
+        except Exception:
+            pass
+        combined.save(str(master), garbage=4, deflate=True,
+                      deflate_fonts=True, clean=True)
+        combined.close()
+        ok(f"master: {master}  ({master.stat().st_size/1_000_000:.2f} MB, "
+           f"{len(existing)}/{len(urls)} rows)")
+        missing = len(urls) - len(existing)
+        if missing:
+            warn(f"{missing} row(s) missing — re-run the same command to retry")
+    return 0
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="transcribe",
-        description="Transcribe a YouTube URL or local A/V file to PDF using local Whisper.",
+        description="Transcribe a YouTube URL, local A/V file, or .docx of YouTube links "
+                    "to PDF(s) using local Whisper.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Models: tiny, base, small, medium, large (RAM ~1, 1, 2, 5, 10 GB)",
     )
-    ap.add_argument("source", help="YouTube URL or path to a local audio/video file")
+    ap.add_argument("source",
+                    help="YouTube URL, path to local audio/video, or .docx of links "
+                         "(batch mode: one PDF per hyperlink + a combined master)")
     ap.add_argument("-o", "--output",
-                    help="Output PDF path (default: <cwd>/<title>.pdf)")
+                    help="Output PDF path for single-source mode; output DIRECTORY for "
+                         ".docx mode (default: <cwd>/<title>.pdf or the docx's folder)")
     ap.add_argument("--model", default="small",
                     help="Whisper model size (default: small)")
     ap.add_argument("--lang", default=None,
@@ -396,6 +526,10 @@ def main() -> int:
                     help="Also append the generated PDF to this master PDF (created if missing)")
     ap.add_argument("--keep-audio", action="store_true",
                     help="Keep the intermediate audio file next to the output")
+    ap.add_argument("--cookies",
+                    help="Browser to read cookies from (chrome, safari, firefox, …); "
+                         "passed to yt-dlp as --cookies-from-browser. Use this when "
+                         "YouTube asks to 'sign in to confirm you are not a bot'.")
     args = ap.parse_args()
 
     extras = {x.strip().lower() for x in args.also.split(",") if x.strip()}
@@ -403,11 +537,16 @@ def main() -> int:
     if bad:
         die(f"unknown --also formats: {', '.join(bad)}")
 
+    # Docx batch mode: hand off to _run_docx and exit. URL / local-file paths
+    # below are untouched.
+    if is_docx(args.source):
+        return _run_docx(args)
+
     workdir = Path(tempfile.mkdtemp(prefix="transcribe-"))
     try:
         # 1. Get audio.
         if is_url(args.source):
-            audio, title = fetch_youtube(args.source, workdir)
+            audio, title = fetch_youtube(args.source, workdir, cookies=args.cookies)
             source_label = args.source
         else:
             audio, title = fetch_local(Path(args.source).expanduser(), workdir)
@@ -469,7 +608,12 @@ def main() -> int:
             # Save to a temp file then atomic-rename, so a kill mid-write
             # never leaves a half-written master.
             tmp = master.with_suffix(master.suffix + ".tmp")
-            combined.save(str(tmp), deflate=True)
+            try:
+                combined.subset_fonts()
+            except Exception:
+                pass
+            combined.save(str(tmp), garbage=4, deflate=True,
+                          deflate_fonts=True, clean=True)
             combined.close()
             tmp.replace(master)
             ok(f"appended to {master}")

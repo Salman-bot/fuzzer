@@ -1,106 +1,130 @@
-# Installing `fuzzer` on a fresh Mac
+# Installing `fuzzer`
 
-`fuzzer` is the main project — a fuzzy file-content search GUI for plain
-text, PDF, and DOCX (Arabic + English). `transcribe` is a helper script
-that fuzzer can call to turn YouTube videos and audio files into PDFs
-that fuzzer then searches.
+Mac-only. Open **Terminal** (`⌘`+`Space` → `Terminal` → Enter) and run each
+block below in order.
 
-This guide goes from a brand-new macOS install to a working `fuzzer`
-GUI, with the optional bits at the end.
+---
 
-## 1. Homebrew
+## 1 — Xcode Command Line Tools
+
+```sh
+xcode-select --install
+```
+
+Click **Install** in the dialog. Skip if already installed.
+
+---
+
+## 2 — Homebrew
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-Follow the post-install hint to add `brew` to your `PATH` (the installer
-prints the exact two lines for your shell — they look like
-`eval "$(/opt/homebrew/bin/brew shellenv)"`).
+When it finishes, run the two `eval` lines it prints (they add `brew` to
+your shell).
 
-## 2. System binaries
+---
+
+## 3 — System packages
 
 ```sh
-xcode-select --install                       # C compiler (for _ar_norm native build)
-brew install python@3.14 ffmpeg yt-dlp
+brew install git python@3.14 ffmpeg yt-dlp
 ```
 
-- `python@3.14` — interpreter for fuzzer + transcribe.
-- `ffmpeg` — audio decoding for the transcribe helper.
-- `yt-dlp` — only needed if you use transcribe on YouTube URLs.
-- Xcode Command Line Tools — needed to build the `_ar_norm` C extension
-  that speeds up Arabic normalization. Without it, fuzzer falls back to
-  a pure-Python implementation (still works, just slower).
+---
 
-## 3. Clone and run install.sh
+## 4 — Clone the repo
 
 ```sh
 git clone https://github.com/Salman-bot/fuzzer.git ~/bin
 cd ~/bin
+```
+
+---
+
+## 5 — Run the installer
+
+```sh
 ./install.sh
 ```
 
-`install.sh` does the rest:
+This installs the Python libraries, builds the Arabic-normalize C
+extension, and installs **Skim** (used for jump-to-page).
 
-- Installs every Python dependency fuzzer needs (`pymupdf`, `rapidfuzz`,
-  `pdfplumber`, `openpyxl`, `python-docx`, `pyarabic`, `tkinterdnd2`,
-  `arabic_reshaper`, `python-bidi`).
-- Auto-handles PEP 668 (externally-managed Python) by switching to
-  `--user` installs.
-- Builds the `_ar_norm` C extension.
-- Smoke-tests every import.
+Add `--with-corpus` to also fetch ~50 sample PDFs.
 
-To also get docs and the test corpus:
+---
 
-```sh
-./install.sh --with-docs     # pdoc / markdown / pygments for `make docs`
-./install.sh --with-corpus   # fetch ~50 real PDFs for TestRealCorpus
-```
-
-## 4. Put fuzzer on your PATH
+## 6 — Put `fuzzer` on PATH
 
 ```sh
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-## 5. Launch
+---
+
+## 7 — Launch
 
 ```sh
-fuzzer                       # GUI
+fuzzer
 ```
 
-## 6. Optional: the `transcribe` helper
+The GUI opens. See [USAGE.md](USAGE.md) for the tour.
 
-`transcribe` turns audio / video / YouTube URLs into searchable PDFs
-that fuzzer can then index. One extra dep beyond what `install.sh`
-already pulled in:
+---
+
+## 8 — Transcribe (audio / video / YouTube → searchable PDF)
+
+`transcribe` runs from the CLI or directly from the fuzzer GUI (the
+**Transcribe…** button in the action row).
+
+Install the one extra dependency:
 
 ```sh
 pip3 install --break-system-packages openai-whisper
 ```
 
-Usage (output lands in the cwd by default):
+### From the GUI
+
+Click **Transcribe…**, pick a `.docx` of YouTube links, then pick an
+output folder. fuzzer runs `transcribe` in batch mode with
+`--model large --cookies chrome --also txt`, streams progress into the
+activity log, and drops one PDF per link plus a `_combined.pdf` master
+into the chosen folder. Click the status bar afterwards to reveal the
+folder in Finder.
+
+### From the CLI
 
 ```sh
-transcribe URL_OR_FILE                       # → ./<title>.pdf
+transcribe https://www.youtube.com/watch?v=...
 transcribe lecture.mp4 -o lecture.pdf
-transcribe podcast.m4a --also txt,srt        # extra .txt/.srt sidecars
-transcribe URL --model medium --lang ar      # high quality for non-English
-transcribe URL --append ~/all.pdf            # also concat into a master PDF
+transcribe podcast.m4a --also txt,srt
+transcribe URL --model medium --lang ar
+transcribe links.docx -o transcripts/
 ```
 
-Models: `tiny` is fastest but unreliable on non-English. Use `medium`
-or `large` for Arabic / Japanese / etc. — first run downloads the model
-(`tiny` ≈ 70 MB, `medium` ≈ 1.5 GB, `large` ≈ 3 GB) into
-`~/.cache/whisper/`.
+First run of `--model medium` / `large` downloads the model (~1.5 GB /
+~3 GB). After that it works offline.
 
-Fonts are auto-picked per script — Arial Unicode for Arabic, Hiragino
-for CJK, Helvetica otherwise. All ship with macOS.
+---
 
-## Smoke test
+## Sanity check
 
 ```sh
 fuzzer --help
-transcribe --help            # only if you set up the helper
+transcribe --help
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom                              | Fix                                                |
+| ------------------------------------ | -------------------------------------------------- |
+| `command not found: brew`            | Re-run the two `eval` lines from step 2.           |
+| `command not found: fuzzer`          | `source ~/.zshrc` or open a new Terminal window.   |
+| Installer says "PDF backend missing" | `pip3 install --break-system-packages pymupdf`.    |
+| Transcribe button greyed out         | Whisper isn't installed — re-run step 8.           |
+| Anything else                        | Re-run `./install.sh` — safe to run again.         |

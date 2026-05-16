@@ -1568,6 +1568,10 @@ def run_gui() -> int:
     export_btn.pack(side="left", padx=2)
     apikey_btn = ttk.Button(actions, text="API Key…")
     apikey_btn.pack(side="left", padx=(12, 2))
+    # Transcribe button: picks a .docx of YouTube links and runs the
+    # sibling `transcribe` CLI in batch mode (one PDF per link + master).
+    transcribe_btn = ttk.Button(actions, text="Transcribe…")
+    transcribe_btn.pack(side="left", padx=(12, 2))
 
     form.columnconfigure(1, weight=1)
     form.columnconfigure(2, weight=1)
@@ -4658,6 +4662,126 @@ def run_gui() -> int:
     clear_btn.config(command=clear_results)
     export_btn.config(command=export_to_file)
     apikey_btn.config(command=set_api_key)
+
+    # ── Transcribe: docx-of-links → batch of PDFs via sibling `transcribe` ──
+    # Matches the CLI invocation the user runs by hand:
+    #   transcribe path/to/links.docx -o output_dir/ --model large \
+    #              --cookies chrome --also txt
+    # Spawned in a background thread so the GUI stays responsive; stdout
+    # lines stream into the activity log.
+    _transcribe_state = {"running": False}
+
+    def _run_transcribe() -> None:
+        if _transcribe_state["running"]:
+            messagebox.showinfo(
+                "fuzzer – Transcribe",
+                "A transcription is already running. Wait for it to finish "
+                "or stop it from the terminal.")
+            return
+        src = filedialog.askopenfilename(
+            title="Pick a .docx of YouTube links (batch transcribe)",
+            initialdir=str(_PROJECT_DIR),
+            filetypes=[
+                ("Word document", "*.docx"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not src:
+            return
+        # Default output dir = "<docx-stem>_transcripts" next to the source.
+        # Folder picker lets the user override.
+        _src_path = Path(src)
+        _default_out = _src_path.parent / f"{_src_path.stem}_transcripts"
+        outdir = filedialog.askdirectory(
+            title="Output directory (one PDF per link + a combined master)",
+            initialdir=str(_src_path.parent),
+            mustexist=False,
+        )
+        if not outdir:
+            outdir = str(_default_out)
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+
+        # Resolve the sibling `transcribe` script. fuzzer's shebang pins
+        # /opt/homebrew/bin/python3, so we run the script directly and let
+        # its own shebang choose its interpreter.
+        _transcribe_path = Path(__file__).resolve().parent / "transcribe"
+        if not _transcribe_path.exists():
+            messagebox.showerror(
+                "fuzzer – Transcribe",
+                f"`transcribe` not found next to fuzzer at {_transcribe_path}")
+            return
+
+        _cmd = [
+            str(_transcribe_path), str(_src_path),
+            "-o", str(outdir),
+            "--model", "large",
+            "--cookies", "chrome",
+            "--also", "txt",
+        ]
+        _transcribe_state["running"] = True
+        transcribe_btn.config(text="Transcribing…", state="disabled")
+        status_var.set(
+            f"Transcribing {_src_path.name} → {Path(outdir).name}/")
+        _log_activity(
+            f"Transcribe start: {_src_path.name} → {outdir} "
+            "(model=large, cookies=chrome, also=txt)")
+
+        def _worker() -> None:
+            import subprocess as _sp
+            rc = 1
+            try:
+                # Pipe stdout+stderr line-by-line so progress shows in the
+                # activity log instead of buffering until the very end.
+                proc = _sp.Popen(
+                    _cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                    text=True, bufsize=1,
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    # Only the most-recent message goes to status; the
+                    # activity log keeps the full trail for review.
+                    root.after(
+                        0, lambda ln=line: status_var.set(ln[:160]))
+                    root.after(0, lambda ln=line: _log_activity(ln[:200]))
+                rc = proc.wait()
+            except Exception as e:
+                root.after(0, lambda _e=e: messagebox.showerror(
+                    "fuzzer – Transcribe", f"Failed to run transcribe: {_e}"))
+                root.after(0, lambda _e=e: _log_activity(
+                    f"Transcribe error: {_e}"))
+            finally:
+                def _done() -> None:
+                    _transcribe_state["running"] = False
+                    transcribe_btn.config(text="Transcribe…", state="normal")
+                    if rc == 0:
+                        status_var.set(
+                            f"{_EXPORT_PREFIX}{outdir}")
+                        _log_activity(
+                            f"Transcribe done: {_src_path.name} → {outdir} "
+                            "(click status to reveal)")
+                    else:
+                        status_var.set(
+                            f"Transcribe failed (rc={rc}) — see activity log")
+                        _log_activity(
+                            f"Transcribe failed: rc={rc}")
+                root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    transcribe_btn.config(command=_run_transcribe)
+    _Tooltip(
+        transcribe_btn,
+        "Transcribe a .docx of YouTube links to PDFs (one per link + a\n"
+        "combined master). Runs the sibling `transcribe` CLI in batch mode:\n"
+        "  transcribe <picked.docx> -o <outdir>/ --model large \\\n"
+        "             --cookies chrome --also txt\n"
+        "\n"
+        "Pick the .docx, then a folder for the output (defaults to\n"
+        "<docx-stem>_transcripts next to the source). Progress streams\n"
+        "into the activity log; the GUI stays responsive.")
 
     def _set_selected_preview_from_iid(iid: str) -> None:
         vals = tree.item(iid, "values")

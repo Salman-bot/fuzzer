@@ -1,111 +1,129 @@
 # fuzzer
 
-Fuzzy file-content search for plain text, PDF, and DOCX — Tk GUI,
-Arabic-aware, macOS-only.
+A friendly search tool for your files. Type a word — even if you misspell
+it or it's in Arabic — and `fuzzer` finds it inside your text files, PDFs,
+and Word documents. Mac-only.
 
 ```sh
-# one-shot setup on a fresh Mac
+# one-time setup
 ./install.sh
 
-# launch the GUI
+# launch the app
 fuzzer
 ```
 
-Full walkthrough: [docs/USAGE.md](docs/USAGE.md). Fresh-Mac install:
-[docs/INSTALL.md](docs/INSTALL.md).
+## Docs
 
-## Features
+Everything you need is in two short pages:
 
-### Search
+- **[How to install](docs/INSTALL.md)** — fresh Mac, step by step.
+- **[How to use it](docs/USAGE.md)** — open the app, search, open results.
 
-- Substring + fuzzy matching (default threshold 80, adjustable).
-- Recursive folder search.
-- Case-sensitive / case-insensitive toggle.
-- SQLite extraction cache keyed by `(path, mtime)` — repeat searches are
-  near-instant.
-- Optional [ripgrep-all](https://github.com/phiresky/ripgrep-all) backend
-  extends file coverage to `.epub .xlsx .sqlite .mkv` etc.
+## What it does
 
-### File formats
+- Searches inside `.txt`, `.md`, `.pdf`, `.docx`, and many more.
+- Fuzzy matching — finds your word even with typos or different spellings.
+- Arabic-aware — ignores diacritics and handles letter variants.
+- Double-click a result to jump straight to the matching page or line.
+- Dark mode, drag-and-drop, history, export to Excel / CSV / JSON.
+- Built-in Claude chat panel — ask questions *about* your search results.
 
-- `.txt .md .rst .csv .tsv .log .json .xml .html .htm`
-- `.pdf` via PyMuPDF, falling back to pdfplumber.
-- `.docx .doc` via python-docx.
+## How it works (in one picture)
 
-### Arabic
+```text
+        you type a word
+              │
+              ▼
+   ┌────────────────────────────────────┐
+   │  fuzzer reads your files           │
+   │  (txt · md · pdf · docx · csv …)   │
+   │                                    │
+   │  then fuzzy-matches every line     │
+   │  against what you typed            │
+   └────────────────────────────────────┘
+              │
+              ▼
+   results table — one row per match
+              │
+              ▼ double-click a row
+              │
+   the file opens at the exact page / line
+   (PDFs get yellow highlights on every hit)
+```
 
-- Native `_ar_norm` C extension for diacritic / variant normalization
-  (Python fallback if the C extension didn't build).
-- PyMuPDF `sort=True` to fix Arabic ligature order in PDFs.
-- CoreText shaping on macOS; `arabic_reshaper` + `python-bidi` fallback.
+Behind the scenes, fuzzer keeps a small cache of files it has already
+read — so the second search on the same folder is near-instant.
 
-### GUI
+## Speed at a glance
 
-- Drag-and-drop file/folder paths into the search field.
-- Double-click a row to open: PDF → Preview at the matched page with
-  yellow highlights on every hit; text/code → `code` / `cursor` / `subl`
-  at the matched line.
-- **Dark mode** with a moon-purple palette — `Mode → 🌙 Dark mode` or
-  `⌘D`, persisted across sessions.
-- Window auto-fits to its content and **centers on screen** each launch.
-- Persistent state (`~/.fuzzer_gui_state.json`): search history, toggles,
-  theme, window geometry, last files.
+Measured on 30 academic PDFs (≈ 127 MB, 58 000 lines of text):
 
-### Export
+| What you do                        | How long it takes                  |
+| ---------------------------------- | ---------------------------------- |
+| First search of a fresh folder     | ~ 0.5 s per PDF (reads + caches)   |
+| Every search after that            | ~ 0.1 s for all 30 PDFs together   |
+| Re-opening files from cache        | basically instant (1 600+ files/s) |
+| Arabic text normalization speed-up | **12 ×** faster than pure Python   |
 
-Click **Export…** in the GUI to save results as `.csv`, `.tsv`, `.json`,
-`.txt`, or `.xlsx`.
+So the first scan of a new folder is the slow part — after that, every
+search is sub-second even on a hundred-megabyte folder.
+
+## The Claude chat panel — tokens & cost
+
+The right side of the window has a chat box. You can ask Claude questions
+about your search results, paste in passages, or just chat. Each turn
+shows a small usage line like:
+
+```text
+this turn: in 1,250  ·  out 380  tok      session (5 turns): in 6,800  ·  out 1,900  tok
+```
+
+That's how many **tokens** (roughly: word-pieces) you sent and got back.
+
+| Model          | Best for                                    | Cost (relative) |
+| -------------- | ------------------------------------------- | --------------- |
+| **Haiku 4.5**  | Quick lookups, summaries, simple Q&A        | Cheapest        |
+| **Sonnet 4.6** | The default — strong all-rounder            | Mid             |
+| **Opus 4.7**   | Hard reasoning, long analysis, deep reviews | Most expensive  |
+
+A typical "ask about my results" turn is a few hundred to a few thousand
+tokens. Live per-million-token prices are on Anthropic's
+[pricing page](https://www.anthropic.com/pricing). The bar at the top of
+the chat panel also shows your remaining rate-limit budget so you can
+keep an eye on it.
+
+> Tip: fuzzer caches your conversation context, so follow-up questions in
+> the same chat are billed at a much lower "cache read" rate — keep one
+> long chat going instead of restarting.
+
+## Who is this for?
+
+Anywhere you have a pile of documents and need to *find things inside them*:
+
+- **Research & academia** — search across hundreds of papers, theses, and
+  conference proceedings without opening each one. Arabic + English in
+  the same query is fine.
+- **Law & compliance** — full-text search through contracts, case files,
+  and scanned (OCR'd) PDFs. Yellow highlights on the matched page make
+  citation easy.
+- **Journalism & investigations** — comb through leaked documents,
+  transcripts, and reports. Pair with the `transcribe` helper to turn
+  interview recordings into searchable PDFs.
+- **Data analysis on unstructured text** — export hits to `.xlsx` /
+  `.csv` / `.json` and pull them into Excel, pandas, or Power BI. Every
+  row carries the file path, page number, line, and score so you can
+  pivot, group, and cross-reference.
+- **Archival & translation work** — fuzzy matching shrugs off typos, OCR
+  errors, and spelling variants. For Arabic this means hamza, alef, and
+  yaa variants all match without thinking about it.
+- **Personal knowledge base** — point it at your `~/Documents` folder
+  and treat it as a desktop Google for your own files.
 
 ## Companion tool: `transcribe`
 
-Turns YouTube URLs / audio / video into searchable PDFs that fuzzer can
-then index. See [docs/INSTALL.md](docs/INSTALL.md#7-optional-the-transcribe-helper).
-
-## Documentation
-
-All docs live in [docs/](docs/):
-
-| File | Covers |
-| ---- | ------ |
-| [docs/INSTALL.md](docs/INSTALL.md) | Fresh-Mac setup (Homebrew → fuzzer → optional transcribe) |
-| [docs/USAGE.md](docs/USAGE.md) | GUI walkthrough |
-| [docs/INTERNALS.md](docs/INTERNALS.md) | Architecture, `_ar_norm` C extension |
-| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Build / test / contribute |
-| [docs/GenAI_Harms.md](docs/GenAI_Harms.md) | Research notes (separate topic) |
-
-### Building the HTML docs site
-
-```sh
-make docs        # full HTML site under docs/_build/
-make docs-serve  # docs + local web server at http://localhost:8765/
-make docs-api    # API reference only
-```
-
-`make docs` auto-installs `pdoc markdown pygments` to the user site if
-missing.
-
-## Testing
-
-```sh
-make test            # 25 unit tests against synthetic fixtures (no network)
-make test-corpus     # fetch ~50 real PDFs from arXiv + Arabic Wikipedia
-make test            # now also runs TestRealCorpus parametrized over those files
-```
-
-The `TestRealCorpus` class in [test_fuzzer.py](test_fuzzer.py) is auto-skipped
-when `test_pdfs/` is empty, so `make test` works on a fresh clone without the
-corpus.
-
-## Repo layout
-
-```text
-fuzzer            ← the GUI app (Python, no .py extension so it's on $PATH)
-transcribe        ← helper: YouTube/audio/video → searchable PDF
-test_fuzzer.py    ← pytest suite
-Makefile          ← test / build-native / docs targets
-native/           ← C extension source for _ar_norm
-docs/             ← hand-maintained docs (+ _build/ generated site)
-```
+Turns YouTube links, audio, or video into searchable PDFs that `fuzzer`
+can then search. Setup is at the bottom of
+[docs/INSTALL.md](docs/INSTALL.md#6-optional-the-transcribe-helper).
 
 ## License
 

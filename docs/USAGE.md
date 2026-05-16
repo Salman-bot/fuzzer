@@ -78,4 +78,4 @@ theme, window geometry, and the last set of loaded files.
 | `0`  | Clean exit |
 | ≠0   | Unhandled error (see stderr) |
 
-See also: [INSTALL.md](INSTALL.md), [INTERNALS.md](INTERNALS.md), [DEVELOPMENT.md](DEVELOPMENT.md).
+See also: [INSTALL.md](INSTALL.md).

@@ -3,7 +3,7 @@ ROOT   := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TEST   := $(ROOT)test_fuzzer.py
 NATIVE := $(ROOT)native
 
-.PHONY: test test-v test-vv demo install build-native clean-native bench-native docs docs-api docs-clean docs-serve test-corpus test-corpus-clean
+.PHONY: test test-v test-vv demo install build-native clean-native bench-native test-corpus test-corpus-clean
 
 test: build-native
 	$(PYTHON) -m pytest $(TEST) -s
@@ -36,24 +36,6 @@ build-native:
 clean-native:
 	rm -f $(ROOT)_ar_norm*.so $(NATIVE)/_ar_norm*.so
 	rm -rf $(NATIVE)/build
-
-# Build the documentation site into docs/_build/.
-# Requires: pip install pdoc markdown pygments
-docs:
-	@$(PYTHON) -c "import pdoc, markdown" 2>/dev/null || \
-	  (echo "→ installing doc dependencies"; \
-	   $(PYTHON) -m pip install --quiet --user --break-system-packages pdoc markdown pygments)
-	@$(PYTHON) $(ROOT)docs/build.py
-
-docs-api:
-	@$(PYTHON) $(ROOT)docs/build.py --api
-
-docs-clean:
-	rm -rf $(ROOT)docs/_build
-
-# Serve docs locally on http://localhost:8765/ — handy for clicking through links.
-docs-serve: docs
-	@cd $(ROOT)docs/_build && $(PYTHON) -m http.server 8765
 
 # Fetch ~50 public Arabic + English PDFs into test_pdfs/ for the corpus test.
 # Idempotent: re-running skips files already on disk. The corpus is gitignored
