@@ -1854,22 +1854,42 @@ def run_gui() -> int:
         _sb_pdf = "—"
     _sb_rga = "available" if _RGA_PATH else "—"
 
+    # Two-line status bar with clear vertical separation between roles.
+    # Outer frame's CHAT_BORDER bg + 2px padding becomes a thin top border
+    # that visually anchors the strip below the panes above it.
     _statusbar_outer = tk.Frame(root, bg=_T["CHAT_BORDER"])
     _statusbar_outer.pack(side="bottom", fill="x", before=main_paned)
     _statusbar_inner = tk.Frame(_statusbar_outer, bg=_T["CHAT_ENTRY_BG"])
-    _statusbar_inner.pack(fill="x", padx=1, pady=1)
+    _statusbar_inner.pack(fill="x", padx=0, pady=(2, 0))
 
-    # Row 1 — live status (left) + selected-row preview (right).
+    # Row 1 — live status (left, icon ⚡) │ selected-row preview (right, icon 📄).
+    # Two cells with a literal vertical separator between them so the eye
+    # has no doubt which text belongs to which role. VS-Code-style.
     _statusbar_row1 = tk.Frame(_statusbar_inner, bg=_T["CHAT_ENTRY_BG"])
     _statusbar_row1.pack(fill="x")
+
+    # Left cell: status icon + status text.
+    _status_cell = tk.Frame(_statusbar_row1, bg=_T["CHAT_ENTRY_BG"])
+    _status_cell.pack(side="left", fill="x", expand=True)
+    _status_icon = tk.Label(
+        _status_cell, text="⚡", bg=_T["CHAT_ENTRY_BG"],
+        fg=_T.get("ACCENT", _T["TAG_CLAUDE_FG"]),
+        font=(_ui_font_family, 11), padx=8, pady=4,
+    )
+    _status_icon.pack(side="left")
     _status_lbl = tk.Label(
-        _statusbar_row1, textvariable=status_var, anchor="w",
+        _status_cell, textvariable=status_var, anchor="w",
         bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_SYS_FG"],
-        font=("Menlo", 11), padx=10, pady=2,
+        font=("Menlo", 11), padx=4, pady=4,
     )
     _status_lbl.pack(side="left", fill="x", expand=True)
     _status_widget_ref[0] = _status_lbl
     _status_lbl.bind("<Button-1>", _on_status_click)
+    _status_icon.bind("<Button-1>", _on_status_click)
+
+    # Vertical separator (1-px CHAT_BORDER strip, height matches the row).
+    _statusbar_sep = tk.Frame(_statusbar_row1, bg=_T["CHAT_BORDER"], width=1)
+    _statusbar_sep.pack(side="left", fill="y", padx=4, pady=2)
 
     # Hover history popup — read the activity log (always recording, even
     # when the debug panel is collapsed) and float it upward above the
@@ -1926,24 +1946,34 @@ def run_gui() -> int:
 
     _status_lbl.bind("<Enter>", _show_status_history, add="+")
     _status_lbl.bind("<Leave>", _hide_status_history, add="+")
-    # `_selected_lbl` is a tk.Text (not Label) so we can tag the matched
-    # substring with a yellow background — Treeview cells can't render
-    # per-substring styling, so this is where the user actually *sees*
-    # the highlight. Width is in characters; long previews are truncated
-    # in _set_selected_preview() before writing.
+    _status_icon.bind("<Enter>", _show_status_history, add="+")
+    _status_icon.bind("<Leave>", _hide_status_history, add="+")
+
+    # Right cell: preview icon + preview text. `_selected_lbl` is a tk.Text
+    # (not Label) so we can tag the matched substring with a yellow
+    # background — Treeview cells can't render per-substring styling, so
+    # this is where the user actually *sees* the highlight.
+    _preview_cell = tk.Frame(_statusbar_row1, bg=_T["CHAT_ENTRY_BG"])
+    _preview_cell.pack(side="right")
+    _preview_icon = tk.Label(
+        _preview_cell, text="📄", bg=_T["CHAT_ENTRY_BG"],
+        fg=_T["TAG_TOOL_RES_FG"],
+        font=(_ui_font_family, 11), padx=4, pady=4,
+    )
+    _preview_icon.pack(side="left")
     _SELECTED_PREVIEW_CHARS = 80
     _selected_lbl = tk.Text(
-        _statusbar_row1, height=1, width=_SELECTED_PREVIEW_CHARS,
+        _preview_cell, height=1, width=_SELECTED_PREVIEW_CHARS,
         wrap="none", state="disabled", cursor="arrow",
         bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_TOOL_RES_FG"],
         insertbackground=_T["CHAT_ENTRY_BG"],  # hide caret
         relief="flat", borderwidth=0, highlightthickness=0,
-        font=("Menlo", 11), padx=10, pady=2,
+        font=("Menlo", 11), padx=6, pady=4,
         takefocus=0,
     )
     _selected_lbl.tag_configure("match", background="#ffd24a",
                                 foreground="#1a1426")
-    _selected_lbl.pack(side="right")
+    _selected_lbl.pack(side="left")
     _selected_widget_ref[0] = _selected_lbl
 
     # Seed the placeholder so first-run users see what this strip is for.
