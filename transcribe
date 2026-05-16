@@ -80,14 +80,16 @@ def fmt_srt_ts(seconds: float | None) -> str:
 def has_arabic(text: str) -> bool:
     return any('؀' <= c <= 'ۿ' or 'ݐ' <= c <= 'ݿ' for c in text)
 
+def has_hangul(text: str) -> bool:
+    return any(0xAC00 <= ord(c) <= 0xD7AF or 0x1100 <= ord(c) <= 0x11FF for c in text)
+
 def has_cjk(text: str) -> bool:
-    # Covers Hiragana, Katakana, CJK Unified Ideographs, Hangul.
+    """Hiragana, Katakana, or CJK Unified Ideographs (NOT Hangul — Korean has its own font)."""
     for c in text:
         o = ord(c)
         if (0x3040 <= o <= 0x30FF        # Hiragana + Katakana
                 or 0x4E00 <= o <= 0x9FFF # CJK Unified Ideographs
                 or 0x3400 <= o <= 0x4DBF # CJK Extension A
-                or 0xAC00 <= o <= 0xD7AF # Hangul syllables
                 or 0xFF66 <= o <= 0xFF9F # Halfwidth Katakana
         ):
             return True
@@ -115,8 +117,11 @@ def fetch_youtube(url: str, workdir: Path) -> tuple[Path, str]:
         url,
     ]
     out = subprocess.check_output(cmd, text=True).strip().splitlines()
-    title = out[-1] if out else "YouTube video"
-    audios = list(workdir.glob("src.*"))
+    # Strip any stray empty lines / progress noise; the last non-empty line is the title.
+    title = next((l for l in reversed(out) if l.strip()), "YouTube video").strip()
+    # Prefer the .wav we asked for; fall back to whatever yt-dlp produced.
+    wavs = list(workdir.glob("src.wav"))
+    audios = wavs or list(workdir.glob("src.*"))
     if not audios:
         die("yt-dlp produced no audio file")
     return audios[0], title
@@ -163,24 +168,41 @@ def transcribe_whisper(audio: Path, model_name: str, language: str | None) -> di
     )
 
 # ── output writers ────────────────────────────────────────────────────────────
+_ARABIC_DEPS_WARNED = False
+
 def _arabic_shape(text: str) -> str:
-    """Reshape Arabic text for visual ordering in PDF. Falls back to raw."""
+    """Reshape Arabic text for visual ordering in PDF.
+
+    If `arabic_reshaper` / `python-bidi` aren't installed, returns the raw
+    text — which renders with unshaped (isolated) letters AND left-to-right
+    flow, which is what was happening before the Arabic-render fix. Warn once
+    so the user knows the install is the cause.
+    """
+    global _ARABIC_DEPS_WARNED
     try:
         import arabic_reshaper  # type: ignore
         from bidi.algorithm import get_display  # type: ignore
     except ImportError:
+        if not _ARABIC_DEPS_WARNED:
+            warn("arabic-reshaper / python-bidi not installed — Arabic text in the PDF "
+                 "will render with disconnected letters and left-to-right flow.\n"
+                 "  fix:  pip3 install --break-system-packages arabic-reshaper python-bidi")
+            _ARABIC_DEPS_WARNED = True
         return text
-    # Reshape each line so newlines are preserved.
     lines = text.split("\n")
     return "\n".join(get_display(arabic_reshaper.reshape(l)) for l in lines)
 
 def _pick_font(text: str) -> tuple[str, str | None]:
     """Return (fontname, fontfile|None) suitable for the given text.
 
-    Arabic takes priority over CJK: Whisper-tiny commonly hallucinates a few
-    stray CJK glyphs into Arabic transcripts; picking Hiragino (no Arabic)
-    would tofu the whole page. Arial Unicode covers Arabic AND CJK as a
-    fallback, so it's the safe pick when both scripts are present.
+    Priority order:
+      1. Arabic → Arial Unicode (also covers CJK fallback). Wins over CJK
+         because Whisper-tiny commonly hallucinates stray CJK glyphs into
+         Arabic transcripts; Hiragino would tofu Arabic.
+      2. Hangul (Korean) → Apple SD Gothic, which has better Hangul coverage
+         than Hiragino. Whisper hallucinations are less of an issue here.
+      3. Japanese / Chinese (Hiragana / Katakana / CJK Unified) → Hiragino.
+      4. Latin → Helvetica (built into PDF, no embed needed).
     """
     if has_arabic(text):
         for candidate in (
@@ -191,6 +213,15 @@ def _pick_font(text: str) -> tuple[str, str | None]:
             if os.path.exists(candidate):
                 return "body", candidate
         warn("no Arabic-capable font found — PDF may show tofu boxes for Arabic")
+    if has_hangul(text):
+        for candidate in (
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ):
+            if os.path.exists(candidate):
+                return "body", candidate
+        warn("no Hangul-capable font found — PDF may show tofu boxes for Korean")
     if has_cjk(text):
         for candidate in (
             "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
@@ -200,7 +231,7 @@ def _pick_font(text: str) -> tuple[str, str | None]:
         ):
             if os.path.exists(candidate):
                 return "body", candidate
-        warn("no CJK-capable font found — PDF may show tofu boxes for Japanese/Chinese/Korean")
+        warn("no CJK-capable font found — PDF may show tofu boxes for Japanese/Chinese")
     return "helv", None
 
 def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: str,
@@ -424,7 +455,9 @@ def main() -> int:
                 import fitz
             except ImportError:
                 die("pymupdf not installed — pip install pymupdf")
-            master = Path(args.append).expanduser()
+            master = Path(args.append).expanduser().resolve()
+            if master == out_pdf.resolve():
+                die(f"--append target is the same file as the output PDF: {master}")
             master.parent.mkdir(parents=True, exist_ok=True)
             if master.exists():
                 combined = fitz.open(master)
