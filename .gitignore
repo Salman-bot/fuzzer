@@ -2,8 +2,36 @@ __pycache__/
 .pytest_cache/
 .claude/
 .vscode/
+.idea/
+.vs/
+*.iml
 *.pyc
+
+# Editor temp / swap / backup files.
+*.swp
+*.swo
+*~
+.~lock.*
+*.bak
+
+# macOS junk.
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Env files. Often contain secrets — never commit.
+.env
+.env.*
+
+# Python packaging artifacts.
+*.egg-info/
+dist/
+build/
+
+# Logs.
+*.log
+logs/
 
 # Test PDF corpus — fetched on demand with `make test-corpus`.
 # (Tarball lives outside the repo; pattern guards against accidental drops.)
@@ -24,6 +52,11 @@ native/_ar_norm*.so
 # HTML docs build output (regenerate with `make docs`).
 docs/_build/
 
+# Personal / sample files kept under docs/ for convenience but not part
+# of the project itself (untracked but left on disk locally).
+docs/GenAI_Harms.md
+docs/009.docx
+
 # Generated codebase overview — regenerate with `make doc` (calls `claude -p`).
 project_info.md
 
@@ -37,3 +70,17 @@ search_*.txt
 
 # Local transcription output folders (one per batch run of `transcribe`).
 transcripts_*/
+
+# Whisper model files. They can be huge (multi-GB) and live in
+# ~/.cache/huggingface — but if someone copies one into the repo we
+# don't want it tracked.
+*.pt
+*.bin
+*.safetensors
+models/
+
+# Local state files written to the user's $HOME by fuzzer (defensive —
+# they normally live in ~ , not the repo, but symlinks happen).
+.fuzzer_gui_state.json
+.fuzzer_cache.sqlite
+.fuzzer_mupdf_blacklist.json

@@ -459,6 +459,94 @@ def fuzzy_score(pattern: str, line: str) -> int:
 
     return best
 
+# ── Smart search (Google-Scholar-style query language) ────────────────────────
+# Parses a query into AND / OR / NOT structure:
+#   "exact phrase"   → exact substring (quotes group multi-word phrases)
+#   word1 word2      → AND  (both must appear on the same line, any order)
+#   word1 OR word2   → OR   (capital OR; only one needs to match)
+#   -word            → NOT  (line must NOT contain it)
+#
+# Grammar precedence:  -word  >  OR  >  AND
+#   `a b OR c d` parses as  a AND (b OR c) AND d
+#
+# At least one positive term is required (pure negation would otherwise
+# match every line in every file — match Google Scholar's behavior).
+
+
+def _parse_smart_query(query: str) -> Dict[str, List[object]]:
+    """Tokenize a Scholar-style query and return AND / OR / NOT structure.
+
+    Returns ``{"required": [[t, ...], ...], "excluded": [t, ...]}`` where
+    each inner list of ``required`` is an OR group (any-of). The outer
+    list is an AND join. Empty / unparseable queries return empty lists.
+    """
+    import shlex
+    if not query or not query.strip():
+        return {"required": [], "excluded": []}
+    try:
+        raw = shlex.split(query, posix=True)
+    except ValueError:
+        # Unbalanced quotes — fall back to a space split and drop bare quotes.
+        raw = [t for t in query.replace('"', "").split() if t]
+    required: List[List[str]] = []
+    excluded: List[str] = []
+    i = 0
+    while i < len(raw):
+        tok = raw[i]
+        if not tok:
+            i += 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            excluded.append(tok[1:])
+            i += 1
+            continue
+        # Collect consecutive `OR <token>` pairs into a single OR group.
+        or_group = [tok]
+        while i + 2 < len(raw) and raw[i + 1] == "OR" and raw[i + 2]:
+            or_group.append(raw[i + 2])
+            i += 2
+        required.append(or_group)
+        i += 1
+    return {"required": required, "excluded": excluded}  # type: ignore[return-value]
+
+
+def _smart_match(
+    line: str, parsed: Dict[str, List[object]], *,
+    case_sensitive: bool = False,
+) -> bool:
+    cmp = line if case_sensitive else line.lower()
+    for or_group in parsed["required"]:
+        if not any(
+            (tok if case_sensitive else tok.lower()) in cmp
+            for tok in or_group  # type: ignore[union-attr]
+        ):
+            return False
+    for tok in parsed["excluded"]:
+        if (tok if case_sensitive else str(tok).lower()) in cmp:  # type: ignore[arg-type]
+            return False
+    return True
+
+
+def _smart_match_terms(
+    line: str, parsed: Dict[str, List[object]], *,
+    case_sensitive: bool = False,
+) -> List[str]:
+    """Return the positive substrings that actually appear in ``line``.
+
+    Used by the highlighter and the cell snippet so we paint only the
+    terms responsible for the hit (negatives never get highlighted).
+    """
+    cmp = line if case_sensitive else line.lower()
+    out: List[str] = []
+    for or_group in parsed["required"]:
+        for tok in or_group:  # type: ignore[union-attr]
+            cmp_tok = tok if case_sensitive else tok.lower()
+            if cmp_tok in cmp:
+                out.append(tok)
+                break  # One representative per OR group is enough.
+    return out
+
+
 # ── core search ────────────────────────────────────────────────────────────────
 
 
@@ -469,13 +557,14 @@ def search_file(
     case_sensitive: bool,
     threshold: int,
     whole_word: bool = False,
-    use_regex: bool = False,
+    use_smart: bool = False,
 ) -> Tuple[List[str], List[Match]]:
     """Search ``fp`` for ``pattern``.
 
     Modes (mutually-exclusive precedence):
-      * ``use_regex``    — pattern is a Python regex; ``re.search`` per line;
-                           fuzzy fallback skipped. Invalid regex returns [].
+      * ``use_smart``    — Google-Scholar-style query: quoted phrases,
+                           AND/OR/NOT. Fuzzy fallback skipped. At least one
+                           positive term required, else returns [].
       * ``whole_word``   — pattern must match at word boundaries (``\\b``);
                            fuzzy still runs on non-matching lines (if threshold
                            > 0) but is also gated to whole-word hits.
@@ -491,14 +580,14 @@ def search_file(
     matches: List[Match] = []
     _pages = _pdf_page_map.get(fp, [])
 
-    if use_regex:
-        flags = 0 if case_sensitive else re.IGNORECASE
-        try:
-            _rx = re.compile(pattern, flags)
-        except re.error:
+    if use_smart:
+        _parsed = _parse_smart_query(pattern)
+        if not _parsed["required"]:
+            # Google Scholar requires at least one positive term — pure
+            # negation would otherwise match every line in every file.
             return lines, matches
         for i, line in enumerate(lines, start=1):
-            if _rx.search(line):
+            if _smart_match(line, _parsed, case_sensitive=case_sensitive):
                 pg = _pages[i - 1] if i - 1 < len(_pages) else 0
                 matches.append(Match(fp, i, line, 100, pg))
         return lines, matches
@@ -560,22 +649,22 @@ def rga_search_file(
     case_sensitive: bool,
     threshold: int,  # unused — rga is substring-only
     whole_word: bool = False,
-    use_regex: bool = False,
+    use_smart: bool = False,
 ) -> Tuple[List[str], List[Match]]:
     """Search a single file via rga --json. On any failure (rga missing,
     spawn error, parse error) falls back to the in-process search_file().
     Returns (lines, matches); lines is empty for formats fuzzer can't read
     natively (docx/epub/sqlite) — the GUI only relies on Match.line for those.
     """
-    # Regex mode is handled in-process — rga's --json output is line-oriented
-    # but its regex semantics differ enough from Python's re that it's cleaner
-    # to fall back than try to translate.
-    if use_regex or not _RGA_PATH or not pattern:
+    # Smart-search mode is handled in-process — rga doesn't understand
+    # AND/OR/NOT queries, so we fall back to search_file() which knows
+    # how to evaluate the parsed query.
+    if use_smart or not _RGA_PATH or not pattern:
         return search_file(fp, pattern,
                            case_sensitive=case_sensitive,
                            threshold=threshold,
                            whole_word=whole_word,
-                           use_regex=use_regex)
+                           use_smart=use_smart)
     import subprocess as _sub
     import json as _json
     args = [_RGA_PATH, "--json", "--no-config", "--no-messages"]
@@ -594,7 +683,7 @@ def rga_search_file(
                            case_sensitive=case_sensitive,
                            threshold=threshold,
                            whole_word=whole_word,
-                           use_regex=use_regex)
+                           use_smart=use_smart)
 
     matches: List[Match] = []
     # rga's PDF adapter prefixes each emitted line with "Page N:" (e.g.
@@ -957,26 +1046,46 @@ def run_gui() -> int:
 
     def _find_match_ranges(
         text: str, pattern: str, *,
-        use_regex: bool = False,
+        use_smart: bool = False,
         case_sensitive: bool = False,
         whole_word: bool = False,
     ) -> List[Tuple[int, int]]:
         """Return [(start, end), …] character ranges in `text` matched by
-        the active search mode. Empty list if pattern is empty, regex is
-        invalid, or no matches found. Ranges are deduped and non-overlapping;
-        overlap is resolved by keeping the earlier match."""
+        the active search mode. Empty list if pattern is empty or no matches
+        found. Ranges are deduped and non-overlapping; overlap is resolved by
+        keeping the earlier match.
+
+        In ``use_smart`` mode, every positive term (quoted phrases + bare
+        words + matched OR-group representatives) is located; negative terms
+        are never highlighted.
+        """
         if not text or not pattern:
             return []
-        flags = 0 if case_sensitive else re.IGNORECASE
-        try:
-            if use_regex:
-                rx = re.compile(pattern, flags)
-            elif whole_word:
-                rx = re.compile(rf"\b{re.escape(pattern)}\b", flags)
-            else:
-                rx = re.compile(re.escape(pattern), flags)
-        except re.error:
-            return []
+        if use_smart:
+            parsed = _parse_smart_query(pattern)
+            terms = _smart_match_terms(
+                text, parsed, case_sensitive=case_sensitive)
+            if not terms:
+                return []
+            flags = 0 if case_sensitive else re.IGNORECASE
+            # Build one alternation regex from all the matched positive terms.
+            # `re.escape` neutralises any special chars inside a quoted phrase.
+            alt = "|".join(re.escape(t) for t in terms if t)
+            if not alt:
+                return []
+            try:
+                rx = re.compile(alt, flags)
+            except re.error:
+                return []
+        else:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            try:
+                if whole_word:
+                    rx = re.compile(rf"\b{re.escape(pattern)}\b", flags)
+                else:
+                    rx = re.compile(re.escape(pattern), flags)
+            except re.error:
+                return []
         ranges: List[Tuple[int, int]] = []
         prev_end = -1
         for m in rx.finditer(text):
@@ -1436,8 +1545,8 @@ def run_gui() -> int:
         value=bool(_gui_state.get("recursive", False)))
     whole_word_var = tk.BooleanVar(
         value=bool(_gui_state.get("whole_word", False)))
-    regex_var = tk.BooleanVar(
-        value=bool(_gui_state.get("use_regex", False)))
+    smart_var = tk.BooleanVar(
+        value=bool(_gui_state.get("smart_mode", False)))
     # rga is an optional external backend. Disable the toggle when the binary
     # isn't on PATH so the user sees the option exists but knows it needs install.
     rga_var = tk.BooleanVar(
@@ -1466,30 +1575,30 @@ def run_gui() -> int:
          "\n"
          "Arabic: Python's \\b doesn't treat Arabic letters as word chars,\n"
          "so for Arabic we fall back to substring-within-the-same-word."),
-        ("Regex", regex_var,
-         "Regex — the pattern is a Python regular expression (re.search per line).\n"
+        ("Smart search", smart_var,
+         "Smart search — Google-Scholar-style query language.\n"
          "\n"
-         "Common syntax:\n"
-         "  .       any one character        \\d  digit       \\s  whitespace\n"
-         "  *       0 or more of preceding   \\w  word char   \\b  word boundary\n"
-         "  +       1 or more of preceding   ^   line start   $   line end\n"
-         "  ?       0 or 1 of preceding      |   OR\n"
-         "  [abc]   any of a, b, c           [^abc]  NOT a, b, c\n"
-         "  [a-z]   range                    (…)     group\n"
+         "Operators:\n"
+         "  \"phrase\"        exact phrase  (quotes group multi-word phrases)\n"
+         "  word1 word2     all words must appear on the same line (AND)\n"
+         "  word1 OR word2  either word satisfies the term  (capital OR)\n"
+         "  -word           exclude lines containing the word  (NOT)\n"
          "\n"
          "Examples:\n"
-         "  TODO|FIXME      either word\n"
-         "  \\d+             one or more digits\n"
-         "  [A-Z]\\w+        capitalized word\n"
-         "  func\\(.*?\\)     function call with anything in parens (non-greedy)\n"
-         "  ^import         lines starting with 'import'\n"
-         "  \\bcat\\b         exact word 'cat' — same as Whole word with 'cat'\n"
+         "  \"machine learning\"           exact phrase\n"
+         "  transformer attention        both words must appear (any order)\n"
+         "  cat OR dog                   either word\n"
+         "  python -snake                python WITHOUT snake\n"
+         "  \"neural network\" -survey     phrase WITHOUT 'survey'\n"
+         "  apple OR banana pie          (apple|banana) AND pie\n"
+         "\n"
+         "Precedence:  -word  >  OR  >  AND  (e.g. `a b OR c d`  ≡  a AND (b OR c) AND d)\n"
          "\n"
          "Notes:\n"
-         "  • Score is always 100; fuzzy fallback is disabled while Regex is on.\n"
-         "  • Invalid regex (e.g. '**hi') returns no matches for that file.\n"
+         "  • Score is always 100; fuzzy fallback is disabled while Smart is on.\n"
+         "  • At least one positive term is required — pure -negation matches nothing.\n"
          "  • Case is controlled by the Case-sensitive checkbox.\n"
-         "  • Literal special chars must be escaped: . * + ? ( ) [ ] { } ^ $ | \\"),
+         "  • Quotes must be balanced; unbalanced quotes fall back to a space-split."),
         ("Recursive", recursive_var, "Search subfolders when a folder is given"),
         ("rga engine", rga_var,
          ("Use ripgrep-all (rga) as the search backend. Extends file coverage to "
@@ -1568,10 +1677,28 @@ def run_gui() -> int:
     export_btn.pack(side="left", padx=2)
     apikey_btn = ttk.Button(actions, text="API Key…")
     apikey_btn.pack(side="left", padx=(12, 2))
-    # Transcribe button: picks a .docx of YouTube links and runs the
-    # sibling `transcribe` CLI in batch mode (one PDF per link + master).
+    # Transcribe button + model picker: picks a .docx of YouTube links
+    # and runs the sibling `transcribe` CLI in batch mode (one PDF per
+    # link + master). The model dropdown selects Whisper accuracy /
+    # speed; the choice is saved across runs.
     transcribe_btn = ttk.Button(actions, text="Transcribe…")
     transcribe_btn.pack(side="left", padx=(12, 2))
+    _TRANSCRIBE_MODELS = ("tiny", "base", "small", "medium", "large", "turbo")
+    transcribe_model_var = tk.StringVar(
+        value=str(_gui_state.get("transcribe_model", "large")))
+    if transcribe_model_var.get() not in _TRANSCRIBE_MODELS:
+        transcribe_model_var.set("large")
+    transcribe_model_cb = ttk.Combobox(
+        actions, textvariable=transcribe_model_var,
+        values=list(_TRANSCRIBE_MODELS),
+        width=8, state="readonly",
+    )
+    transcribe_model_cb.pack(side="left", padx=(2, 2))
+
+    def _on_transcribe_model_change(*_a: object) -> None:
+        _gui_state["transcribe_model"] = transcribe_model_var.get()
+        _save_state(_gui_state)
+    transcribe_model_var.trace_add("write", _on_transcribe_model_change)
 
     form.columnconfigure(1, weight=1)
     form.columnconfigure(2, weight=1)
@@ -1861,6 +1988,74 @@ def run_gui() -> int:
             _selected_lbl.configure(state="disabled")
 
     _set_selected_preview(_SELECTED_PLACEHOLDER)
+
+    # ── progress strip (used by Transcribe, packed only while running) ─────
+    # Custom Canvas-based progress bar so we can:
+    #   1. control thickness (taller than ttk's default ~6 px),
+    #   2. paint the fill in the theme's purple accent for visibility, and
+    #   3. write the current task + percent centered ON the bar itself.
+    _progress_frame = tk.Frame(_statusbar_inner, bg=_T["CHAT_ENTRY_BG"])
+    _progress_visible = [False]
+    _PROGRESS_HEIGHT = 22
+    _progress_canvas = tk.Canvas(
+        _progress_frame, height=_PROGRESS_HEIGHT,
+        bg=_T["BORDER"], highlightthickness=0, borderwidth=0,
+    )
+    _progress_canvas.pack(fill="x", expand=True, padx=8, pady=3)
+    # Mutable text/value cache so a <Configure> resize can redraw without
+    # losing the most-recent state.
+    _progress_state: Dict[str, object] = {"value": 0.0, "text": ""}
+
+    def _progress_redraw(_e: object = None) -> None:
+        with contextlib.suppress(Exception):
+            _progress_canvas.delete("all")
+            w = max(1, _progress_canvas.winfo_width())
+            h = max(1, _progress_canvas.winfo_height())
+            v = float(_progress_state["value"])
+            # Fill rectangle — purple accent so the bar stands out on dark.
+            fill_w = int(w * (v / 100.0))
+            if fill_w > 0:
+                _progress_canvas.create_rectangle(
+                    0, 0, fill_w, h,
+                    fill=_T["ACCENT"], outline="",
+                )
+            txt = str(_progress_state["text"])
+            label = f"{txt}  ·  {int(v)}%" if txt else f"{int(v)}%"
+            # Drop-shadow trick: draw the text twice (1px offset, darker)
+            # so it stays readable both over the filled portion and the
+            # empty trough.
+            _progress_canvas.create_text(
+                w // 2 + 1, h // 2 + 1,
+                text=label, fill="#0e0814",
+                font=("Menlo", 11, "bold"),
+            )
+            _progress_canvas.create_text(
+                w // 2, h // 2,
+                text=label, fill="#ffffff",
+                font=("Menlo", 11, "bold"),
+            )
+    _progress_canvas.bind("<Configure>", _progress_redraw)
+
+    def _progress_show(text: str = "") -> None:
+        if not _progress_visible[0]:
+            _progress_frame.pack(
+                side="top", fill="x", before=_statusbar_row1)
+            _progress_visible[0] = True
+        if text:
+            _progress_state["text"] = text[:90]
+            _progress_redraw()
+
+    def _progress_set(value: float, text: str = "") -> None:
+        _progress_show(text)
+        _progress_state["value"] = max(0.0, min(100.0, float(value)))
+        _progress_redraw()
+
+    def _progress_hide() -> None:
+        if _progress_visible[0]:
+            _progress_frame.pack_forget()
+            _progress_visible[0] = False
+        _progress_state["value"] = 0.0
+        _progress_state["text"] = ""
 
     # Thin divider between the two rows.
     _statusbar_div = tk.Frame(_statusbar_inner, bg=_T["CHAT_BORDER"], height=1)
@@ -2405,13 +2600,16 @@ def run_gui() -> int:
     chat_frame.pack(fill="both", expand=True)
 
     # Grid layout (not pack) for the top/flex/bottom pattern:
-    #   row 0: context label  — fixed
-    #   row 1: chat log       — flex (only row with weight=1)
-    #   row 2: input panel    — fixed (status + selected + ~/bin ❯ + buttons)
+    #   col 0: history sidebar  — fixed width, scrollable list of past turns
+    #   col 1: main chat column
+    #     row 0: context label  — fixed
+    #     row 1: chat log       — flex (only row with weight=1)
+    #     row 2: input panel    — fixed (spans both columns)
     # Pack-with-expand=True is greedy and starves bottom side="bottom" widgets
     # when the pane is short; grid gives the input panel its natural height
     # and lets the log absorb whatever is left.
-    chat_frame.columnconfigure(0, weight=1)
+    chat_frame.columnconfigure(0, weight=0, minsize=150)
+    chat_frame.columnconfigure(1, weight=1)
     chat_frame.rowconfigure(0, weight=0)
     chat_frame.rowconfigure(1, weight=1)
     chat_frame.rowconfigure(2, weight=0)
@@ -2420,12 +2618,72 @@ def run_gui() -> int:
         value="Context: (none — add files above to ground answers)")
     chat_context_lbl = ttk.Label(chat_frame, textvariable=chat_context_var,
                                  foreground="#6b6b6b")
-    chat_context_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+    chat_context_lbl.grid(row=0, column=1, sticky="ew", pady=(0, 2))
 
     _chat_fam, _chat_sz = _chat_font[:2]
 
-    chat_log_wrap = tk.Frame(chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
-    chat_log_wrap.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+    # ── history sidebar (col 0) ─────────────────────────────────────────────
+    # One row per user message; clicking jumps the chat log to that turn.
+    # Wrapped in a 2-px CHAT_BORDER frame to match the log's bordered look.
+    chat_history_wrap = tk.Frame(
+        chat_frame, bg=_T["CHAT_BORDER"], padx=2, pady=2)
+    chat_history_wrap.grid(
+        row=1, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
+    _chat_history_box = tk.Frame(chat_history_wrap, bg=_T["CHAT_BG"])
+    _chat_history_box.pack(fill="both", expand=True)
+
+    tk.Label(
+        _chat_history_box, text="History",
+        bg=_T["CHAT_BG"], fg=_T["TAG_CLAUDE_FG"],
+        font=(_ui_font_family, 10, "bold"),
+        anchor="w", padx=8, pady=4,
+    ).pack(fill="x")
+
+    _chat_history_listframe = tk.Frame(_chat_history_box, bg=_T["CHAT_BG"])
+    _chat_history_listframe.pack(fill="both", expand=True)
+    _chat_history_sb = ttk.Scrollbar(_chat_history_listframe, orient="vertical")
+    _chat_history_sb.pack(side="right", fill="y")
+    chat_history_lb = tk.Listbox(
+        _chat_history_listframe,
+        bg=_T["CHAT_BG"], fg=_T["CHAT_FG"],
+        selectbackground=_T["CHAT_SEL_BG"], selectforeground=_T["TEXT"],
+        activestyle="none",
+        font=(_ui_font_family, 10),
+        borderwidth=0, highlightthickness=0,
+        yscrollcommand=_chat_history_sb.set,
+    )
+    chat_history_lb.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=(0, 4))
+    _chat_history_sb.config(command=chat_history_lb.yview)
+
+    # Listbox row idx → chat_log "line.col" index where that user turn starts.
+    _chat_history_indices: List[str] = []
+
+    def _chat_history_add(msg: str, log_index: str) -> None:
+        """Append one entry to the sidebar and track its position in chat_log."""
+        preview = msg.replace("\n", " ").strip()
+        if len(preview) > 22:
+            preview = preview[:21] + "…"
+        chat_history_lb.insert("end", preview or "(empty)")
+        _chat_history_indices.append(log_index)
+        chat_history_lb.see("end")
+
+    def _chat_history_clear() -> None:
+        chat_history_lb.delete(0, "end")
+        _chat_history_indices.clear()
+
+    def _on_chat_history_click(_e: object = None) -> None:
+        sel = chat_history_lb.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        if 0 <= i < len(_chat_history_indices):
+            with contextlib.suppress(Exception):
+                chat_log.see(_chat_history_indices[i])
+    chat_history_lb.bind("<<ListboxSelect>>", _on_chat_history_click)
+
+    # ── main chat log (col 1) ───────────────────────────────────────────────
+    chat_log_wrap = tk.Frame(chat_frame, bg=_T["CHAT_BORDER"], padx=2, pady=2)
+    chat_log_wrap.grid(row=1, column=1, sticky="nsew", pady=(0, 4))
     chat_log = tk.Text(
         chat_log_wrap, height=5, state="disabled", wrap="word",
         font=_chat_font,
@@ -2674,8 +2932,8 @@ def run_gui() -> int:
     # Bottom row of chat_frame's grid — guaranteed natural height even when
     # the pane is short (the log shrinks instead of the input being clipped).
     chat_input_panel = tk.Frame(
-        chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
-    chat_input_panel.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        chat_frame, bg=_T["CHAT_BORDER"], padx=2, pady=2)
+    chat_input_panel.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
     _input_inner = tk.Frame(chat_input_panel, bg=_T["CHAT_ENTRY_BG"])
     _input_inner.pack(fill="x", expand=True)
@@ -3407,6 +3665,7 @@ def run_gui() -> int:
         _show_chat_welcome()
         _chat_welcome_shown[0] = True
         _update_chat_context_label()
+        _chat_history_clear()
         _log_activity("Chat conversation reset")
 
     def _send_chat(_event: object = None) -> str:
@@ -3430,7 +3689,9 @@ def run_gui() -> int:
         _chat_history_state["idx"] = -1
         _chat_history_state["draft"] = ""
         chat_entry.delete("1.0", "end")
+        _user_turn_start = chat_log.index("end-1c")
         _append_chat("you", "you", msg)
+        _chat_history_add(msg, _user_turn_start)
         _log_activity(f"Chat sent: {msg[:80]}{'…' if len(msg) > 80 else ''}")
         _set_chat_entry_state("disabled")
         chat_send_btn.config(state="disabled")
@@ -3952,6 +4213,9 @@ def run_gui() -> int:
                 bg=t["CHAT_ENTRY_BG"], fg=t["MUTED"],
                 text=_theme_indicator_text())
             _sb_alpha_lbl.configure(bg=t["CHAT_ENTRY_BG"], fg=t["MUTED"])
+            _progress_frame.configure(bg=t["CHAT_ENTRY_BG"])
+            _progress_canvas.configure(bg=t["BORDER"])
+            _progress_redraw()  # repaint with the new ACCENT colour
         with contextlib.suppress(Exception):
             chat_input_panel.configure(bg=t["CHAT_BORDER"])
             _input_inner.configure(bg=t["CHAT_ENTRY_BG"])
@@ -3993,7 +4257,7 @@ def run_gui() -> int:
     def worker(pattern: str, paths: List[str], case_sensitive: bool,
                threshold: int,
                recursive: bool, rga: bool = False,
-               whole_word: bool = False, use_regex: bool = False) -> None:
+               whole_word: bool = False, use_smart: bool = False) -> None:
         try:
             files = collect_files(paths, recursive)
             if not files:
@@ -4012,7 +4276,7 @@ def run_gui() -> int:
                         case_sensitive=case_sensitive,
                         threshold=threshold,
                         whole_word=whole_word,
-                        use_regex=use_regex,
+                        use_smart=use_smart,
                     )
                 else:
                     lines, matches = search_file(
@@ -4020,7 +4284,7 @@ def run_gui() -> int:
                         case_sensitive=case_sensitive,
                         threshold=threshold,
                         whole_word=whole_word,
-                        use_regex=use_regex,
+                        use_smart=use_smart,
                     )
                 if matches:
                     # Stream each file's results immediately so the GUI stays
@@ -4063,7 +4327,7 @@ def run_gui() -> int:
         _gui_state["threshold"] = threshold_var.get()
         _gui_state["rga_mode"] = rga_var.get()
         _gui_state["whole_word"] = whole_word_var.get()
-        _gui_state["use_regex"] = regex_var.get()
+        _gui_state["smart_mode"] = smart_var.get()
         _save_state(_gui_state)
         state["searching"] = True
         state["cancel_search"] = False
@@ -4080,7 +4344,7 @@ def run_gui() -> int:
                  f"recursive={'on' if recursive_var.get() else 'off'} "
                  f"rga={'on' if rga_var.get() else 'off'} "
                  f"ww={'on' if whole_word_var.get() else 'off'} "
-                 f"regex={'on' if regex_var.get() else 'off'}")
+                 f"smart={'on' if smart_var.get() else 'off'}")
         _log_activity(f"Search '{pat}' — {len(paths)} path(s)  [{_opts}]")
 
         t = threading.Thread(
@@ -4092,7 +4356,7 @@ def run_gui() -> int:
                 recursive=recursive_var.get(),
                 rga=rga_var.get() and bool(_RGA_PATH),
                 whole_word=whole_word_var.get(),
-                use_regex=regex_var.get(),
+                use_smart=smart_var.get(),
             ),
             daemon=True,
         )
@@ -4129,27 +4393,42 @@ def run_gui() -> int:
 
             _query = pattern_var.get().strip()
             _query_norm = _normalize_arabic(_query)
-            _use_regex = bool(regex_var.get())
+            _use_smart = bool(smart_var.get())
             _case = bool(case_var.get())
             _whole_word = bool(whole_word_var.get())
-            # Unique literal search terms for pass 1. In regex mode the
-            # raw pattern isn't a literal substring of the PDF — we collect
-            # the *actual* matched substrings per page below instead.
+            # Parse the Smart query once so each per-page pass can pull
+            # positive terms (negatives are never highlighted).
+            _smart_parsed = (
+                _parse_smart_query(_query) if _use_smart
+                else {"required": [], "excluded": []})
+            # Flatten Smart positive terms into a single list for pass 1
+            # literal highlighting.
+            _smart_positive_terms: List[str] = []
+            if _use_smart:
+                _seen_pos: set = set()
+                for _og in _smart_parsed["required"]:
+                    for _t in _og:  # type: ignore[union-attr]
+                        if _t and _t not in _seen_pos:
+                            _seen_pos.add(_t)
+                            _smart_positive_terms.append(_t)
+            # Unique literal search terms for pass 1. In smart mode we use
+            # the parsed positive terms; in default mode the raw query +
+            # its Arabic-normalized form.
             _terms = (
-                []
-                if _use_regex
+                list(_smart_positive_terms) if _use_smart
                 else list(dict.fromkeys(t for t in [_query, _query_norm] if t))
             )
 
             # Pages that actually had matches
             _hit_pages = set(m.page_num or 1 for m in matches)
-            # Multi-word queries split into per-word normalized tokens for
-            # word-level scanning; single-word queries fall straight into the
-            # token list. In regex mode we still try word-level pass 2 — it
-            # often catches the same hits via Arabic normalization — but the
-            # primary path is the per-page regex finditer below.
-            _query_words = [_normalize_arabic(w)
-                            for w in _query.split() if w.strip()]
+            # Per-word normalized tokens for the word-level pass. In smart
+            # mode use the parsed positive terms; in default mode split
+            # the raw query.
+            _query_words = (
+                [_normalize_arabic(t) for t in _smart_positive_terms if t]
+                if _use_smart
+                else [_normalize_arabic(w)
+                      for w in _query.split() if w.strip()])
 
             import string as _string
             # ASCII punctuation that PyMuPDF's search_for tends to normalize
@@ -4182,30 +4461,13 @@ def run_gui() -> int:
                     continue
                 _pg = _doc[_pn - 1]
                 _highlighted_any = False
-                # Track which regex-matched substrings we found via search_for
-                # — pass 2 can then walk page words to catch substrings the
-                # CMap aliasing or column-merged text left invisible.
-                _regex_terms: List[str] = []
-                # Pass 1a (regex): run the pattern against the page text and
-                # collect the *actual* matched substrings. Those ARE literal
-                # substrings of the PDF, so search_for can locate their quads.
-                if _use_regex:
-                    try:
-                        _rx = re.compile(
-                            _query, 0 if _case else re.IGNORECASE)
-                        _page_text = _pg.get_text("text", sort=True) or ""
-                        _seen: set = set()
-                        for _m in _rx.finditer(_page_text):
-                            _t = _m.group(0)
-                            if _t and _t not in _seen:
-                                _seen.add(_t)
-                                _regex_terms.append(_t)
-                        for _term in _regex_terms:
-                            if _search_with_fallback(_pg, _term) > 0:
-                                _highlighted_any = True
-                    except re.error:
-                        pass
-                # Pass 1b (literal): exact substring search via PyMuPDF
+                # Smart mode's positive terms ARE literal substrings (quoted
+                # phrases + bare words), so they go straight into the same
+                # search_for pass as the default-mode terms. The regex
+                # finditer + collection step we used to need is no longer
+                # required.
+                _regex_terms: List[str] = list(_terms) if _use_smart else []
+                # Pass 1 (literal): exact substring search via PyMuPDF
                 for _term in _terms:
                     if _search_with_fallback(_pg, _term) > 0:
                         _highlighted_any = True
@@ -4275,7 +4537,7 @@ def run_gui() -> int:
             # reaching the match, leaving the ‹…› markers nowhere to land.
             _full_ranges = _find_match_ranges(
                 m.line, pattern_var.get(),
-                use_regex=regex_var.get(),
+                use_smart=smart_var.get(),
                 case_sensitive=case_var.get(),
                 whole_word=whole_word_var.get(),
             )
@@ -4293,7 +4555,7 @@ def run_gui() -> int:
                 # Re-compute ranges in the trimmed snippet coordinates.
                 _snippet_ranges = _find_match_ranges(
                     _snippet, pattern_var.get(),
-                    use_regex=regex_var.get(),
+                    use_smart=smart_var.get(),
                     case_sensitive=case_var.get(),
                     whole_word=whole_word_var.get(),
                 )
@@ -4301,7 +4563,7 @@ def run_gui() -> int:
                 _snippet = _line_context(m.line, pattern_var.get())
                 _snippet_ranges = _find_match_ranges(
                     _snippet, pattern_var.get(),
-                    use_regex=regex_var.get(),
+                    use_smart=smart_var.get(),
                     case_sensitive=case_var.get(),
                     whole_word=whole_word_var.get(),
                 )
@@ -4679,7 +4941,7 @@ def run_gui() -> int:
                 "or stop it from the terminal.")
             return
         src = filedialog.askopenfilename(
-            title="Pick a .docx of YouTube links (batch transcribe)",
+            title="STEP 1/2 — Pick the SOURCE .docx (contains YouTube links)",
             initialdir=str(_PROJECT_DIR),
             filetypes=[
                 ("Word document", "*.docx"),
@@ -4693,7 +4955,10 @@ def run_gui() -> int:
         _src_path = Path(src)
         _default_out = _src_path.parent / f"{_src_path.stem}_transcripts"
         outdir = filedialog.askdirectory(
-            title="Output directory (one PDF per link + a combined master)",
+            title=(
+                "STEP 2/2 — Pick the OUTPUT folder "
+                "(transcribed PDFs will be written here). "
+                "Cancel = use default next to the source."),
             initialdir=str(_src_path.parent),
             mustexist=False,
         )
@@ -4711,20 +4976,79 @@ def run_gui() -> int:
                 f"`transcribe` not found next to fuzzer at {_transcribe_path}")
             return
 
+        # Whisper model download check — the first time the user picks a
+        # given model, it pulls a few hundred MB to a few GB from the
+        # Hugging Face cache. Warn explicitly so the long pause on the
+        # first run doesn't look like a hang.
+        _model = transcribe_model_var.get() or "large"
+        _hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+        _whisper_cache = Path.home() / ".cache" / "whisper"
+        # Heuristic: any directory mentioning whisper-{model} (mlx OR
+        # openai cache) counts as "already downloaded".
+        _have = False
+        with contextlib.suppress(Exception):
+            for _d in list(_hf_cache.glob(f"models--*whisper-{_model}*")) + \
+                     list(_whisper_cache.glob(f"{_model}*.pt")):
+                if _d.exists():
+                    _have = True
+                    break
+        if not _have:
+            _sizes = {
+                "tiny": "~75 MB", "base": "~150 MB", "small": "~500 MB",
+                "medium": "~1.5 GB", "large": "~3 GB", "turbo": "~1.5 GB",
+            }
+            _size = _sizes.get(_model, "a few hundred MB")
+            _ok = messagebox.askokcancel(
+                "fuzzer – Transcribe",
+                f"First run with the '{_model}' model.\n\n"
+                f"Whisper will download the model file ({_size}) on this "
+                f"first run — this can take a few minutes depending on your "
+                f"network. After that, every run uses the cached copy and "
+                f"starts instantly.\n\n"
+                f"Continue?",
+            )
+            if not _ok:
+                return
+
         _cmd = [
             str(_transcribe_path), str(_src_path),
             "-o", str(outdir),
-            "--model", "large",
+            "--model", _model,
             "--cookies", "chrome",
             "--also", "txt",
         ]
         _transcribe_state["running"] = True
         transcribe_btn.config(text="Transcribing…", state="disabled")
+        transcribe_model_cb.config(state="disabled")
         status_var.set(
             f"Transcribing {_src_path.name} → {Path(outdir).name}/")
         _log_activity(
             f"Transcribe start: {_src_path.name} → {outdir} "
-            "(model=large, cookies=chrome, also=txt)")
+            f"(model={_model}, cookies=chrome, also=txt)")
+        # Initial progress: 0%, label "Preparing…". The bar reveals itself
+        # via _progress_show and disappears in _done().
+        root.after(0, lambda: _progress_set(0, "Preparing…"))
+
+        # Patterns to drive the progress bar from streamed stdout:
+        #   batch row tag      e.g. "[03/12] https://…"
+        #   yt-dlp download    e.g. "[download]  17.4% of 12.34MiB at …"
+        _ROW_TAG_RE = re.compile(r"\[(\d+)/(\d+)\]")
+        _DL_PCT_RE = re.compile(r"\[download\]\s+(\d+\.\d+)%")
+        _row_state: Dict[str, float] = {"row": 0, "total": 0, "row_inner": 0}
+
+        def _push_progress() -> None:
+            total = _row_state["total"] or 1
+            # Each row contributes 1/total of the overall bar; the inner
+            # download percentage (0..100) advances us within that slot.
+            completed = max(0, _row_state["row"] - 1)
+            base = (completed / total) * 100.0
+            inner = (_row_state["row_inner"] / total)
+            overall = base + inner
+            label = (
+                f"row {int(_row_state['row'])}/{int(total)}"
+                if _row_state["row"] else "Starting…")
+            root.after(
+                0, lambda v=overall, t=label: _progress_set(v, t))
 
         def _worker() -> None:
             import subprocess as _sp
@@ -4741,11 +5065,23 @@ def run_gui() -> int:
                     line = line.rstrip("\n")
                     if not line:
                         continue
-                    # Only the most-recent message goes to status; the
-                    # activity log keeps the full trail for review.
+                    # Most-recent message → status; full trail → activity log.
                     root.after(
                         0, lambda ln=line: status_var.set(ln[:160]))
                     root.after(0, lambda ln=line: _log_activity(ln[:200]))
+                    # Progress parsing — outer row tags first (per-video
+                    # boundaries reset the inner download counter to 0).
+                    m_row = _ROW_TAG_RE.search(line)
+                    if m_row:
+                        _row_state["row"] = float(m_row.group(1))
+                        _row_state["total"] = float(m_row.group(2))
+                        _row_state["row_inner"] = 0.0
+                        _push_progress()
+                        continue
+                    m_dl = _DL_PCT_RE.search(line)
+                    if m_dl:
+                        _row_state["row_inner"] = float(m_dl.group(1))
+                        _push_progress()
                 rc = proc.wait()
             except Exception as e:
                 root.after(0, lambda _e=e: messagebox.showerror(
@@ -4756,6 +5092,8 @@ def run_gui() -> int:
                 def _done() -> None:
                     _transcribe_state["running"] = False
                     transcribe_btn.config(text="Transcribe…", state="normal")
+                    transcribe_model_cb.config(state="readonly")
+                    _progress_hide()
                     if rc == 0:
                         status_var.set(
                             f"{_EXPORT_PREFIX}{outdir}")
@@ -4776,12 +5114,29 @@ def run_gui() -> int:
         transcribe_btn,
         "Transcribe a .docx of YouTube links to PDFs (one per link + a\n"
         "combined master). Runs the sibling `transcribe` CLI in batch mode:\n"
-        "  transcribe <picked.docx> -o <outdir>/ --model large \\\n"
+        "  transcribe <picked.docx> -o <outdir>/ --model <picked>\n"
         "             --cookies chrome --also txt\n"
         "\n"
-        "Pick the .docx, then a folder for the output (defaults to\n"
-        "<docx-stem>_transcripts next to the source). Progress streams\n"
-        "into the activity log; the GUI stays responsive.")
+        "Pick the .docx (STEP 1), then the output folder (STEP 2). The\n"
+        "model dropdown next to this button selects accuracy vs speed.\n"
+        "Progress streams into the activity log + bottom bar; the GUI\n"
+        "stays responsive while transcription runs in the background.")
+    _Tooltip(
+        transcribe_model_cb,
+        "Whisper model — accuracy vs speed for Transcribe…\n"
+        "\n"
+        "  tiny    fastest, lowest accuracy, ~75 MB\n"
+        "  base    fast, low accuracy, ~150 MB\n"
+        "  small   moderate, ~500 MB\n"
+        "  medium  good accuracy, slower, ~1.5 GB\n"
+        "  large   highest accuracy, slowest, ~3 GB  (default)\n"
+        "  turbo   large-v3-turbo: large quality, ~5× faster, ~1.5 GB\n"
+        "\n"
+        "First time you pick a model the file is downloaded once to\n"
+        "~/.cache/huggingface (a few minutes); after that it's cached\n"
+        "and every run starts instantly.\n"
+        "\n"
+        "From the terminal:  transcribe … --model <name>")
 
     def _set_selected_preview_from_iid(iid: str) -> None:
         vals = tree.item(iid, "values")
@@ -4816,7 +5171,7 @@ def run_gui() -> int:
         text = prefix + full_line
         ranges = _find_match_ranges(
             full_line, pattern_var.get(),
-            use_regex=regex_var.get(),
+            use_smart=smart_var.get(),
             case_sensitive=case_var.get(),
             whole_word=whole_word_var.get(),
         )

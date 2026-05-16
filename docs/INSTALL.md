@@ -26,19 +26,40 @@ your shell).
 
 ---
 
-## 3 — System packages
+## 3 — System packages (includes git)
 
 ```sh
 brew install git python@3.14 ffmpeg yt-dlp
 ```
 
+`git` is the tool that downloads source code from GitHub. Check it works:
+
+```sh
+git --version
+```
+
+You should see something like `git version 2.45.0`.
+
 ---
 
-## 4 — Clone the repo
+## 4 — Pull the code from GitHub
+
+The repo is public — no GitHub account or login is required.
 
 ```sh
 git clone https://github.com/Salman-bot/fuzzer.git ~/bin
 cd ~/bin
+```
+
+`git clone` downloads the code into `~/bin` (your home folder, then `bin`).
+`cd ~/bin` moves your Terminal into that folder so the next commands run
+in the right place.
+
+To **update** later (get the newest version of fuzzer):
+
+```sh
+cd ~/bin
+git pull
 ```
 
 ---
@@ -75,7 +96,99 @@ The GUI opens. See [USAGE.md](USAGE.md) for the tour.
 
 ---
 
-## 8 — Transcribe (audio / video / YouTube → searchable PDF)
+## 8 — Claude API key (optional, for the chat panel)
+
+The right side of the fuzzer window has a chat box that asks Claude
+questions about your files. Searching, opening PDFs, and exporting work
+**without** a key — you only need one for the chat panel.
+
+### 8a. Create an Anthropic account
+
+1. Open <https://console.anthropic.com> in your browser.
+2. Click **Sign up** and create an account (email or Google).
+3. Verify your email if asked.
+
+### 8b. Add money (buy credits)
+
+Anthropic uses **prepaid credit** — you put money in once and the chat
+panel draws from it as you use it.
+
+1. In the console, open **Settings → Plans & Billing** (or just
+   **Billing**).
+2. Click **Add payment method** and enter a card.
+3. Click **Add credits** and choose an amount. The minimum is **$5**.
+   Start with **$5** — it lasts a long time for normal use (see costs
+   below).
+4. Optional: turn on **Auto-reload** so credits top up automatically
+   when they run low.
+
+### 8c. Create an API key
+
+1. In the console, open **Settings → API keys**.
+2. Click **Create key**, give it a name like `fuzzer`, click **Create**.
+3. Copy the key. It starts with `sk-ant-…`. **Copy it now** — the
+   console won't show it again. (If you lose it, just create a new one.)
+
+### 8d. Give the key to fuzzer
+
+Two ways — pick one:
+
+**Easy way (recommended):** in the fuzzer window, click the
+**API Key…** button in the action row, paste the key, click **Save**.
+fuzzer remembers it for next time.
+
+**Terminal way:** add it to your shell so every program on your Mac can
+see it:
+
+```sh
+echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
+source ~/.zshrc
+```
+
+(Replace `sk-ant-...` with your real key.)
+
+### 8e. How much will it cost?
+
+Live prices are on Anthropic's
+[pricing page](https://www.anthropic.com/pricing) — they change
+occasionally, so check there for exact numbers. Here is a rough guide
+based on today's prices for the **default model** (Sonnet 4.6):
+
+| What you do                                | Rough cost            |
+| ------------------------------------------ | --------------------- |
+| One chat turn (ask about ~10 search hits)  | **~1–2 ¢**            |
+| Follow-up question in same chat (cached)   | a fraction of a cent  |
+| 50 chat turns in a day                     | **~$0.50 – $1**       |
+| A month of casual use (200–500 turns)      | **~$2 – $5**          |
+
+So a one-time **$5 credit purchase typically lasts weeks to months** for
+normal "search-then-ask-Claude" workflows. The big numbers come from
+running many long Opus turns back-to-back — see the model picker in the
+chat header to switch:
+
+| Model          | When to use it                         | Relative cost |
+| -------------- | -------------------------------------- | ------------- |
+| **Haiku 4.5**  | Quick lookups, simple Q&A              | ~5× cheaper   |
+| **Sonnet 4.6** | Default — strong all-rounder           | baseline      |
+| **Opus 4.7**   | Hard reasoning, long analysis          | ~5× pricier   |
+
+Every chat turn prints a usage line at the bottom of the chat panel:
+
+```text
+this turn: in 1,250  ·  out 380  tok      session (5 turns): in 6,800  ·  out 1,900  tok
+```
+
+Multiply those numbers by the per-million-token price on the pricing
+page to see exactly what you spent. The console also shows a running
+balance under **Billing → Usage**.
+
+> Tip: keep one long chat going instead of restarting — fuzzer caches
+> context, so follow-ups in the same chat are billed at the much
+> cheaper "cache read" rate.
+
+---
+
+## 9 — Transcribe (audio / video / YouTube → searchable PDF)
 
 `transcribe` runs from the CLI or directly from the fuzzer GUI (the
 **Transcribe…** button in the action row).
@@ -124,7 +237,10 @@ transcribe --help
 | Symptom                              | Fix                                                |
 | ------------------------------------ | -------------------------------------------------- |
 | `command not found: brew`            | Re-run the two `eval` lines from step 2.           |
+| `command not found: git`             | Re-run step 3 — `brew install git`.                |
 | `command not found: fuzzer`          | `source ~/.zshrc` or open a new Terminal window.   |
 | Installer says "PDF backend missing" | `pip3 install --break-system-packages pymupdf`.    |
-| Transcribe button greyed out         | Whisper isn't installed — re-run step 8.           |
+| Chat panel says "No API key"         | Click **API Key…**, paste your key (step 8d).      |
+| Chat panel says "Insufficient credit"| Add credits at console.anthropic.com → Billing.    |
+| Transcribe button greyed out         | Whisper isn't installed — re-run step 9.           |
 | Anything else                        | Re-run `./install.sh` — safe to run again.         |

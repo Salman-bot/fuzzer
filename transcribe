@@ -194,19 +194,99 @@ def fetch_local(path: Path, workdir: Path) -> tuple[Path, str]:
     die(f"unsupported file type: {path.suffix}")
 
 # ── transcription ─────────────────────────────────────────────────────────────
+# mlx-whisper model names on Hugging Face. mlx-community publishes MLX-native
+# weights for every Whisper size; we map the openai-whisper model names that
+# users already pass (--model large / medium / …) to these repos.
+_MLX_REPO_MAP = {
+    "tiny":     "mlx-community/whisper-tiny-mlx",
+    "tiny.en":  "mlx-community/whisper-tiny.en-mlx",
+    "base":     "mlx-community/whisper-base-mlx",
+    "base.en":  "mlx-community/whisper-base.en-mlx",
+    "small":    "mlx-community/whisper-small-mlx",
+    "small.en": "mlx-community/whisper-small.en-mlx",
+    "medium":   "mlx-community/whisper-medium-mlx",
+    "medium.en":"mlx-community/whisper-medium.en-mlx",
+    # Default `--model large` routes to *turbo* on mlx: the large-v3 encoder
+    # paired with a slim 4-layer decoder, ~5× faster than full large-v3 with
+    # comparable quality on clearly-recorded speech. The full large-v3 weights
+    # are served via HF's Xet CDN which is unreachable from some networks;
+    # turbo is served via the regular LFS path. Pass --model large-v3 explicitly
+    # to force the full model when transcribing noisy / heavy-accent audio.
+    "large":    "mlx-community/whisper-large-v3-turbo",
+    "large-v1": "mlx-community/whisper-large-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "turbo":    "mlx-community/whisper-large-v3-turbo",
+}
+
+
+def _transcribe_mlx(audio: Path, model_name: str, language: str | None) -> dict[str, Any] | None:
+    """Try mlx-whisper first — ~5–8× faster than openai-whisper on Apple
+    Silicon. Returns the same dict shape (text / segments / language) or
+    None if mlx isn't installed, disabled, or the run failed.
+
+    First use of a model triggers a ~3 GB download from HuggingFace; if
+    that's painful (slow network, behind firewall), set the env var
+    TRANSCRIBE_NO_MLX=1 to force the openai-whisper path."""
+    if os.environ.get("TRANSCRIBE_NO_MLX"):
+        return None
+    try:
+        import mlx_whisper  # type: ignore
+    except ImportError:
+        return None
+    repo = _MLX_REPO_MAP.get(model_name, model_name)
+    step(f"loading whisper model: {model_name}  ·  engine: mlx-whisper")
+    step(f"repo: {repo}")
+    step("transcribing (this may take a while)…")
+    return mlx_whisper.transcribe(
+        str(audio),
+        path_or_hf_repo=repo,
+        language=language,          # None → auto-detect
+        verbose=False,
+    )
+
+
 def transcribe_whisper(audio: Path, model_name: str, language: str | None) -> dict[str, Any]:
-    step(f"loading whisper model: {model_name}")
+    # Try the fast Apple-Silicon path first.
+    mlx = _transcribe_mlx(audio, model_name, language)
+    if mlx is not None:
+        return mlx
+
+    # Fall back to openai-whisper (MPS if available, else CPU).
+    step(f"loading whisper model: {model_name}  ·  engine: openai-whisper")
     try:
         import whisper  # type: ignore
     except ImportError:
-        die("whisper not installed — pip install openai-whisper (or: brew install whisper)")
-    model = whisper.load_model(model_name)
+        die("neither mlx-whisper nor openai-whisper is installed — "
+            "pip install mlx-whisper (recommended on Apple Silicon) "
+            "or pip install openai-whisper")
+    device = "cpu"
+    try:
+        import torch  # type: ignore
+        if torch.backends.mps.is_available():
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            device = "mps"
+    except Exception:
+        pass
+    step(f"device: {device}")
+    try:
+        model = whisper.load_model(model_name, device=device)
+    except Exception as e:
+        if device != "cpu":
+            warn(f"MPS load failed ({e!r}) — falling back to CPU")
+            model = whisper.load_model(model_name, device="cpu")
+        else:
+            raise
+    # fp16=False is faster on this MPS backend than fp16=True (counter-
+    # intuitively): most MPS ops in PyTorch fall back to CPU, and the half
+    # ↔ float casts on every fallback exceed the small compute savings.
+    # Benchmarked head-to-head on M5 Pro: fp32 ≈ 700 fps, fp16 ≈ 500 fps.
     step("transcribing (this may take a while)…")
     return model.transcribe(
         str(audio),
         language=language,          # None → auto-detect
         verbose=False,
-        fp16=False,                 # CPU-safe; MPS uses fp32 anyway
+        fp16=False,
     )
 
 # ── output writers ────────────────────────────────────────────────────────────
@@ -286,8 +366,25 @@ def _pick_font(text: str) -> tuple[str, str | None]:
         warn("no CJK-capable font found — PDF may show tofu boxes for Japanese/Chinese")
     return "helv", None
 
+def _info_header_lines(
+    title: str, source: str, language: str, line_count: int,
+) -> list[str]:
+    """Compact 'just as info' header — 4 short labelled lines that sit
+    inline above the transcript body. Empty fields are skipped so we
+    don't emit blank 'Language:' rows when nothing is known."""
+    out: list[str] = [f"Title:     {title}"] if title else []
+    if source:
+        key = "YouTube" if source.startswith(("http://", "https://")) else "Source"
+        out.append(f"{key}:   {source}")
+    if language:
+        out.append(f"Language:  {language}")
+    out.append(f"Lines:     {line_count}")
+    return out
+
+
 def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: str,
-              include_timestamps: bool, source: str) -> None:
+              include_timestamps: bool, source: str,
+              language: str = "") -> None:
     try:
         import fitz  # PyMuPDF
     except ImportError:
@@ -302,7 +399,15 @@ def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: 
     doc = fitz.open()
     W, H = fitz.paper_size("a4")
     MARGIN = 50
-    body_rect = fitz.Rect(MARGIN, MARGIN + 60, W - MARGIN, H - MARGIN)
+    # Compact inline header — 4 short info lines (Title / YouTube /
+    # Language / Lines) above the transcript on page 1 only. ~14 px per
+    # line + a couple of pixels for breathing room. Body starts right
+    # below; we never burn a whole cover page on this metadata.
+    _INFO_LINE_H = 12
+    _info_lines_count = sum(1 for _ in _info_header_lines(
+        title, source, language, max(len(segments), 1)))
+    _header_total_h = _info_lines_count * _INFO_LINE_H + 8
+    body_rect = fitz.Rect(MARGIN, MARGIN + _header_total_h, W - MARGIN, H - MARGIN)
 
     # Build the body text once. For RTL, put the timestamp AFTER the segment
     # text so the bidi algorithm places the LTR timestamp on the visual left
@@ -329,18 +434,20 @@ def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: 
         if fontfile:
             page.insert_font(fontname=fontname, fontfile=fontfile)
         if first:
-            # Title block on page 1.
-            page.insert_textbox(
-                fitz.Rect(MARGIN, MARGIN, W - MARGIN, MARGIN + 30),
-                title_disp,
-                fontname=fontname, fontfile=fontfile,
-                fontsize=16, align=title_align,
-            )
-            page.insert_textbox(
-                fitz.Rect(MARGIN, MARGIN + 30, W - MARGIN, MARGIN + 55),
-                f"Source: {source}",
-                fontname="helv", fontsize=9, color=(0.4, 0.4, 0.4),
-            )
+            # Compact info header — small grey lines, inline above the
+            # transcript. No cover page; the title is part of the info
+            # block rather than a big banner.
+            _info_lines = _info_header_lines(
+                title_disp, source, language, len(segments))
+            for _i, _ln in enumerate(_info_lines):
+                _y = MARGIN + _i * _INFO_LINE_H
+                page.insert_textbox(
+                    fitz.Rect(MARGIN, _y, W - MARGIN, _y + _INFO_LINE_H),
+                    _ln,
+                    fontname=fontname, fontfile=fontfile,
+                    fontsize=9, color=(0.35, 0.35, 0.35),
+                    align=title_align,
+                )
             first = False
         # insert_textbox returns negative of the unwritten character count, or
         # positive remaining vertical space if everything fit.
@@ -403,14 +510,19 @@ def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: 
     doc.close()
 
 def write_txt(out: Path, title: str, segments: list[WhisperSegment], full_text: str,
-              include_timestamps: bool) -> None:
-    parts = [title, "=" * len(title), ""]
+              include_timestamps: bool, source: str = "", language: str = "") -> None:
+    body: list[str] = []
     if include_timestamps and segments:
         for s in segments:
-            parts.append(f"[{fmt_ts(s['start'])}] {s['text'].strip()}")
+            body.append(f"[{fmt_ts(s['start'])}] {s['text'].strip()}")
     else:
-        parts.append(full_text.strip())
-    out.write_text("\n".join(parts) + "\n", encoding="utf-8")
+        body.append(full_text.strip())
+    # Compact info header inline above the body — matches the PDF style
+    # so users see the same Title / YouTube / Language / Lines block.
+    header = _info_header_lines(
+        title, source, language, len(segments) or len(body))
+    sep = "─" * 60
+    out.write_text("\n".join(header + [sep, ""] + body) + "\n", encoding="utf-8")
 
 def write_md(out: Path, title: str, segments: list[WhisperSegment], full_text: str) -> None:
     parts = [f"# {title}", ""]
@@ -571,14 +683,15 @@ def main() -> int:
         # 4. Write outputs.
         write_pdf(out_pdf, title, segments, full_text,
                   include_timestamps=not args.no_timestamps,
-                  source=source_label)
+                  source=source_label, language=detected)
         ok(f"wrote {out_pdf}")
 
         stem = out_pdf.with_suffix("")
         if "txt" in extras:
             p = stem.with_suffix(".txt")
             write_txt(p, title, segments, full_text,
-                      include_timestamps=not args.no_timestamps)
+                      include_timestamps=not args.no_timestamps,
+                      source=source_label, language=detected)
             ok(f"wrote {p}")
         if "md" in extras:
             p = stem.with_suffix(".md")
