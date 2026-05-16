@@ -2569,12 +2569,17 @@ def run_gui() -> int:
         state="readonly", width=11,
     )
     _chat_model_picker.bind("<<ComboboxSelected>>", _on_model_change)
-    _chat_model_picker.pack(side="right", padx=(4, 4), pady=2)
+    _chat_model_picker.pack(side="right", padx=(4, 8), pady=2)
     _chat_model_lbl = tk.Label(
-        chat_header, text="Model:", bg=_BG, fg=_TEXT,
+        chat_header, text="Model", bg=_BG, fg=_MUTED,
         font=(_ui_font_family, 10),
     )
-    _chat_model_lbl.pack(side="right", padx=(0, 2))
+    _chat_model_lbl.pack(side="right", padx=(0, 4))
+
+    # Vertical divider between the rate-limit cluster and the Model picker
+    # so the two right-side roles don't blur into "rate-limit Model dropdown".
+    _chat_header_sep = tk.Frame(chat_header, bg=_T["CHAT_BORDER"], width=1)
+    _chat_header_sep.pack(side="right", fill="y", padx=8, pady=4)
 
     # Rate-limit indicator: filled in after each turn from anthropic-ratelimit-*
     # response headers. Empty until the first chat round completes.
@@ -2584,7 +2589,7 @@ def run_gui() -> int:
         bg=_BG, fg=_MUTED,
         font=(_ui_font_family, 10),
     )
-    _chat_ratelimit_lbl.pack(side="right", padx=(0, 8))
+    _chat_ratelimit_lbl.pack(side="right", padx=(0, 4))
 
     # ttk.Label (not tk.Button) — macOS Aqua's tk.Button ignores bg and renders
     # the native white face. ttk.Label honors the TLabel style and so picks up
@@ -3019,10 +3024,14 @@ def run_gui() -> int:
                 chat_entry.configure(
                     background=_T["CHAT_ENTRY_BG"],
                     foreground=_T["CHAT_FG"])
+    # Small visual gap between the typing area and the action buttons so
+    # the eye reads them as "input | buttons" instead of one continuous strip.
+    _chat_input_gap = tk.Frame(chat_input_row, bg=_T["CHAT_ENTRY_BG"], width=8)
+    _chat_input_gap.pack(side="left", fill="y")
     chat_send_btn = ttk.Button(chat_input_row, text="Send", width=8)
     chat_send_btn.pack(side="left")
     chat_reset_btn = ttk.Button(chat_input_row, text="Reset", width=8)
-    chat_reset_btn.pack(side="left", padx=(4, 0))
+    chat_reset_btn.pack(side="left", padx=(6, 4))
 
     _wire_text_shortcuts(chat_log, allow_edit=False)
     _wire_text_shortcuts(chat_entry, allow_edit=True)
