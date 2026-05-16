@@ -1608,15 +1608,22 @@ def run_gui() -> int:
           + ("Detected: " + _RGA_PATH if _RGA_PATH else
              "NOT INSTALLED — run `brew install ripgrep-all` to enable."))),
     ]
+    # Group the checkboxes by role so the strip reads as three clusters
+    # rather than one wall: match-style ┊ scope ┊ backend ┊ threshold.
+    _OPT_GROUPS = {"Case-sensitive", "Whole word", "Smart search"}  # match style
+    _OPT_AFTER_GROUP = {"Smart search": True, "Recursive": True, "rga engine": True}
     for _label, _var, _tip in _opt_tooltips:
         _cb = ttk.Checkbutton(opts, text=_label, variable=_var)
         _cb.pack(side="left", padx=4)
         if _label == "rga engine" and not _RGA_PATH:
             _cb.state(["disabled"])
         _Tooltip(_cb, _tip)
+        if _OPT_AFTER_GROUP.get(_label):
+            tk.Frame(opts, bg=_T["CHAT_BORDER"], width=1).pack(
+                side="left", fill="y", padx=8, pady=2)
 
-    _thr_lbl = ttk.Label(opts, text="  Threshold:")
-    _thr_lbl.pack(side="left")
+    _thr_lbl = ttk.Label(opts, text="Threshold")
+    _thr_lbl.pack(side="left", padx=(4, 2))
     _thr_saved = _gui_state.get("threshold", 80)
     threshold_var = tk.IntVar(value=int(_thr_saved)
                               if isinstance(_thr_saved, (int, str)) else 80)
@@ -1675,14 +1682,21 @@ def run_gui() -> int:
     clear_btn.pack(side="left", padx=2)
     export_btn = ttk.Button(actions, text="Export…", state="disabled")
     export_btn.pack(side="left", padx=2)
+
+    # Separator: search actions │ config │ companion tools.
+    tk.Frame(actions, bg=_T["CHAT_BORDER"], width=1).pack(
+        side="left", fill="y", padx=10, pady=4)
     apikey_btn = ttk.Button(actions, text="API Key…")
-    apikey_btn.pack(side="left", padx=(12, 2))
+    apikey_btn.pack(side="left", padx=2)
+
+    tk.Frame(actions, bg=_T["CHAT_BORDER"], width=1).pack(
+        side="left", fill="y", padx=10, pady=4)
     # Transcribe button + model picker: picks a .docx of YouTube links
     # and runs the sibling `transcribe` CLI in batch mode (one PDF per
     # link + master). The model dropdown selects Whisper accuracy /
     # speed; the choice is saved across runs.
     transcribe_btn = ttk.Button(actions, text="Transcribe…")
-    transcribe_btn.pack(side="left", padx=(12, 2))
+    transcribe_btn.pack(side="left", padx=2)
     _TRANSCRIBE_MODELS = ("tiny", "base", "small", "medium", "large", "turbo")
     transcribe_model_var = tk.StringVar(
         value=str(_gui_state.get("transcribe_model", "large")))

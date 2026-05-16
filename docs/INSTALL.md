@@ -218,8 +218,24 @@ transcribe URL --model medium --lang ar
 transcribe links.docx -o transcripts/
 ```
 
-First run of `--model medium` / `large` downloads the model (~1.5 GB /
-~3 GB). After that it works offline.
+### Which `--model` to pick
+
+Next to the GUI **Transcribe…** button is a model dropdown; the CLI takes
+the same names via `--model`. Bigger = more accurate, slower, larger
+one-time download.
+
+| Model    | Size    | Speed        | Best for                                  |
+| -------- | ------- | ------------ | ----------------------------------------- |
+| `tiny`   | ~75 MB  | fastest      | quick previews, English only really       |
+| `base`   | ~150 MB | very fast    | rough drafts                              |
+| `small`  | ~500 MB | fast         | decent quality, most common dialects      |
+| `medium` | ~1.5 GB | slower       | good for non-English / accented speech    |
+| `large`  | ~3 GB   | slowest      | highest quality — **default**             |
+| `turbo`  | ~1.5 GB | ~5× of large | nearly large quality, much faster         |
+
+> **First run with a model is slow** — Whisper downloads the model file
+> the first time you use it. Every later run uses the cached copy and
+> starts instantly.
 
 ---
 
