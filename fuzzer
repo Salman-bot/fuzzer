@@ -1255,7 +1255,11 @@ def run_gui() -> int:
     #   • initial sashpos placed so chat starts at ~38 % of window height
     #   • on every <Configure> we clamp the sash so chat ≥ _CHAT_PANE_MIN_PX
     # User drags are honored as long as they leave at least the floor.
-    _CHAT_PANE_MIN_PX = 220
+    # Min height guarantees the chat input row (~3 lines) + status/selected
+    # strip (~2 lines) + a few rows of log are always visible. Initial fraction
+    # leans toward chat (44% rather than 38%) since the empty log otherwise
+    # reads as wasted real estate.
+    _CHAT_PANE_MIN_PX = 260
     _sash_inited = [False]
 
     def _ensure_chat_pane_visible(_e: object = None) -> None:
@@ -1264,7 +1268,7 @@ def run_gui() -> int:
             if h < _CHAT_PANE_MIN_PX + 80:
                 return  # Window too tiny — let widgets size themselves.
             if not _sash_inited[0]:
-                target_chat = max(_CHAT_PANE_MIN_PX, int(h * 0.38))
+                target_chat = max(_CHAT_PANE_MIN_PX, int(h * 0.44))
                 main_paned.sashpos(0, h - target_chat)
                 _sash_inited[0] = True
                 return
@@ -1942,6 +1946,50 @@ def run_gui() -> int:
 
     _apply_chat_log_tags(_T)
 
+    # Welcome banner shown until the user sends their first message — fills the
+    # empty chat pane on launch with the onboarding bits a new user actually
+    # needs (how to ground answers, history nav, model picker, key setup).
+    def _show_chat_welcome() -> None:
+        with contextlib.suppress(Exception):
+            chat_log.configure(state="normal")
+            chat_log.delete("1.0", "end")
+            chat_log.insert("end", "Claude Chat\n", ("md_h2",))
+            chat_log.insert(
+                "end",
+                "Ground answers in your files — search above, then ask:\n",
+                ("sys",),
+            )
+            chat_log.insert(
+                "end",
+                "  • “summarize the cultural-representation findings”\n"
+                "  • “list every paper that disagrees with row 7”\n"
+                "  • “open the PDF where this was discussed”\n\n",
+                ("sys",),
+            )
+            chat_log.insert("end", "Tips\n", ("md_h3",))
+            chat_log.insert(
+                "end",
+                "  ↑/↓  recall prior prompts        ⌘⇧C  collapse this pane\n"
+                "  Enter to send, Shift+Enter for a newline\n"
+                "  Pick the model on the top-right; API Key… stores your key\n",
+                ("sys",),
+            )
+            chat_log.configure(state="disabled")
+
+    # Tagged "welcome" so _send_chat can detect + clear it before the first turn.
+    _chat_welcome_shown = [False]
+
+    def _clear_chat_welcome_if_needed() -> None:
+        if _chat_welcome_shown[0]:
+            with contextlib.suppress(Exception):
+                chat_log.configure(state="normal")
+                chat_log.delete("1.0", "end")
+                chat_log.configure(state="disabled")
+            _chat_welcome_shown[0] = False
+
+    _show_chat_welcome()
+    _chat_welcome_shown[0] = True
+
     # Track per-link tags so each detected path can be opened independently.
     _chat_path_links: Dict[str, str] = {}
     _chat_path_counter = [0]
@@ -2071,9 +2119,9 @@ def run_gui() -> int:
         _input_inner, textvariable=status_var, anchor="w",
         bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_SYS_FG"],
         font=("Menlo", 11),
-        padx=10, pady=2,
+        padx=10, pady=0,
     )
-    _status_lbl.pack(fill="x", pady=(4, 0))
+    _status_lbl.pack(fill="x", pady=(3, 0))
     _status_widget_ref[0] = _status_lbl
     _status_lbl.bind("<Button-1>", _on_status_click)
 
@@ -2082,9 +2130,9 @@ def run_gui() -> int:
         _input_inner, textvariable=selected_var, anchor="w",
         bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_TOOL_RES_FG"],
         font=("Menlo", 11),
-        padx=10, pady=2,
+        padx=10, pady=0,
     )
-    _selected_lbl.pack(fill="x", pady=(0, 2))
+    _selected_lbl.pack(fill="x", pady=(0, 3))
     _selected_widget_ref[0] = _selected_lbl
 
     # Thin divider between the info lines and the actual input row, for visual
@@ -2118,9 +2166,11 @@ def run_gui() -> int:
 
     # Multi-line input: Enter sends, Shift+Enter inserts a newline. Behaves
     # like any real OS text box — selectable, paste-friendly, undo via Cmd+Z.
+    # height=3 — gives the prompt enough breathing room that users see it as
+    # a real input area, not a single squashed line.
     chat_entry = tk.Text(
         _chat_input_box,
-        height=2, wrap="word",
+        height=3, wrap="word",
         font=_chat_font,
         background=_T["CHAT_ENTRY_BG"], foreground=_T["CHAT_FG"],
         insertbackground=_T["CHAT_FG"], relief="flat", borderwidth=0,
@@ -2817,11 +2867,9 @@ def run_gui() -> int:
         chat_state["files_sig"] = ""
         chat_state["context_files"] = []
         chat_state["context_chars"] = 0
-        chat_log.config(state="normal")
-        chat_log.delete("1.0", "end")
-        chat_log.config(state="disabled")
+        _show_chat_welcome()
+        _chat_welcome_shown[0] = True
         _update_chat_context_label()
-        _append_chat("sys", "system", "Conversation reset.")
         _log_activity("Chat conversation reset")
 
     def _send_chat(_event: object = None) -> str:
@@ -2831,10 +2879,12 @@ def run_gui() -> int:
         api_key = str(_gui_state.get("api_key")
                       or os.environ.get("ANTHROPIC_API_KEY") or "")
         if not api_key:
+            _clear_chat_welcome_if_needed()
             _append_chat("err", "error",
                          "No API key — click 'API Key…' to set your Anthropic key.")
             _log_activity("Chat blocked — no API key")
             return "break"
+        _clear_chat_welcome_if_needed()
         if msg in _chat_input_history:
             _chat_input_history.remove(msg)
         _chat_input_history.insert(0, msg)
