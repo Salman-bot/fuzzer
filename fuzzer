@@ -248,6 +248,7 @@ try:
     def _normalize_arabic(s: str) -> str:
         """C-accelerated: strip diacritics + tatweel, normalize alef/yeh."""
         return _ar_norm.normalize(s)
+    _ENGINE_ARABIC = "C ext (_ar_norm)"
 
 except ImportError:
     _AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")
@@ -258,6 +259,7 @@ except ImportError:
     def _normalize_arabic(s: str) -> str:
         s = _AR_DIACRITICS.sub("", s)
         return s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
+    _ENGINE_ARABIC = "regex fallback"
 
 # ── native-call instrumentation (toggleable at runtime via the GUI) ──────────
 # When debug mode is ON, every call to _normalize_arabic is recorded into
@@ -348,15 +350,19 @@ try:
     def _RATIO_FN(a, b): return int(_rf_fuzz.ratio(a, b))
     def _PARTIAL_FN(a, b): return int(_rf_fuzz.partial_ratio(a, b))
     def _TOKEN_FN(a, b): return int(_rf_fuzz.token_set_ratio(a, b))
+    _ENGINE_FUZZY = "rapidfuzz (Rust)"
 except ImportError:
     try:
         from thefuzz import fuzz as _tf_fuzz
+        _RATIO_FN = _tf_fuzz.ratio
         _PARTIAL_FN = _tf_fuzz.partial_ratio
         _TOKEN_FN = _tf_fuzz.token_set_ratio
+        _ENGINE_FUZZY = "thefuzz"
     except ImportError:
         _RATIO_FN = _builtin_ratio
         _PARTIAL_FN = None  # type: ignore[assignment]
         _TOKEN_FN = None  # type: ignore[assignment]
+        _ENGINE_FUZZY = "builtin Levenshtein"
 
 
 def fuzzy_score(pattern: str, line: str) -> int:
@@ -389,8 +395,22 @@ def search_file(
     *,
     case_sensitive: bool,
     threshold: int,
+    whole_word: bool = False,
+    use_regex: bool = False,
 ) -> Tuple[List[str], List[Match]]:
-    """Search ``fp`` for ``pattern`` (substring + fuzzy fallback)."""
+    """Search ``fp`` for ``pattern``.
+
+    Modes (mutually-exclusive precedence):
+      * ``use_regex``    — pattern is a Python regex; ``re.search`` per line;
+                           fuzzy fallback skipped. Invalid regex returns [].
+      * ``whole_word``   — pattern must match at word boundaries (``\\b``);
+                           fuzzy still runs on non-matching lines (if threshold
+                           > 0) but is also gated to whole-word hits.
+      * default          — plain substring; below-threshold lines try
+                           ``fuzzy_score``. Token pre-filter rejects lines that
+                           share zero tokens with the pattern, so unrelated
+                           lines skip rapidfuzz entirely.
+    """
     lines = read_lines(fp)
     if lines is None:
         return [], []
@@ -398,17 +418,51 @@ def search_file(
     matches: List[Match] = []
     _pages = _pdf_page_map.get(fp, [])
 
+    if use_regex:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            _rx = re.compile(pattern, flags)
+        except re.error:
+            return lines, matches
+        for i, line in enumerate(lines, start=1):
+            if _rx.search(line):
+                pg = _pages[i - 1] if i - 1 < len(_pages) else 0
+                matches.append(Match(fp, i, line, 100, pg))
+        return lines, matches
+
     pat = pattern if case_sensitive else pattern.lower()
 
+    if whole_word:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            _ww_rx = re.compile(rf"\b{re.escape(pattern)}\b", flags)
+        except re.error:
+            _ww_rx = None
+    else:
+        _ww_rx = None
+
     def _is_hit(line: str) -> bool:
+        if _ww_rx is not None:
+            return bool(_ww_rx.search(line))
         cmp = line if case_sensitive else line.lower()
         return pat in cmp
 
+    # Token pre-filter: skip fuzzy on lines that share zero tokens with the
+    # pattern. For long files this is a >10x win when the pattern is rare,
+    # because rapidfuzz is the per-line hot path.
+    pat_tokens = _tokenize(pattern) if threshold > 0 else set()
     pat_lower = pattern if case_sensitive else pattern.lower()
+
     for i, line in enumerate(lines, start=1):
         pg = _pages[i - 1] if i - 1 < len(_pages) else 0
         if _is_hit(line):
             matches.append(Match(fp, i, line, 100, pg))
+            continue
+        if threshold <= 0:
+            continue
+        # Pre-filter only when the pattern has tokens (≥2-char alnum runs).
+        # Very short patterns skip the filter and fall through to fuzzy.
+        if pat_tokens and not (pat_tokens & _tokenize(line)):
             continue
         cmp = line if case_sensitive else line.lower()
         sc = fuzzy_score(pat_lower, cmp)
@@ -432,20 +486,30 @@ def rga_search_file(
     *,
     case_sensitive: bool,
     threshold: int,  # unused — rga is substring-only
+    whole_word: bool = False,
+    use_regex: bool = False,
 ) -> Tuple[List[str], List[Match]]:
     """Search a single file via rga --json. On any failure (rga missing,
     spawn error, parse error) falls back to the in-process search_file().
     Returns (lines, matches); lines is empty for formats fuzzer can't read
     natively (docx/epub/sqlite) — the GUI only relies on Match.line for those.
     """
-    if not _RGA_PATH or not pattern:
+    # Regex mode is handled in-process — rga's --json output is line-oriented
+    # but its regex semantics differ enough from Python's re that it's cleaner
+    # to fall back than try to translate.
+    if use_regex or not _RGA_PATH or not pattern:
         return search_file(fp, pattern,
                            case_sensitive=case_sensitive,
-                           threshold=threshold)
+                           threshold=threshold,
+                           whole_word=whole_word,
+                           use_regex=use_regex)
     import subprocess as _sub
     import json as _json
-    args = [_RGA_PATH, "--json", "--no-config",
-            "--fixed-strings", "--no-messages"]
+    args = [_RGA_PATH, "--json", "--no-config", "--no-messages"]
+    if whole_word:
+        args.append("--word-regexp")
+    else:
+        args.append("--fixed-strings")
     if not case_sensitive:
         args.append("--ignore-case")
     args.extend(["--", pattern, fp])
@@ -455,7 +519,9 @@ def rga_search_file(
     except (_sub.TimeoutExpired, OSError):
         return search_file(fp, pattern,
                            case_sensitive=case_sensitive,
-                           threshold=threshold)
+                           threshold=threshold,
+                           whole_word=whole_word,
+                           use_regex=use_regex)
 
     matches: List[Match] = []
     # rga's PDF adapter prefixes each emitted line with "Page N:" (e.g.
@@ -902,14 +968,17 @@ def run_gui() -> int:
             root.geometry(f"{new_w}x{new_h}")
 
     # ── theme + styling ──────────────────────────────────────────────────────
-    _BG = "#f4f5f7"
+    # Light palette pivots toward purple to match the existing dark-mode accent
+    # (#a78bfa). The Search button, focus ring, selection highlight, and chat
+    # "you" tag all draw from the same accent so the brand reads coherently.
+    _BG = "#f6f4fb"
     _CARD_BG = "#ffffff"
-    _BORDER = "#dcdfe3"
+    _BORDER = "#dcd6ea"
     _TEXT = "#1c1e22"
-    _MUTED = "#5f6571"
-    _ACCENT = "#2563eb"
-    _ROW_ALT = "#f7f9fc"
-    _SEL_BG = "#dbeafe"
+    _MUTED = "#6b6580"
+    _ACCENT = "#7c3aed"      # violet-600
+    _ROW_ALT = "#f9f6ff"
+    _SEL_BG = "#ddd4fb"
 
     # Palette dicts for live theme switching. `_T` is the active palette and
     # is referenced by widgets created later in run_gui(). The Mode → Dark/Light
@@ -919,17 +988,17 @@ def run_gui() -> int:
         TEXT=_TEXT, MUTED=_MUTED, ACCENT=_ACCENT,
         ROW_ALT=_ROW_ALT, SEL_BG=_SEL_BG,
         CHAT_BG="#fbf8f1", CHAT_FG="#2b2b2b", CHAT_BORDER="#d8d2c4",
-        CHAT_SEL_BG="#d4e4f7", CHAT_ENTRY_BG="#ffffff",
+        CHAT_SEL_BG="#ddd4fb", CHAT_ENTRY_BG="#ffffff",
         CHAT_DISABLED_BG="#efece4", CHAT_DISABLED_FG="#a8a8a8",
-        TAG_YOU_FG="#0a5cb0", TAG_YOU_BG="#eef4fb",
+        TAG_YOU_FG="#6d28d9", TAG_YOU_BG="#f1ecfd",
         TAG_CLAUDE_FG="#1a6e34", TAG_CLAUDE_BG="#eef7ee",
         TAG_ERR_FG="#a8302b", TAG_ERR_BG="#fdecec",
         TAG_SYS_FG="#8a7f6a",
         TAG_TOOL_FG="#6b3aa0", TAG_TOOL_BG="#f3eefa",
         TAG_TOOL_RES_FG="#0e6a72", TAG_TOOL_RES_BG="#eaf6f7",
         TAG_THINK_FG="#7a7a7a",
-        TIP_BG="#ffffc0", TIP_FG="#1c1e22",
-        BTN_GO_BG="#2563eb", BTN_GO_HOVER="#1d4ed8",
+        TIP_BG="#fff8d6", TIP_FG="#1c1e22",
+        BTN_GO_BG="#7c3aed", BTN_GO_HOVER="#6d28d9",
         BTN_RUN_BG="#f59e0b", BTN_RUN_HOVER="#d97706",
     )
     _DARK_PAL = dict(
@@ -1096,16 +1165,45 @@ def run_gui() -> int:
     msg_q: "queue.Queue[tuple]" = queue.Queue()
 
     # ── top form ─────────────────────────────────────────────────────────────
-    form = ttk.Frame(root, padding=10)
+    # Tightened padding (10 → (10, 6)) so the search bar doesn't dominate the
+    # window at default size. Row 0 (pattern) is the headline input and gets
+    # a slightly heavier font + a focus ring; row 1 (files) and row 2 (opts)
+    # stay compact.
+    form = ttk.Frame(root, padding=(10, 6, 10, 6))
     form.pack(fill="x")
+    form.columnconfigure(1, weight=1)
 
     ttk.Label(form, text="Pattern:").grid(row=0, column=0, sticky="w")
     pattern_var = tk.StringVar(value=str(_gui_state.get("last_pattern", "")))
     _search_history: List[str] = [str(x) for x in _gui_state.get(
         "search_history", [])]  # type: ignore[arg-type]
-    pattern_entry = ttk.Combobox(form, textvariable=pattern_var, values=_search_history,
-                                 justify="right", width=40)
-    pattern_entry.grid(row=0, column=1, sticky="w", padx=4, pady=2)
+    # Wrap the combobox in a 1px frame that doubles as a focus ring (color
+    # swap on FocusIn/FocusOut). ttk on Aqua ignores most border styling on
+    # the widget itself, so the wrapping frame is the only reliable way.
+    _pat_ring = tk.Frame(form, bg=_T["BORDER"],
+                         highlightthickness=0, bd=1)
+    _pat_ring.grid(row=0, column=1, columnspan=2,
+                   sticky="ew", padx=4, pady=2)
+    pattern_entry = ttk.Combobox(
+        _pat_ring, textvariable=pattern_var, values=_search_history,
+        justify="left", font=(_ui_font_family, 13))
+    pattern_entry.pack(fill="x", expand=True, padx=0, pady=0)
+    pattern_entry.bind(
+        "<FocusIn>",
+        lambda _e: _pat_ring.configure(bg=_T["ACCENT"]),
+        add="+")
+    pattern_entry.bind(
+        "<FocusOut>",
+        lambda _e: _pat_ring.configure(bg=_T["BORDER"]),
+        add="+")
+
+    def _clear_pattern() -> None:
+        pattern_var.set("")
+        pattern_entry.focus_set()
+    _pat_clear_btn = ttk.Button(form, text="✕", width=2,
+                                command=_clear_pattern)
+    _pat_clear_btn.grid(row=0, column=3, padx=(2, 2), pady=2)
+    _Tooltip(_pat_clear_btn, "Clear the pattern")
 
     ttk.Label(form, text="Files/folders:").grid(row=1, column=0, sticky="w")
     files_var = tk.StringVar(value=str(_gui_state.get("last_files", "")))
@@ -1171,6 +1269,10 @@ def run_gui() -> int:
         _gui_state.get("case_sensitive", False)))
     recursive_var = tk.BooleanVar(
         value=bool(_gui_state.get("recursive", False)))
+    whole_word_var = tk.BooleanVar(
+        value=bool(_gui_state.get("whole_word", False)))
+    regex_var = tk.BooleanVar(
+        value=bool(_gui_state.get("use_regex", False)))
     # rga is an optional external backend. Disable the toggle when the binary
     # isn't on PATH so the user sees the option exists but knows it needs install.
     rga_var = tk.BooleanVar(
@@ -1178,11 +1280,19 @@ def run_gui() -> int:
 
     _opt_tooltips = [
         ("Case-sensitive", case_var, "Match uppercase/lowercase exactly"),
+        ("Whole word", whole_word_var,
+         "Pattern must match at word boundaries — 'asic' will NOT match 'basic'.\n"
+         "Works for ASCII; Arabic falls back to substring inside the same word."),
+        ("Regex", regex_var,
+         "Pattern is a Python regular expression (re.search per line).\n"
+         "Score is always 100; fuzzy fallback is disabled when this is on.\n"
+         "Invalid regex returns no matches for that file."),
         ("Recursive", recursive_var, "Search subfolders when a folder is given"),
         ("rga engine", rga_var,
          ("Use ripgrep-all (rga) as the search backend. Extends file coverage to "
           "docx, epub, xlsx, sqlite, mkv subtitles, etc.\n"
-          "Trade-off: substring-only (no fuzzy fallback).\n\n"
+          "Trade-off: substring/whole-word only (no fuzzy fallback). Regex mode "
+          "stays in-process even when this box is on.\n\n"
           + ("Detected: " + _RGA_PATH if _RGA_PATH else
              "NOT INSTALLED — run `brew install ripgrep-all` to enable."))),
     ]
@@ -1205,6 +1315,31 @@ def run_gui() -> int:
         _thr_lbl, "Minimum fuzzy similarity score (0 = anything, 100 = exact only)")
     _Tooltip(
         _thr_spin, "Minimum fuzzy similarity score (0 = anything, 100 = exact only)")
+
+    # Engine indicator — small ⓘ pill that, on hover, lists which engines are
+    # actually being used. Demystifies "is this the slow Python path or
+    # rapidfuzz + the C ext?" without cluttering the row.
+    import importlib.util as _iu
+    if _iu.find_spec("fitz") is not None:
+        _pdf_engine = "PyMuPDF (fitz)"
+    elif _iu.find_spec("pdfplumber") is not None:
+        _pdf_engine = "pdfplumber"
+    else:
+        _pdf_engine = "none — install pymupdf"
+    _engine_tip = (
+        f"Active search engines\n"
+        f"  Fuzzy:   {_ENGINE_FUZZY}\n"
+        f"  Arabic:  {_ENGINE_ARABIC}\n"
+        f"  PDF:     {_pdf_engine}\n"
+        f"  rga:     {'available — ' + _RGA_PATH if _RGA_PATH else 'not installed'}\n"
+        f"\nFuzzy is the per-line hot path. The token pre-filter skips\n"
+        f"rapidfuzz on lines that share zero ≥2-char tokens with the\n"
+        f"pattern, which is where most of the speed comes from in big PDFs."
+    )
+    _engine_badge = ttk.Label(opts, text="  ⓘ engine",
+                              foreground=_T["MUTED"], cursor="hand2")
+    _engine_badge.pack(side="left", padx=(8, 0))
+    _Tooltip(_engine_badge, _engine_tip)
 
     # action row
     actions = ttk.Frame(form)
@@ -3458,7 +3593,8 @@ def run_gui() -> int:
     # ── search worker ────────────────────────────────────────────────────────
     def worker(pattern: str, paths: List[str], case_sensitive: bool,
                threshold: int,
-               recursive: bool, rga: bool = False) -> None:
+               recursive: bool, rga: bool = False,
+               whole_word: bool = False, use_regex: bool = False) -> None:
         try:
             files = collect_files(paths, recursive)
             if not files:
@@ -3476,12 +3612,16 @@ def run_gui() -> int:
                         fp, pattern,
                         case_sensitive=case_sensitive,
                         threshold=threshold,
+                        whole_word=whole_word,
+                        use_regex=use_regex,
                     )
                 else:
                     lines, matches = search_file(
                         fp, pattern,
                         case_sensitive=case_sensitive,
                         threshold=threshold,
+                        whole_word=whole_word,
+                        use_regex=use_regex,
                     )
                 if matches:
                     # Stream each file's results immediately so the GUI stays
@@ -3523,6 +3663,8 @@ def run_gui() -> int:
         _gui_state["recursive"] = recursive_var.get()
         _gui_state["threshold"] = threshold_var.get()
         _gui_state["rga_mode"] = rga_var.get()
+        _gui_state["whole_word"] = whole_word_var.get()
+        _gui_state["use_regex"] = regex_var.get()
         _save_state(_gui_state)
         state["searching"] = True
         state["cancel_search"] = False
@@ -3537,15 +3679,22 @@ def run_gui() -> int:
         _opts = (f"case={'on' if case_var.get() else 'off'} "
                  f"thr={threshold_var.get()} "
                  f"recursive={'on' if recursive_var.get() else 'off'} "
-                 f"rga={'on' if rga_var.get() else 'off'}")
+                 f"rga={'on' if rga_var.get() else 'off'} "
+                 f"ww={'on' if whole_word_var.get() else 'off'} "
+                 f"regex={'on' if regex_var.get() else 'off'}")
         _log_activity(f"Search '{pat}' — {len(paths)} path(s)  [{_opts}]")
 
         t = threading.Thread(
             target=worker,
-            args=(pat, paths, case_var.get(),
-                  threshold_var.get(),
-                  recursive_var.get(),
-                  rga_var.get() and bool(_RGA_PATH)),
+            kwargs=dict(
+                pattern=pat, paths=paths,
+                case_sensitive=case_var.get(),
+                threshold=threshold_var.get(),
+                recursive=recursive_var.get(),
+                rga=rga_var.get() and bool(_RGA_PATH),
+                whole_word=whole_word_var.get(),
+                use_regex=regex_var.get(),
+            ),
             daemon=True,
         )
         t.start()
