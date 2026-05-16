@@ -918,6 +918,16 @@ def run_gui() -> int:
         BG=_BG, CARD_BG=_CARD_BG, BORDER=_BORDER,
         TEXT=_TEXT, MUTED=_MUTED, ACCENT=_ACCENT,
         ROW_ALT=_ROW_ALT, SEL_BG=_SEL_BG,
+        CHAT_BG="#fbf8f1", CHAT_FG="#2b2b2b", CHAT_BORDER="#d8d2c4",
+        CHAT_SEL_BG="#d4e4f7", CHAT_ENTRY_BG="#ffffff",
+        CHAT_DISABLED_BG="#efece4", CHAT_DISABLED_FG="#a8a8a8",
+        TAG_YOU_FG="#0a5cb0", TAG_YOU_BG="#eef4fb",
+        TAG_CLAUDE_FG="#1a6e34", TAG_CLAUDE_BG="#eef7ee",
+        TAG_ERR_FG="#a8302b", TAG_ERR_BG="#fdecec",
+        TAG_SYS_FG="#8a7f6a",
+        TAG_TOOL_FG="#6b3aa0", TAG_TOOL_BG="#f3eefa",
+        TAG_TOOL_RES_FG="#0e6a72", TAG_TOOL_RES_BG="#eaf6f7",
+        TAG_THINK_FG="#7a7a7a",
         TIP_BG="#ffffc0", TIP_FG="#1c1e22",
         BTN_GO_BG="#2563eb", BTN_GO_HOVER="#1d4ed8",
         BTN_RUN_BG="#f59e0b", BTN_RUN_HOVER="#d97706",
@@ -926,6 +936,16 @@ def run_gui() -> int:
         BG="#12101e", CARD_BG="#1c1929", BORDER="#2d2842",
         TEXT="#f5f0ff", MUTED="#a39ec5", ACCENT="#a78bfa",
         ROW_ALT="#181626", SEL_BG="#3b2d6e",
+        CHAT_BG="#141220", CHAT_FG="#ddd6f3", CHAT_BORDER="#2d2842",
+        CHAT_SEL_BG="#3b2d6e", CHAT_ENTRY_BG="#1c1929",
+        CHAT_DISABLED_BG="#1e1b2e", CHAT_DISABLED_FG="#5a5470",
+        TAG_YOU_FG="#c4b5fd", TAG_YOU_BG="#241942",
+        TAG_CLAUDE_FG="#5eead4", TAG_CLAUDE_BG="#0f2e29",
+        TAG_ERR_FG="#ff7a7a", TAG_ERR_BG="#3a1717",
+        TAG_SYS_FG="#facc15",
+        TAG_TOOL_FG="#f0abfc", TAG_TOOL_BG="#2a1240",
+        TAG_TOOL_RES_FG="#67e8f9", TAG_TOOL_RES_BG="#0d2738",
+        TAG_THINK_FG="#94a3b8",
         TIP_BG="#2d2842", TIP_FG="#ddd6f3",
         BTN_GO_BG="#3b82f6", BTN_GO_HOVER="#2563eb",
         BTN_RUN_BG="#fbbf24", BTN_RUN_HOVER="#f59e0b",
@@ -1208,13 +1228,52 @@ def run_gui() -> int:
     clear_btn.pack(side="left", padx=2)
     export_btn = ttk.Button(actions, text="Export…", state="disabled")
     export_btn.pack(side="left", padx=2)
+    apikey_btn = ttk.Button(actions, text="API Key…")
+    apikey_btn.pack(side="left", padx=(12, 2))
 
     form.columnconfigure(1, weight=1)
     form.columnconfigure(2, weight=1)
 
-    # ── results table ─────────────────────────────────────────────────────────
-    table_frame = ttk.Frame(root, padding=(10, 0, 10, 0))
-    table_frame.pack(fill="both", expand=True)
+    # ── main split: results table (top pane) and chat (bottom pane) ──────────
+    # A vertical PanedWindow lets the user drag the sash to give more vertical
+    # room to whichever pane they care about. Critically, when the window is
+    # resized small the chat panel can never be clipped off — it just gets
+    # smaller, and the user can drag the sash to grow it back.
+    main_paned = ttk.PanedWindow(root, orient="vertical")
+    main_paned.pack(fill="both", expand=True)
+
+    table_frame = ttk.Frame(main_paned, padding=(10, 0, 10, 0))
+    main_paned.add(table_frame, weight=2)
+    # chat_outer is created (and added as the second pane) here, before any
+    # widgets that want to parent to it (status, selected). The chat header,
+    # input box, and log are populated into chat_outer further down.
+    chat_outer = tk.Frame(main_paned, bg=_BORDER)
+    main_paned.add(chat_outer, weight=1)
+
+    # Floor for the chat pane height. Below this the chat input box gets
+    # crowded out by the status/selected strips. Enforced two ways:
+    #   • initial sashpos placed so chat starts at ~38 % of window height
+    #   • on every <Configure> we clamp the sash so chat ≥ _CHAT_PANE_MIN_PX
+    # User drags are honored as long as they leave at least the floor.
+    _CHAT_PANE_MIN_PX = 220
+    _sash_inited = [False]
+
+    def _ensure_chat_pane_visible(_e: object = None) -> None:
+        with contextlib.suppress(Exception):
+            h = main_paned.winfo_height()
+            if h < _CHAT_PANE_MIN_PX + 80:
+                return  # Window too tiny — let widgets size themselves.
+            if not _sash_inited[0]:
+                target_chat = max(_CHAT_PANE_MIN_PX, int(h * 0.38))
+                main_paned.sashpos(0, h - target_chat)
+                _sash_inited[0] = True
+                return
+            pos = main_paned.sashpos(0)
+            chat_h = h - pos
+            if chat_h < _CHAT_PANE_MIN_PX:
+                main_paned.sashpos(0, max(80, h - _CHAT_PANE_MIN_PX))
+
+    main_paned.bind("<Configure>", _ensure_chat_pane_visible)
 
     columns = ("file", "line", "page", "match", "score", "content")
     tree = ttk.Treeview(table_frame, columns=columns, show="headings")
@@ -1625,32 +1684,10 @@ def run_gui() -> int:
         root.bind("<Command-d>", _toggle_debug_panel)
         root.bind("<Command-0>", lambda _e: _auto_fit(grow_only=False))
 
-    # ── status bar ─────────────────────────────────────────────────────────────
-    # Bottom strip with two lines: live status and selected-row preview.
-    status_panel = tk.Frame(root, bg=_BORDER, padx=1, pady=1)
-    status_panel.pack(fill="x", side="bottom", pady=(2, 0))
-
-    _status_inner = tk.Frame(status_panel, bg=_CARD_BG)
-    _status_inner.pack(fill="x", expand=True)
-
-    _status_lbl = tk.Label(
-        _status_inner, textvariable=status_var, anchor="w",
-        bg=_CARD_BG, fg=_TEXT,
-        font=("Menlo", 11),
-        padx=10, pady=2,
-    )
-    _status_lbl.pack(fill="x", pady=(4, 0))
-    _status_widget_ref[0] = _status_lbl
-    _status_lbl.bind("<Button-1>", _on_status_click)
-
-    _selected_lbl = tk.Label(
-        _status_inner, textvariable=selected_var, anchor="w",
-        bg=_CARD_BG, fg=_MUTED,
-        font=("Menlo", 11),
-        padx=10, pady=2,
-    )
-    _selected_lbl.pack(fill="x", pady=(0, 4))
-    _selected_widget_ref[0] = _selected_lbl
+    # NOTE: status_lbl + _selected_lbl are built later inside the chat input
+    # panel (terminal-style status header + selected hint line + `~/bin ❯`
+    # prompt) so they read as part of the chat textbox rather than as orphaned
+    # strips at the bottom of root.
 
     def _wire_text_shortcuts(widget: tk.Widget, *,
                              allow_edit: bool = True) -> None:
@@ -1708,6 +1745,1565 @@ def run_gui() -> int:
     _wire_text_shortcuts(pattern_entry, allow_edit=True)
     _wire_text_shortcuts(files_entry, allow_edit=True)
 
+    # ── Claude chat panel (packed before table so it always gets its space) ──
+    # Conversational mode: maintains history, auto-grounds answers in the files
+    # listed in the Files/folders field. When that field changes, the
+    # conversation is reset with the new file content as context.
+    _chat_font = (_arabic_font[0] if _arabic_font else "Menlo", 13)
+
+    # chat_outer was created earlier (above the table_frame body) so status +
+    # selected labels could parent to it. Just keep building the chat content.
+
+    # Header row with collapse toggle.
+    # Chat always starts EXPANDED on launch so users see it immediately,
+    # regardless of whether they collapsed it last session. The toggle still
+    # works during the session; only the auto-restore is bypassed.
+    _chat_collapsed = tk.BooleanVar(value=False)
+    chat_header = tk.Frame(chat_outer, bg=_BG)
+    chat_header.pack(fill="x")
+
+    _CHAT_MODEL_OPTIONS = (
+        ("Sonnet 4.6", "claude-sonnet-4-6"),
+        ("Haiku 4.5", "claude-haiku-4-5"),
+        ("Opus 4.7", "claude-opus-4-7"),
+    )
+    _model_label_to_id = {label: mid for label, mid in _CHAT_MODEL_OPTIONS}
+    _model_id_to_label = {mid: label for label, mid in _CHAT_MODEL_OPTIONS}
+    _saved_model_id = str(_gui_state.get("claude_model") or "claude-sonnet-4-6")
+    _chat_model_var = tk.StringVar(
+        value=_model_id_to_label.get(_saved_model_id, "Sonnet 4.6"))
+
+    def _on_model_change(_event: object = None) -> None:
+        _gui_state["claude_model"] = _model_label_to_id.get(
+            _chat_model_var.get(), "claude-sonnet-4-6")
+
+    _chat_model_picker = ttk.Combobox(
+        chat_header, textvariable=_chat_model_var,
+        values=[label for label, _ in _CHAT_MODEL_OPTIONS],
+        state="readonly", width=11,
+    )
+    _chat_model_picker.bind("<<ComboboxSelected>>", _on_model_change)
+    _chat_model_picker.pack(side="right", padx=(4, 4), pady=2)
+    _chat_model_lbl = tk.Label(
+        chat_header, text="Model:", bg=_BG, fg=_TEXT,
+        font=(_ui_font_family, 10),
+    )
+    _chat_model_lbl.pack(side="right", padx=(0, 2))
+
+    # Rate-limit indicator: filled in after each turn from anthropic-ratelimit-*
+    # response headers. Empty until the first chat round completes.
+    _chat_ratelimit_var = tk.StringVar(value="")
+    _chat_ratelimit_lbl = tk.Label(
+        chat_header, textvariable=_chat_ratelimit_var,
+        bg=_BG, fg=_MUTED,
+        font=(_ui_font_family, 10),
+    )
+    _chat_ratelimit_lbl.pack(side="right", padx=(0, 8))
+
+    # ttk.Label (not tk.Button) — macOS Aqua's tk.Button ignores bg and renders
+    # the native white face. ttk.Label honors the TLabel style and so picks up
+    # the dark BG. Click binding (set below) keeps the toggle-on-click behavior.
+    _chat_toggle_btn = tk.Label(
+        chat_header, text="▾ Claude Chat",
+        font=(_ui_font_family, 10, "bold"),
+        bg=_BG, fg=_TEXT,
+        anchor="w", cursor="hand2", padx=6, pady=3,
+    )
+    _chat_toggle_btn.pack(side="left", fill="x", expand=True)
+
+    # Body — the part that gets hidden on collapse.
+    chat_frame = tk.Frame(chat_outer, bg=_BG, padx=6, pady=4)
+
+    def _toggle_chat(_event: object = None) -> None:
+        if _chat_collapsed.get():
+            _chat_collapsed.set(False)
+            chat_frame.pack(fill="both", expand=True)
+            _chat_toggle_btn.config(text="▾ Claude Chat")
+        else:
+            _chat_collapsed.set(True)
+            chat_frame.pack_forget()
+            _chat_toggle_btn.config(text="▸ Claude Chat")
+        _gui_state["chat_collapsed"] = _chat_collapsed.get()
+
+    # Labels have no `command` option — bind click directly.
+    _chat_toggle_btn.bind("<Button-1>", _toggle_chat)
+
+    # Add chat toggle to View menu and bind keyboard shortcut.
+    with contextlib.suppress(Exception):
+        view_menu.add_command(
+            label="Claude Chat",
+            accelerator="Ctrl+Shift+C",
+            command=_toggle_chat,
+        )
+    root.bind_all("<Control-Shift-c>", _toggle_chat)
+    root.bind_all("<Command-Shift-c>", _toggle_chat)
+
+    # Always mount the chat body on launch (we force _chat_collapsed=False above).
+    # fill="both", expand=True so dragging the PanedWindow sash actually grows
+    # the chat log instead of leaving blank space at the bottom of the pane.
+    chat_frame.pack(fill="both", expand=True)
+
+    chat_context_var = tk.StringVar(
+        value="Context: (none — add files above to ground answers)")
+    chat_context_lbl = ttk.Label(chat_frame, textvariable=chat_context_var,
+                                 foreground="#6b6b6b")
+    chat_context_lbl.pack(fill="x", anchor="w", pady=(0, 2))
+
+    _chat_fam, _chat_sz = _chat_font[:2]
+
+    chat_log_wrap = tk.Frame(chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
+    chat_log_wrap.pack(fill="both", expand=True, pady=(0, 4))
+    chat_log = tk.Text(
+        chat_log_wrap, height=5, state="disabled", wrap="word",
+        font=_chat_font,
+        background=_T["CHAT_BG"], foreground=_T["CHAT_FG"],
+        insertbackground=_T["CHAT_FG"], relief="flat", borderwidth=0,
+        padx=10, pady=8,
+        selectbackground=_T["CHAT_SEL_BG"], selectforeground=_T["TEXT"],
+    )
+    chat_log.pack(fill="both", expand=True)
+
+    def _apply_chat_log_tags(t: dict) -> None:
+        """Reconfigure chat log text tags for palette t."""
+        chat_log.tag_config("you", foreground=t["TAG_YOU_FG"],
+                            font=(_chat_fam, _chat_sz, "bold"),
+                            spacing1=6, spacing3=2,
+                            background=t["TAG_YOU_BG"],
+                            lmargin1=8, lmargin2=8, rmargin=8)
+        chat_log.tag_config("claude", foreground=t["TAG_CLAUDE_FG"],
+                            font=(_chat_fam, _chat_sz),
+                            spacing1=6, spacing3=4,
+                            background=t["TAG_CLAUDE_BG"],
+                            lmargin1=8, lmargin2=8, rmargin=8)
+        chat_log.tag_config("err", foreground=t["TAG_ERR_FG"],
+                            font=(_chat_fam, _chat_sz, "bold"),
+                            background=t["TAG_ERR_BG"],
+                            lmargin1=8, lmargin2=8, rmargin=8)
+        chat_log.tag_config("sys", foreground=t["TAG_SYS_FG"],
+                            font=(_chat_fam, _chat_sz, "italic"),
+                            spacing1=2, spacing3=2)
+        chat_log.tag_config("tool", foreground=t["TAG_TOOL_FG"],
+                            font=(_chat_fam, _chat_sz, "bold"),
+                            background=t["TAG_TOOL_BG"],
+                            lmargin1=8, lmargin2=8, rmargin=8,
+                            spacing1=3, spacing3=1)
+        chat_log.tag_config("tool_result", foreground=t["TAG_TOOL_RES_FG"],
+                            font=(_chat_fam, _chat_sz),
+                            background=t["TAG_TOOL_RES_BG"],
+                            lmargin1=8, lmargin2=8, rmargin=8,
+                            spacing1=1, spacing3=4)
+        chat_log.tag_config("thinking", foreground=t["TAG_THINK_FG"],
+                            font=(_chat_fam, _chat_sz, "italic"),
+                            spacing1=2, spacing3=2)
+        chat_log.tag_config("path", foreground=t["TAG_YOU_FG"],
+                            underline=True)
+        chat_log.tag_config("usage", foreground=t["TAG_SYS_FG"],
+                            font=(_chat_fam, max(9, _chat_sz - 1), "italic"),
+                            spacing1=1, spacing3=2,
+                            lmargin1=8, lmargin2=8)
+
+        # Markdown styling — applied by _scan_chat_markdown after each turn.
+        # Higher priority than the role tag (claude/you/...) so the bold/code
+        # styling shows through; raise() runs after tag_config below.
+        chat_log.tag_config("md_bold",
+                            font=(_chat_fam, _chat_sz, "bold"))
+        chat_log.tag_config("md_italic",
+                            font=(_chat_fam, _chat_sz, "italic"))
+        chat_log.tag_config("md_code_inline",
+                            font=("Menlo", max(9, _chat_sz - 1)),
+                            background=t["TAG_TOOL_BG"],
+                            foreground=t["TAG_TOOL_FG"])
+        chat_log.tag_config("md_code_block",
+                            font=("Menlo", max(9, _chat_sz - 1)),
+                            background=t["TAG_TOOL_BG"],
+                            foreground=t["TAG_TOOL_RES_FG"],
+                            lmargin1=20, lmargin2=20, rmargin=12,
+                            spacing1=4, spacing3=4)
+        chat_log.tag_config("md_h1",
+                            font=(_chat_fam, _chat_sz + 4, "bold"),
+                            foreground=t["TAG_CLAUDE_FG"],
+                            spacing1=8, spacing3=4)
+        chat_log.tag_config("md_h2",
+                            font=(_chat_fam, _chat_sz + 2, "bold"),
+                            foreground=t["TAG_CLAUDE_FG"],
+                            spacing1=6, spacing3=3)
+        chat_log.tag_config("md_h3",
+                            font=(_chat_fam, _chat_sz + 1, "bold"),
+                            foreground=t["TAG_YOU_FG"],
+                            spacing1=4, spacing3=2)
+        chat_log.tag_config("md_link",
+                            foreground=t["TAG_YOU_FG"],
+                            underline=True)
+        # Make sure markdown styling wins over role-tag colors/fonts.
+        for _md in ("md_code_block", "md_code_inline", "md_bold", "md_italic",
+                    "md_h1", "md_h2", "md_h3", "md_link"):
+            with contextlib.suppress(Exception):
+                chat_log.tag_raise(_md)
+
+    _apply_chat_log_tags(_T)
+
+    # Track per-link tags so each detected path can be opened independently.
+    _chat_path_links: Dict[str, str] = {}
+    _chat_path_counter = [0]
+    _PATH_RE = re.compile(
+        r"`(/[^`\n]+?)`"             # backtick-quoted absolute path
+        r"|(?<![\w/])(/[\w./\-]+\.[A-Za-z0-9]{1,8})\b"  # bare absolute path
+    )
+
+    def _open_chat_path(path: str) -> None:
+        """Open a path from a chat link with the OS default handler."""
+        import subprocess
+        try:
+            if not os.path.exists(path):
+                _append_chat("err", "error", f"Path no longer exists: {path}")
+                return
+            subprocess.Popen(["open", path])
+            _log_activity(f"Opened from chat: {os.path.basename(path)}")
+        except Exception as exc:
+            _append_chat("err", "error", f"Open failed: {exc}")
+
+    def _scan_chat_paths(start_idx: str) -> None:
+        """Find absolute file paths after start_idx in chat_log and tag them
+        as clickable. Each match gets a fresh per-instance tag bound to its
+        own path so duplicates don't collide."""
+        try:
+            text = chat_log.get(start_idx, "end-1c")
+        except Exception:
+            return
+        for m in _PATH_RE.finditer(text):
+            path = m.group(1) or m.group(2)
+            if not path or not os.path.isabs(path):
+                continue
+            grp = 1 if m.group(1) else 2
+            char_start, char_end = m.start(grp), m.end(grp)
+            try:
+                idx_a = chat_log.index(f"{start_idx}+{char_start}c")
+                idx_b = chat_log.index(f"{start_idx}+{char_end}c")
+            except Exception:
+                continue
+            _chat_path_counter[0] += 1
+            tag_name = f"path_{_chat_path_counter[0]}"
+            chat_log.tag_add("path", idx_a, idx_b)
+            chat_log.tag_add(tag_name, idx_a, idx_b)
+            _chat_path_links[tag_name] = path
+            chat_log.tag_bind(
+                tag_name, "<Button-1>",
+                lambda _e, p=path: _open_chat_path(p))
+            chat_log.tag_bind(
+                tag_name, "<Enter>",
+                lambda _e: chat_log.config(cursor="hand2"))
+            chat_log.tag_bind(
+                tag_name, "<Leave>",
+                lambda _e: chat_log.config(cursor=""))
+
+    # Light markdown rendering applied after each turn ends. Tags `md_*` are
+    # configured in _apply_chat_log_tags; we just stamp them over the right
+    # text ranges so the styling tracks the theme.
+    _MD_CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\n?(.*?)```", re.DOTALL)
+    _MD_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+    _MD_BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
+    _MD_ITALIC = re.compile(r"(?<![\*_\w])\*([^*\n]+?)\*(?!\*)")
+    _MD_HEADER = re.compile(r"^(#{1,3})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+
+    def _tag_range(start_idx: str, char_a: int, char_b: int, tag: str) -> None:
+        try:
+            ia = chat_log.index(f"{start_idx}+{char_a}c")
+            ib = chat_log.index(f"{start_idx}+{char_b}c")
+            chat_log.tag_add(tag, ia, ib)
+        except Exception:
+            pass
+
+    def _scan_chat_markdown(start_idx: str) -> None:
+        """Stamp markdown tags onto chat_log content from start_idx to end."""
+        try:
+            text = chat_log.get(start_idx, "end-1c")
+        except Exception:
+            return
+        chat_log.config(state="normal")
+        try:
+            # Code blocks first — strip later patterns from matching inside.
+            code_block_spans: List[Tuple[int, int]] = []
+            for m in _MD_CODE_BLOCK.finditer(text):
+                _tag_range(start_idx, m.start(1), m.end(1), "md_code_block")
+                code_block_spans.append((m.start(), m.end()))
+
+            def _outside_code(i: int) -> bool:
+                return all(not (a <= i < b) for a, b in code_block_spans)
+
+            for m in _MD_INLINE_CODE.finditer(text):
+                if _outside_code(m.start()):
+                    _tag_range(start_idx, m.start(1), m.end(1), "md_code_inline")
+            for m in _MD_BOLD.finditer(text):
+                if _outside_code(m.start()):
+                    _tag_range(start_idx, m.start(1), m.end(1), "md_bold")
+            for m in _MD_ITALIC.finditer(text):
+                if _outside_code(m.start()):
+                    _tag_range(start_idx, m.start(1), m.end(1), "md_italic")
+            for m in _MD_HEADER.finditer(text):
+                if _outside_code(m.start()):
+                    level = len(m.group(1))
+                    _tag_range(start_idx, m.start(2), m.end(2), f"md_h{level}")
+        finally:
+            chat_log.config(state="disabled")
+
+    # ── unified input panel ─────────────────────────────────────────────────
+    # One bordered terminal-style box that visually groups three lines, top
+    # to bottom:
+    #   ┌──────────────────────────────────────────────────────────────────┐
+    #   │ status    ← what the app is doing right now (search, export, …) │
+    #   │ selected  ← the row the user has clicked in the results table   │
+    #   │ ~/bin ❯ [input area ......................]  [Send] [Reset]    │
+    #   └──────────────────────────────────────────────────────────────────┘
+    # Packed side="bottom" inside chat_frame so pack honors its full height
+    # FIRST and chat_log_wrap (with expand=True) takes the remainder. Result:
+    # the input panel can never be squeezed off-screen, no matter how small
+    # the chat pane gets.
+    chat_input_panel = tk.Frame(
+        chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
+    chat_input_panel.pack(fill="x", side="bottom", pady=(2, 0))
+
+    _input_inner = tk.Frame(chat_input_panel, bg=_T["CHAT_ENTRY_BG"])
+    _input_inner.pack(fill="x", expand=True)
+
+    # Status line (live "what's happening" — search progress, export path,
+    # debug toggles). Amber, monospace, looks like a shell prompt's pre-line.
+    _status_lbl = tk.Label(
+        _input_inner, textvariable=status_var, anchor="w",
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_SYS_FG"],
+        font=("Menlo", 11),
+        padx=10, pady=2,
+    )
+    _status_lbl.pack(fill="x", pady=(4, 0))
+    _status_widget_ref[0] = _status_lbl
+    _status_lbl.bind("<Button-1>", _on_status_click)
+
+    # Selected-row preview. Cyan, slightly indented so it reads as a sub-line.
+    _selected_lbl = tk.Label(
+        _input_inner, textvariable=selected_var, anchor="w",
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_TOOL_RES_FG"],
+        font=("Menlo", 11),
+        padx=10, pady=2,
+    )
+    _selected_lbl.pack(fill="x", pady=(0, 2))
+    _selected_widget_ref[0] = _selected_lbl
+
+    # Thin divider between the info lines and the actual input row, for visual
+    # separation without breaking the "one box" feel.
+    tk.Frame(_input_inner, bg=_T["CHAT_BORDER"], height=1).pack(
+        fill="x", padx=2)
+
+    chat_input_row = tk.Frame(_input_inner, bg=_T["CHAT_ENTRY_BG"])
+    chat_input_row.pack(fill="x")
+    # Outer border around just the input box used to live here; the whole
+    # panel now provides the ring, so the input row is flush against the
+    # status/selected lines above it.
+    chat_entry_wrap = tk.Frame(chat_input_row, bg=_T["CHAT_ENTRY_BG"])
+    chat_entry_wrap.pack(side="left", fill="x", expand=True)
+    # Inner box holds the zsh-style prompt prefix + the Text widget on one row.
+    _chat_input_box = tk.Frame(chat_entry_wrap, bg=_T["CHAT_ENTRY_BG"])
+    _chat_input_box.pack(fill="both", expand=True)
+
+    # Terminal-style prompt: show the project dir, ~-relative if possible.
+    try:
+        _chat_prompt_text = f"~/{_PROJECT_DIR.relative_to(Path.home())} ❯"
+    except ValueError:
+        _chat_prompt_text = f"{_PROJECT_DIR.name} ❯"
+    chat_prompt_lbl = tk.Label(
+        _chat_input_box, text=_chat_prompt_text,
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_CLAUDE_FG"],
+        font=("Menlo", 13, "bold"),
+        padx=10, pady=6, anchor="nw", cursor="hand2",
+    )
+    chat_prompt_lbl.pack(side="left", anchor="n")
+
+    # Multi-line input: Enter sends, Shift+Enter inserts a newline. Behaves
+    # like any real OS text box — selectable, paste-friendly, undo via Cmd+Z.
+    chat_entry = tk.Text(
+        _chat_input_box,
+        height=2, wrap="word",
+        font=_chat_font,
+        background=_T["CHAT_ENTRY_BG"], foreground=_T["CHAT_FG"],
+        insertbackground=_T["CHAT_FG"], relief="flat", borderwidth=0,
+        padx=0, pady=6, undo=True,
+    )
+    chat_entry.pack(side="left", fill="both", expand=True)
+    # Click the prompt → focus the input (matches terminal feel).
+    chat_prompt_lbl.bind("<Button-1>", lambda _e: chat_entry.focus_set())
+
+    def _set_chat_entry_state(s: str) -> None:
+        """Toggle chat_entry between normal/disabled and recolor accordingly.
+        tk.Text doesn't honor disabledbackground/disabledforeground options,
+        so we set the colors explicitly."""
+        with contextlib.suppress(Exception):
+            chat_entry.configure(state=s)
+            if s == "disabled":
+                chat_entry.configure(
+                    background=_T["CHAT_DISABLED_BG"],
+                    foreground=_T["CHAT_DISABLED_FG"])
+            else:
+                chat_entry.configure(
+                    background=_T["CHAT_ENTRY_BG"],
+                    foreground=_T["CHAT_FG"])
+    chat_send_btn = ttk.Button(chat_input_row, text="Send", width=8)
+    chat_send_btn.pack(side="left")
+    chat_reset_btn = ttk.Button(chat_input_row, text="Reset", width=8)
+    chat_reset_btn.pack(side="left", padx=(4, 0))
+
+    _wire_text_shortcuts(chat_log, allow_edit=False)
+    _wire_text_shortcuts(chat_entry, allow_edit=True)
+
+    # ── chat state ───────────────────────────────────────────────────────────
+    # messages: full conversation, including the leading "context" turn pair
+    # if files are loaded. files_sig: signature of the files currently loaded
+    # into context (used to detect when the user changed the file selection).
+    chat_state: Dict[str, object] = {
+        "messages": [],  # List[{"role": ..., "content": ...}]
+        "files_sig": "",
+        "context_files": [],  # List[str]
+        "context_chars": 0,
+    }
+    # Up/Down arrow input history for the chat entry. idx == -1 means
+    # "not navigating" — the entry shows whatever the user is currently typing.
+    _saved_input_history = _gui_state.get("chat_input_history")
+    _chat_input_history: List[str] = [
+        str(x) for x in _saved_input_history if str(x).strip()
+    ] if isinstance(_saved_input_history, list) else []
+    _CHAT_INPUT_HISTORY_CAP = 100
+    _chat_history_state: Dict[str, object] = {"idx": -1, "draft": ""}
+    # Token budgets. We send Claude a tiny *manifest* of loaded files (paths,
+    # line counts, one-line preview) rather than full content — Claude pulls
+    # content on demand via search_in_context + read_file_chunk. This keeps
+    # per-turn input small enough for low rate-limit tiers (e.g. 10K tokens/min).
+    _CHAT_CONTEXT_BUDGET = 20_000    # manifest cap — ~5K tokens of file metadata
+    _CHAT_CONTEXT_WARN = 15_000      # warn once the manifest fills past this
+    _CHAT_MAX_HISTORY = 40           # user/assistant turns kept after the context pair
+    _CHAT_TOOL_ROUNDS = 8            # max tool-use rounds per turn
+    _CHAT_MAX_TOKENS = 16_384        # response cap per round
+    _CHAT_THINKING_BUDGET = 10_000   # extended-thinking token budget
+    _CHAT_TOOL_RESULT_CAP = 8_000    # max chars of tool output fed back (~2K tokens — sized for Free-tier 10K/min cap)
+    # default fuzzy threshold for search_in_context
+    _CHAT_SEARCH_DEFAULT_THRESHOLD = 70
+    _CHAT_SEARCH_DEFAULT_MAX = 50         # default match cap for search_in_context
+
+    # ── Claude system tools ───────────────────────────────────────────────────
+    # Claude can operate on any path on the system. If an operation is denied
+    # due to permissions, the tool asks the user whether to retry as admin.
+    _CHAT_TOOLS = [
+        {
+            "name": "list_results",
+            "description": "List files found by the most recent fuzzer search, "
+                           "with per-file match counts and sample matched lines.",
+            "input_schema": {"type": "object", "properties": {}, "required": []},
+        },
+        {
+            "name": "read_file_chunk",
+            "description": "Read a slice of any text file on the system. "
+                           "Use 1-based line numbers. Returns lines prefixed with "
+                           "their number.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "description": "1-based first line (default 1)"},
+                    "max_lines": {"type": "integer", "description": "max lines to return (default 200, max 1000)"},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "search_in_context",
+            "description": "Fuzzy-search the user's currently loaded files (the "
+                           "ones listed in the manifest at the start of the chat) "
+                           "for a phrase. Returns matching lines with [p.N L42] "
+                           "tags so you know where to read. Use this FIRST when "
+                           "answering questions — it's much cheaper than reading "
+                           "files whole.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "phrase to search for"},
+                    "exact": {"type": "boolean", "description": "disable fuzzy fallback — substring matches only (default false)"},
+                    "whole_word": {"type": "boolean", "description": "require whole-word match — 'asic' will NOT match 'basic' (default false)"},
+                    "threshold": {"type": "integer", "description": "fuzzy score 0-100 (default 70)"},
+                    "max_results": {"type": "integer", "description": "max matches to return (default 50, max 500)"},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "write_file",
+            "description": "Write (overwrite) any file on the system with new content. "
+                           "Parent directories are created automatically. "
+                           "If permission is denied, the user will be asked to approve admin access.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
+            "name": "append_to_file",
+            "description": "Append content to a file (creates it if missing). "
+                           "Parent directories are created automatically.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
+            "name": "create_directory",
+            "description": "Create a directory (and any missing parents). "
+                           "Safe to call if the directory already exists.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "delete_path",
+            "description": "Delete a file or directory. Pass recursive=true to delete "
+                           "a non-empty directory and all its contents.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "recursive": {"type": "boolean", "description": "delete directory contents recursively (default false)"},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "copy_file",
+            "description": "Copy a file or directory tree from src to dst.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                },
+                "required": ["src", "dst"],
+            },
+        },
+        {
+            "name": "move_file",
+            "description": "Move or rename a file or directory.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                },
+                "required": ["src", "dst"],
+            },
+        },
+        {
+            "name": "run_command",
+            "description": "Run a shell command and return its stdout + stderr. "
+                           "Runs in the system shell (sh on Unix). "
+                           "Use working_dir to set the working directory. "
+                           "Commands that need administrator/root access will prompt the user. "
+                           "Timeout is 60 seconds by default.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "working_dir": {"type": "string", "description": "directory to run in (default: project root)"},
+                    "timeout": {"type": "integer", "description": "seconds before timeout (default 60, max 300)"},
+                    "as_admin": {"type": "boolean", "description": "request elevated/admin privileges (default false)"},
+                },
+                "required": ["command"],
+            },
+        },
+    ]
+
+    # ── admin elevation helper ────────────────────────────────────────────────
+
+    def _ask_admin(action: str) -> bool:
+        return messagebox.askyesno(
+            "Permission denied",
+            f"Administrator privileges are needed to:\n\n  {action}\n\n"
+            "Try again as administrator?",
+            icon="warning",
+        )
+
+    def _run_elevated(command: str, working_dir: str) -> Tuple[int, str]:
+        """Run a command elevated via sudo prompt. Returns (exit_code, combined_output)."""
+        import subprocess
+        try:
+            parts = ["sudo", "--", "sh", "-c", command]
+            r = subprocess.run(
+                parts, capture_output=True, text=True,
+                timeout=120, cwd=working_dir,
+            )
+            return r.returncode, (r.stdout + r.stderr).strip()
+        except Exception as e:
+            return 1, str(e)
+
+    # ── tool implementations ──────────────────────────────────────────────────
+
+    def _tool_list_results() -> str:
+        results = state.get("results", {})  # type: ignore[assignment]
+        if not results:
+            return ("No search results loaded. Run a search first "
+                    "(the user can do this; you cannot trigger it).")
+        out = []
+        for fp, (_lines, matches) in results.items():  # type: ignore[misc]
+            sample = []
+            for m in matches[:5]:
+                pg = f" p.{m.page_num}" if m.page_num else ""
+                sample.append(f"L{m.line_num}{pg} (score={m.score}): "
+                              f"{m.line.strip()[:120]}")
+            out.append({
+                "path": fp,
+                "match_count": len(matches),
+                "samples": sample,
+            })
+        import json as _json
+        return _json.dumps(out, ensure_ascii=False, indent=2)
+
+    def _tool_search_in_context(query: str, exact: bool = False,
+                                threshold: int = _CHAT_SEARCH_DEFAULT_THRESHOLD,
+                                max_results: int = _CHAT_SEARCH_DEFAULT_MAX,
+                                whole_word: bool = False) -> str:
+        """Fuzzy-search the user's loaded files. Reuses search_file() so the
+        results match what the user sees in the GUI."""
+        if not query:
+            return "error: query is required"
+        paths = chat_state.get("context_files", []) or []
+        if not paths:
+            return ("No files loaded into context. Ask the user to add paths "
+                    "to the Files/folders entry above.")
+        max_results = max(
+            1, min(int(max_results or _CHAT_SEARCH_DEFAULT_MAX), 500))
+        threshold = max(
+            0, min(int(threshold or _CHAT_SEARCH_DEFAULT_THRESHOLD), 100))
+        hits: List[str] = []
+        per_file_counts: Dict[str, int] = {}
+        for fp in paths:  # type: ignore[union-attr]
+            _lines, matches = search_file(
+                fp, query,
+                case_sensitive=False,
+                threshold=threshold,
+            )
+            per_file_counts[fp] = len(matches)
+            for m in matches:
+                tag = (f"[p.{m.page_num} L{m.line_num}]"
+                       if m.page_num else f"[L{m.line_num}]")
+                snippet = m.line.strip()[:200]
+                hits.append(
+                    f"{os.path.basename(fp)} {tag} (score {m.score}): {snippet}")
+                if len(hits) >= max_results:
+                    break
+            if len(hits) >= max_results:
+                break
+        total_matches = sum(per_file_counts.values())
+        files_with_hits = sum(1 for c in per_file_counts.values() if c)
+        if not hits:
+            return (f"no matches for {query!r} "
+                    f"(threshold={threshold}, exact={bool(exact)}, "
+                    f"whole_word={bool(whole_word)}) "
+                    f"across {len(paths)} loaded file(s)")
+        truncated_note = ""
+        if total_matches > len(hits):
+            truncated_note = (f"\n… (+{total_matches - len(hits)} more matches "
+                              f"not shown — raise max_results or narrow query)")
+        header = (f"{len(hits)} of {total_matches} match(es) across "
+                  f"{files_with_hits} file(s):\n")
+        return header + "\n".join(hits) + truncated_note
+
+    def _tool_read_chunk(path: str, start_line: int = 1, max_lines: int = 200) -> str:
+        if not path:
+            return "error: path is required"
+        max_lines = max(1, min(int(max_lines or 200), 1000))
+        start_line = max(1, int(start_line or 1))
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+        except Exception as e:
+            return f"error reading {path}: {type(e).__name__}: {e}"
+        chunk = all_lines[start_line - 1: start_line - 1 + max_lines]
+        if not chunk:
+            return (f"(empty — file has {len(all_lines)} lines, "
+                    f"requested start_line={start_line})")
+        body = "".join(f"{start_line + i}: {ln}" for i, ln in enumerate(chunk))
+        suffix = ""
+        if start_line - 1 + max_lines < len(all_lines):
+            suffix = f"\n… (file has {len(all_lines)} lines total)"
+        return body + suffix
+
+    def _resolve_tool_path(path: str) -> str:
+        """Resolve a relative path the chat tools were given against the
+        project directory (/Users/salman/bin). Absolute paths and ~-paths
+        are honored as-is."""
+        if not path:
+            return path
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = _PROJECT_DIR / p
+        return str(p)
+
+    def _tool_write(path: str, content: str, append: bool = False) -> str:
+        if not path:
+            return "error: path is required"
+        path = _resolve_tool_path(path)
+        mode = "a" if append else "w"
+        verb = "appended" if append else "wrote"
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, mode, encoding="utf-8") as f:
+                f.write(content)
+            return f"{verb} {len(content)} chars to {path}"
+        except PermissionError:
+            if _ask_admin(f"{'append to' if append else 'write'} {path}"):
+                import tempfile
+                tmp = tempfile.mktemp(suffix=".txt")
+                try:
+                    Path(tmp).write_text(content, encoding="utf-8")
+                    import subprocess
+                    subprocess.run(
+                        ["sudo", "cp" if not append else "sh", tmp, path],
+                        timeout=60,
+                    )
+                    return f"{verb} {len(content)} chars to {path} (as admin)"
+                except Exception as e:
+                    return f"error (elevated): {e}"
+                finally:
+                    with contextlib.suppress(OSError):
+                        Path(tmp).unlink()
+            return f"error: permission denied writing {path}"
+        except Exception as e:
+            return f"error writing {path}: {type(e).__name__}: {e}"
+
+    def _tool_create_dir(path: str) -> str:
+        if not path:
+            return "error: path is required"
+        path = _resolve_tool_path(path)
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            return f"created directory: {path}"
+        except PermissionError:
+            if _ask_admin(f"create directory {path}"):
+                import subprocess
+                subprocess.run(["sudo", "mkdir", "-p", path], timeout=60)
+                return f"created directory (as admin): {path}"
+            return f"error: permission denied creating {path}"
+        except Exception as e:
+            return f"error: {type(e).__name__}: {e}"
+
+    def _tool_delete(path: str, recursive: bool = False) -> str:
+        if not path:
+            return "error: path is required"
+        path = _resolve_tool_path(path)
+        p = Path(path)
+        try:
+            if p.is_dir():
+                if recursive:
+                    import shutil
+                    shutil.rmtree(path)
+                else:
+                    p.rmdir()
+            else:
+                p.unlink()
+            return f"deleted: {path}"
+        except PermissionError:
+            if _ask_admin(f"delete {path}"):
+                import subprocess
+                cmd = ["sudo", "rm", "-rf" if recursive else "-f", path]
+                subprocess.run(cmd, timeout=60)
+                return f"deleted (as admin): {path}"
+            return f"error: permission denied deleting {path}"
+        except Exception as e:
+            return f"error: {type(e).__name__}: {e}"
+
+    def _tool_copy(src: str, dst: str) -> str:
+        if not src or not dst:
+            return "error: src and dst are required"
+        src = _resolve_tool_path(src)
+        dst = _resolve_tool_path(dst)
+        import shutil
+        try:
+            if Path(src).is_dir():
+                shutil.copytree(src, dst)
+            else:
+                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            return f"copied {src} → {dst}"
+        except Exception as e:
+            return f"error: {type(e).__name__}: {e}"
+
+    def _tool_move(src: str, dst: str) -> str:
+        if not src or not dst:
+            return "error: src and dst are required"
+        src = _resolve_tool_path(src)
+        dst = _resolve_tool_path(dst)
+        import shutil
+        try:
+            Path(dst).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(src, dst)
+            return f"moved {src} → {dst}"
+        except PermissionError:
+            if _ask_admin(f"move {src} → {dst}"):
+                import subprocess
+                subprocess.run(["sudo", "mv", src, dst], timeout=60)
+                return f"moved (as admin): {src} → {dst}"
+            return f"error: permission denied moving {src}"
+        except Exception as e:
+            return f"error: {type(e).__name__}: {e}"
+
+    def _tool_run_command(
+        command: str,
+        working_dir: str = "",
+        timeout: int = 60,
+        as_admin: bool = False,
+    ) -> str:
+        if not command:
+            return "error: command is required"
+        import subprocess
+        cwd = working_dir or str(Path(_script_dir))
+        timeout = max(1, min(int(timeout or 60), 300))
+        if as_admin:
+            if not _ask_admin(f"run: {command}"):
+                return "cancelled: user declined admin access"
+            code, out = _run_elevated(command, cwd)
+            return out or f"(exited {code})"
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+                encoding="utf-8",
+                errors="replace",
+            )
+            out = (r.stdout + r.stderr).strip()
+            if r.returncode != 0 and "denied" in out.lower():
+                if _ask_admin(f"run: {command}"):
+                    code, out2 = _run_elevated(command, cwd)
+                    return out2 or f"(exited {code})"
+            return out or f"(exited {r.returncode})"
+        except subprocess.TimeoutExpired:
+            return f"error: command timed out after {timeout}s"
+        except Exception as e:
+            return f"error: {type(e).__name__}: {e}"
+
+    def _dispatch_tool(name: str, args: dict) -> str:
+        if name == "list_results":
+            return _tool_list_results()
+        if name == "read_file_chunk":
+            return _tool_read_chunk(
+                args.get("path", ""),
+                args.get("start_line", 1),
+                args.get("max_lines", 200),
+            )
+        if name == "search_in_context":
+            return _tool_search_in_context(
+                args.get("query", ""),
+                bool(args.get("exact", False)),
+                int(args.get("threshold", _CHAT_SEARCH_DEFAULT_THRESHOLD)),
+                int(args.get("max_results", _CHAT_SEARCH_DEFAULT_MAX)),
+                whole_word=bool(args.get("whole_word", False)),
+            )
+        if name == "write_file":
+            return _tool_write(args.get("path", ""), args.get("content", ""),
+                               append=False)
+        if name == "append_to_file":
+            return _tool_write(args.get("path", ""), args.get("content", ""),
+                               append=True)
+        if name == "create_directory":
+            return _tool_create_dir(args.get("path", ""))
+        if name == "delete_path":
+            return _tool_delete(args.get("path", ""),
+                                bool(args.get("recursive", False)))
+        if name == "copy_file":
+            return _tool_copy(args.get("src", ""), args.get("dst", ""))
+        if name == "move_file":
+            return _tool_move(args.get("src", ""), args.get("dst", ""))
+        if name == "run_command":
+            return _tool_run_command(
+                args.get("command", ""),
+                args.get("working_dir", ""),
+                int(args.get("timeout", 60)),
+                bool(args.get("as_admin", False)),
+            )
+        return f"unknown tool: {name}"
+
+    def _update_chat_state() -> None:
+        _set_chat_entry_state("normal")
+        chat_send_btn.config(state="normal")
+        chat_reset_btn.config(state="normal")
+
+    def _append_chat(tag: str, prefix: str, text: str) -> None:
+        chat_log.config(state="normal")
+        start = chat_log.index("end-1c")
+        chat_log.insert("end", f"{prefix}: {text}\n", tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+        _scan_chat_paths(start)
+        _scan_chat_markdown(start)
+
+    # Cumulative token usage for this session — written by the chat worker,
+    # rendered after each Claude turn by _show_chat_usage().
+    _chat_session_usage: Dict[str, int] = {
+        "input": 0, "output": 0, "cache_read": 0, "cache_create": 0,
+        "turns": 0,
+    }
+
+    def _show_chat_usage(turn: dict, session: dict) -> None:
+        """Append a small italic 'usage' line after a Claude turn ends.
+        Shows this turn's token spend plus running session totals so the
+        user can keep an eye on rate-limit pressure."""
+        def _fmt(d: dict) -> str:
+            parts = [f"in {d.get('input', 0):,}",
+                     f"out {d.get('output', 0):,}"]
+            if d.get("cache_read"):
+                parts.append(f"cache {d['cache_read']:,} read")
+            if d.get("cache_create"):
+                parts.append(f"cache {d['cache_create']:,} new")
+            return "  ·  ".join(parts)
+
+        line = (f"📊  this turn: {_fmt(turn)}  tok"
+                f"   ·   session ({session.get('turns', 0)} turns): "
+                f"{_fmt(session)}  tok\n")
+        chat_log.config(state="normal")
+        chat_log.insert("end", line, "usage")
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+
+    # Inline streaming helpers: write a prefix once, then append deltas, then
+    # finish with newline. Lets text appear character-by-character while
+    # Claude is still generating. _turn_start tracks where the current turn
+    # began so we can scan the whole turn for clickable paths at end.
+    _turn_start: Dict[str, str] = {}
+
+    def _chat_begin_turn(tag: str, prefix: str) -> None:
+        chat_log.config(state="normal")
+        _turn_start[tag] = chat_log.index("end-1c")
+        chat_log.insert("end", f"{prefix}: ", tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+
+    def _chat_append_text(tag: str, text: str) -> None:
+        chat_log.config(state="normal")
+        chat_log.insert("end", text, tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+
+    def _chat_end_turn(tag: str) -> None:
+        chat_log.config(state="normal")
+        chat_log.insert("end", "\n", tag)
+        chat_log.see("end")
+        chat_log.config(state="disabled")
+        start = _turn_start.pop(tag, None)
+        if start is not None:
+            _scan_chat_paths(start)
+            _scan_chat_markdown(start)
+
+    # Animated "claude is thinking…" indicator. Insert returns a handle; pass
+    # it back to _stop_thinking() to remove the line when the response lands.
+    _thinking_handles: Dict[str, dict] = {}
+
+    _thinking_counter = [0]
+
+    def _start_thinking(label: str = "claude is thinking") -> str:
+        _thinking_counter[0] += 1
+        handle_id = f"thk_{_thinking_counter[0]}"
+        chat_log.config(state="normal")
+        start_idx = chat_log.index("end-1c")
+        chat_log.insert("end", f"{label}\n", "thinking")
+        chat_log.config(state="disabled")
+        chat_log.see("end")
+        info = {"start": start_idx, "label": label, "alive": True, "dots": 0}
+        _thinking_handles[handle_id] = info
+
+        def _tick():
+            if not info["alive"]:
+                return
+            info["dots"] = (info["dots"] + 1) % 4
+            dots = "." * info["dots"] + " " * (3 - info["dots"])
+            chat_log.config(state="normal")
+            line_end = f"{info['start']} lineend"
+            chat_log.delete(info["start"], line_end)
+            chat_log.insert(info["start"], f"{label}{dots}", "thinking")
+            chat_log.config(state="disabled")
+            root.after(350, _tick)
+
+        root.after(350, _tick)
+        return handle_id
+
+    def _stop_thinking(handle_id: str) -> None:
+        info = _thinking_handles.pop(handle_id, None)
+        if not info:
+            return
+        info["alive"] = False
+        try:
+            chat_log.config(state="normal")
+            # Remove the entire line (the indicator + its trailing newline).
+            chat_log.delete(info["start"], f"{info['start']} lineend +1c")
+            chat_log.config(state="disabled")
+        except Exception:
+            pass
+
+    def _update_chat_context_label() -> None:
+        included = chat_state["context_files"]  # type: ignore[index]
+        chars = int(chat_state["context_chars"])  # type: ignore[arg-type]
+        if included:
+            names = ", ".join(os.path.basename(p)
+                              # type: ignore[union-attr]
+                              for p in included[:3])
+            if len(included) > 3:  # type: ignore[arg-type]
+                # type: ignore[arg-type]
+                names += f" + {len(included) - 3} more"
+            chat_context_var.set(
+                f"Context: {names}  ·  {chars/1000:.1f}k chars")
+        else:
+            chat_context_var.set(
+                "Context: (none — add files above to ground answers)")
+
+    def _build_chat_context(paths: List[str], recursive: bool
+                            ) -> Tuple[str, List[str], int, int]:
+        """Build a *manifest* of the user's selected files — just paths,
+        sizes, and a one-line preview. Claude reads actual content on demand
+        via the search_in_context and read_file_chunk tools, which keeps the
+        per-turn input small enough for low rate-limit tiers.
+        Returns (manifest, included_paths, total_chars, total_files)."""
+        files = collect_files(paths, recursive)
+        total = len(files)
+        entries: List[str] = []
+        included: List[str] = []
+        used = 0
+        for fp in files:
+            if used >= _CHAT_CONTEXT_BUDGET:
+                break
+            lines = read_lines(fp)
+            if not lines:
+                continue
+            pg_map = _pdf_page_map.get(fp, [])
+            n_lines = len(lines)
+            n_pages = max(pg_map) if pg_map else 0
+            # First non-empty line as a preview
+            preview = next((ln.strip() for ln in lines[:20] if ln.strip()), "")
+            if len(preview) > 140:
+                preview = preview[:140] + "…"
+            meta_bits = [f"{n_lines} lines"]
+            if n_pages:
+                meta_bits.append(f"{n_pages} pages")
+            entry = (
+                f"- {os.path.basename(fp)} "
+                f"({', '.join(meta_bits)})\n"
+                f"  path: {fp}\n"
+                f"  preview: {preview}\n"
+            )
+            if used + len(entry) > _CHAT_CONTEXT_BUDGET:
+                break
+            entries.append(entry)
+            included.append(fp)
+            used += len(entry)
+        return "".join(entries), included, used, total
+
+    def _reset_chat(_event: object = None) -> None:
+        chat_state["messages"] = []
+        chat_state["files_sig"] = ""
+        chat_state["context_files"] = []
+        chat_state["context_chars"] = 0
+        chat_log.config(state="normal")
+        chat_log.delete("1.0", "end")
+        chat_log.config(state="disabled")
+        _update_chat_context_label()
+        _append_chat("sys", "system", "Conversation reset.")
+        _log_activity("Chat conversation reset")
+
+    def _send_chat(_event: object = None) -> str:
+        msg = chat_entry.get("1.0", "end-1c").strip()
+        if not msg:
+            return "break"
+        api_key = str(_gui_state.get("api_key")
+                      or os.environ.get("ANTHROPIC_API_KEY") or "")
+        if not api_key:
+            _append_chat("err", "error",
+                         "No API key — click 'API Key…' to set your Anthropic key.")
+            _log_activity("Chat blocked — no API key")
+            return "break"
+        if msg in _chat_input_history:
+            _chat_input_history.remove(msg)
+        _chat_input_history.insert(0, msg)
+        del _chat_input_history[_CHAT_INPUT_HISTORY_CAP:]
+        _gui_state["chat_input_history"] = _chat_input_history
+        _chat_history_state["idx"] = -1
+        _chat_history_state["draft"] = ""
+        chat_entry.delete("1.0", "end")
+        _append_chat("you", "you", msg)
+        _log_activity(f"Chat sent: {msg[:80]}{'…' if len(msg) > 80 else ''}")
+        _set_chat_entry_state("disabled")
+        chat_send_btn.config(state="disabled")
+        chat_reset_btn.config(state="disabled")
+
+        # If the Files/folders selection changed (or this is the first turn
+        # with files), rebuild file context and reset the conversation.
+        paths = parse_files_field(files_var.get())
+        sig = "\0".join(sorted(paths))
+        if paths and sig != chat_state["files_sig"]:
+            _append_chat("sys", "system", "Loading files into context…")
+            body, included, used, total_found = _build_chat_context(
+                paths, recursive_var.get())
+            chat_state["files_sig"] = sig
+            chat_state["context_files"] = included
+            chat_state["context_chars"] = used
+            if body:
+                chat_state["messages"] = [
+                    {
+                        "role": "user",
+                        "content": (
+                            "I'll ask you questions about my files. Below is a "
+                            "manifest of what's loaded — paths, sizes, and a "
+                            "one-line preview. To answer, use the "
+                            "search_in_context tool to find relevant lines, "
+                            "then read_file_chunk to read more around a hit. "
+                            "Cite line tags like [L42] or [p.3 L42] when "
+                            "quoting passages.\n\n"
+                            "MANIFEST:\n"
+                            + body
+                        ),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"Manifest received: {len(included)} file(s). "
+                            f"I'll search and read on demand using tools "
+                            f"instead of loading full content. Ask away."
+                        ),
+                    },
+                ]
+                # Manifest is small (paths + previews only) so this rarely
+                # trips, but warn if the user selected enough files to overflow.
+                approx_tokens = used // 4
+                files_skipped = max(0, total_found - len(included))
+                if used >= _CHAT_CONTEXT_BUDGET:
+                    _append_chat("err", "warning",
+                                 f"Manifest budget full "
+                                 f"({used:,}/{_CHAT_CONTEXT_BUDGET:,} chars, "
+                                 f"~{approx_tokens:,} tokens) — "
+                                 f"{files_skipped} file(s) not listed. "
+                                 f"Claude can still reach them by exact path "
+                                 f"via read_file_chunk if you mention them.")
+                elif used >= _CHAT_CONTEXT_WARN:
+                    pct = used * 100 // _CHAT_CONTEXT_BUDGET
+                    _append_chat("sys", "note",
+                                 f"Large manifest: {used:,} chars "
+                                 f"(~{approx_tokens:,} tokens, {pct}% of budget). "
+                                 f"Content is still fetched lazily.")
+            else:
+                chat_state["messages"] = []
+            _update_chat_context_label()
+
+        # Build the request payload (cap history but always keep the leading
+        # context turn pair so file content stays available across many turns).
+        history = list(chat_state["messages"])  # type: ignore[arg-type]
+        if chat_state["context_files"]:
+            head = history[:2]
+            tail = history[2:][-_CHAT_MAX_HISTORY:]
+            messages = head + tail + [{"role": "user", "content": msg}]
+        else:
+            tail = history[-_CHAT_MAX_HISTORY:]
+            messages = tail + [{"role": "user", "content": msg}]
+
+        def _worker() -> None:
+            try:
+                import anthropic as _ant
+                client = _ant.Anthropic(api_key=api_key)
+                system_prompt = (
+                    "You are a research assistant embedded in a file-search tool.\n\n"
+                    "FILE ACCESS — IMPORTANT:\n"
+                    "When the user loads files, you receive a MANIFEST (paths, "
+                    "line counts, one-line previews) — NOT the file content. "
+                    "Read content lazily, on demand, using tools. This keeps "
+                    "the per-turn input small enough for tight API rate limits.\n\n"
+                    "Strategy:\n"
+                    "  1. Use search_in_context FIRST to find relevant lines "
+                    "across all loaded files (cheap and broad).\n"
+                    "  2. Use read_file_chunk to read a focused range around "
+                    "any hit that needs more context.\n"
+                    "  3. Cite line tags like [L42] or [p.3 L42] when quoting "
+                    "passages so the user can jump to them.\n"
+                    "  4. Avoid reading whole files. Pull only what you need.\n\n"
+                    "Tools available:\n"
+                    "  • search_in_context — fuzzy search across loaded files (start here)\n"
+                    "  • read_file_chunk — read a specific line range from one file\n"
+                    "  • list_results — see files the user's last (non-AI) search hit\n"
+                    "  • write_file / append_to_file — produce summaries, extracts, scripts\n"
+                    "  • create_directory / delete_path / copy_file / move_file — file ops\n"
+                    "  • run_command — run shell commands\n\n"
+                    f"OUTPUT DIRECTORY: When you write files, save them under "
+                    f"{_PROJECT_DIR} by default. Use a plain filename or a "
+                    "relative path (e.g. `notes.md`, `out/summary.txt`) — the "
+                    "tool resolves it against that directory automatically. "
+                    "Only use an absolute path when the user explicitly asks "
+                    "you to write somewhere else.\n\n"
+                    "If the user asks a general question that doesn't need their "
+                    "files, answer directly without calling tools."
+                )
+
+                current = list(messages)
+                final_text_parts: List[str] = []
+                turn_usage = {"input": 0, "output": 0,
+                              "cache_read": 0, "cache_create": 0}
+                # mutable so the lambda below can read it
+                think_box = {"id": None}
+
+                def _begin_think(label: str) -> None:
+                    think_box["id"] = _start_thinking(label)
+
+                def _end_think() -> None:
+                    if think_box["id"]:
+                        _stop_thinking(think_box["id"])
+                        think_box["id"] = None
+
+                for _round in range(_CHAT_TOOL_ROUNDS):
+                    label = ("claude is thinking" if _round == 0
+                             else f"claude is working (round {_round + 1})")
+                    root.after(0, _begin_think, label)
+
+                    # Streaming state for this round
+                    text_for_round: List[str] = []
+                    text_turn_open = [False]
+                    thinking_turn_open = [False]
+
+                    def _close_open_turns() -> None:
+                        if thinking_turn_open[0]:
+                            _chat_end_turn("thinking")
+                            thinking_turn_open[0] = False
+                        if text_turn_open[0]:
+                            _chat_end_turn("claude")
+                            text_turn_open[0] = False
+
+                    # Try with extended thinking enabled (interleaved with tools,
+                    # via beta header). If the API rejects it on enter, fall
+                    # back to a plain streaming call.
+                    def _open_stream(with_thinking: bool):
+                        model_id = str(_gui_state.get("claude_model")
+                                       or "claude-sonnet-4-6")
+                        kwargs = dict(
+                            model=model_id,
+                            max_tokens=_CHAT_MAX_TOKENS,
+                            system=system_prompt,
+                            tools=_CHAT_TOOLS,
+                            messages=current,
+                        )
+                        if with_thinking:
+                            kwargs["thinking"] = {
+                                "type": "enabled",
+                                "budget_tokens": _CHAT_THINKING_BUDGET}
+                            kwargs["extra_headers"] = {
+                                "anthropic-beta": "interleaved-thinking-2025-05-14"
+                            }
+                        return client.messages.stream(**kwargs)
+
+                    def _capture_ratelimit(stream_obj) -> None:
+                        """Pull anthropic-ratelimit-* headers off the live
+                        stream's response and push a one-line summary to the
+                        chat header. Best-effort; the SDK exposes the response
+                        via a few different attributes depending on version."""
+                        try:
+                            resp = (getattr(stream_obj, "response", None)
+                                    or getattr(stream_obj, "_response", None))
+                            if resp is None:
+                                return
+                            h = getattr(resp, "headers", None) or {}
+                            def _g(k: str) -> str:
+                                v = h.get(k) if hasattr(h, "get") else None
+                                return str(v) if v is not None else ""
+                            in_rem = _g("anthropic-ratelimit-input-tokens-remaining")
+                            in_lim = _g("anthropic-ratelimit-input-tokens-limit")
+                            out_rem = _g("anthropic-ratelimit-output-tokens-remaining")
+                            out_lim = _g("anthropic-ratelimit-output-tokens-limit")
+                            req_rem = _g("anthropic-ratelimit-requests-remaining")
+
+                            def _fmt(n: str) -> str:
+                                try:
+                                    v = int(n)
+                                    if v >= 1_000_000:
+                                        return f"{v/1_000_000:.1f}M"
+                                    if v >= 1000:
+                                        return f"{v/1000:.1f}k"
+                                    return str(v)
+                                except (TypeError, ValueError):
+                                    return n or "?"
+                            parts = []
+                            if in_rem and in_lim:
+                                parts.append(f"in {_fmt(in_rem)}/{_fmt(in_lim)}")
+                            if out_rem and out_lim:
+                                parts.append(f"out {_fmt(out_rem)}/{_fmt(out_lim)}")
+                            if req_rem:
+                                parts.append(f"req {_fmt(req_rem)}")
+                            label = " · ".join(parts)
+                            if label:
+                                root.after(0,
+                                           lambda lbl=label:
+                                               _chat_ratelimit_var.set(lbl))
+                        except Exception:
+                            pass
+
+                    def _consume_stream(with_thinking: bool):
+                        text_for_round.clear()
+                        with _open_stream(with_thinking=with_thinking) as _s:
+                            for event in _s:
+                                etype = getattr(event, "type", None)
+                                if etype == "content_block_start":
+                                    cb = getattr(event, "content_block", None)
+                                    cbt = getattr(cb, "type", None)
+                                    if cbt == "thinking":
+                                        root.after(0, _end_think)
+                                        root.after(0, _chat_begin_turn,
+                                                   "thinking", "💭 thinking")
+                                        thinking_turn_open[0] = True
+                                    elif cbt == "text":
+                                        root.after(0, _end_think)
+                                        if thinking_turn_open[0]:
+                                            root.after(
+                                                0, _chat_end_turn, "thinking")
+                                            thinking_turn_open[0] = False
+                                        root.after(0, _chat_begin_turn,
+                                                   "claude", "claude")
+                                        text_turn_open[0] = True
+                                elif etype == "content_block_delta":
+                                    delta = getattr(event, "delta", None)
+                                    dtype = getattr(delta, "type", None)
+                                    if dtype == "text_delta":
+                                        t = delta.text or ""
+                                        text_for_round.append(t)
+                                        root.after(
+                                            0, _chat_append_text, "claude", t)
+                                    elif dtype == "thinking_delta":
+                                        t = getattr(
+                                            delta, "thinking", "") or ""
+                                        root.after(
+                                            0, _chat_append_text, "thinking", t)
+                                elif etype == "content_block_stop":
+                                    if thinking_turn_open[0]:
+                                        root.after(
+                                            0, _chat_end_turn, "thinking")
+                                        thinking_turn_open[0] = False
+                            _capture_ratelimit(_s)
+                            return _s.get_final_message()
+
+                    try:
+                        try:
+                            final_msg = _consume_stream(with_thinking=True)
+                        except Exception as e:
+                            err_text = str(e).lower()
+                            if "thinking" in err_text or "beta" in err_text:
+                                root.after(0, lambda: _append_chat(
+                                    "sys", "system",
+                                    "(extended thinking not available — "
+                                    "retrying without)"))
+                                # Close any partial blocks before retry
+                                root.after(0, _close_open_turns)
+                                root.after(0, _begin_think,
+                                           "claude is working")
+                                final_msg = _consume_stream(
+                                    with_thinking=False)
+                            else:
+                                raise
+                    finally:
+                        root.after(0, _end_think)
+                        root.after(0, _close_open_turns)
+
+                    # Tally token usage for this round.
+                    _u = getattr(final_msg, "usage", None)
+                    if _u is not None:
+                        turn_usage["input"] += int(
+                            getattr(_u, "input_tokens", 0) or 0)
+                        turn_usage["output"] += int(
+                            getattr(_u, "output_tokens", 0) or 0)
+                        turn_usage["cache_read"] += int(
+                            getattr(_u, "cache_read_input_tokens", 0) or 0)
+                        turn_usage["cache_create"] += int(
+                            getattr(_u, "cache_creation_input_tokens", 0) or 0)
+
+                    # Reconstruct assistant block list for the next round's request.
+                    tool_uses: List[object] = []
+                    assistant_blocks: List[dict] = []
+                    for b in final_msg.content:
+                        btype = getattr(b, "type", None)
+                        if btype == "text":
+                            assistant_blocks.append(
+                                {"type": "text", "text": b.text})
+                        elif btype == "tool_use":
+                            tool_uses.append(b)
+                            assistant_blocks.append({
+                                "type": "tool_use",
+                                "id": b.id,
+                                "name": b.name,
+                                "input": b.input,
+                            })
+                        elif btype == "thinking":
+                            # Required by the API to be echoed back in subsequent
+                            # turns when interleaved thinking is in use.
+                            assistant_blocks.append({
+                                "type": "thinking",
+                                "thinking": getattr(b, "thinking", ""),
+                                "signature": getattr(b, "signature", ""),
+                            })
+
+                    full_text = "".join(text_for_round).strip()
+                    if full_text:
+                        final_text_parts.append(full_text)
+
+                    if getattr(final_msg, "stop_reason", "") == "max_tokens":
+                        root.after(0, lambda: _append_chat(
+                            "err", "warning",
+                            f"Response hit max_tokens cap ({_CHAT_MAX_TOKENS:,}) — "
+                            f"reply may be cut off. Ask Claude to continue, or "
+                            f"narrow the question."))
+
+                    if final_msg.stop_reason != "tool_use" or not tool_uses:
+                        break
+
+                    # Execute tools and feed results back. Show each call AND
+                    # a brief preview of its result so the user can see progress.
+                    current.append(
+                        {"role": "assistant", "content": assistant_blocks})
+                    tool_results = []
+                    for tu in tool_uses:
+                        tu_input = getattr(tu, "input", {}) or {}
+                        preview_args = ", ".join(
+                            f"{k}={str(v)[:60]!r}" +
+                            ("…" if len(str(v)) > 60 else "")
+                            for k, v in tu_input.items()
+                        )
+                        root.after(0, lambda n=tu.name, p=preview_args:
+                                   _append_chat("tool", "→ tool", f"{n}({p})"))
+                        try:
+                            result = _dispatch_tool(tu.name, tu_input)
+                        except Exception as te:
+                            result = f"error in tool {tu.name}: {type(te).__name__}: {te}"
+                        # First-line preview for the chat; full result still goes to Claude.
+                        first_line = result.splitlines(
+                        )[0] if result else "(empty)"
+                        preview = first_line[:160] + \
+                            ("…" if len(first_line) > 160 else "")
+                        if "\n" in result:
+                            preview += f"  (+{result.count(chr(10))} more lines)"
+                        root.after(0, lambda r=preview:
+                                   _append_chat("tool_result", "← result", r))
+                        # Cap tool output so we don't blow context.
+                        if len(result) > _CHAT_TOOL_RESULT_CAP:
+                            dropped = len(result) - _CHAT_TOOL_RESULT_CAP
+                            result = result[:_CHAT_TOOL_RESULT_CAP] + \
+                                f"\n… (+{dropped:,} chars dropped — tool output capped)"
+                            root.after(0, lambda d=dropped, n=tu.name:
+                                       _append_chat("sys", "warning",
+                                                    f"Tool {n} output truncated by {d:,} chars."))
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": result,
+                        })
+                    current.append({"role": "user", "content": tool_results})
+                else:
+                    root.after(0, _end_think)
+                    root.after(0, lambda: _append_chat(
+                        "sys", "system",
+                        f"(stopped after {_CHAT_TOOL_ROUNDS} tool rounds)"))
+
+                final_reply = "\n\n".join(final_text_parts)
+                _reply_preview = final_reply[:80].replace(
+                    "\n", " ") + ("…" if len(final_reply) > 80 else "")
+                root.after(0, lambda _r=_reply_preview: _log_activity(
+                    f"Chat reply: {_r}"))
+
+                # Update session token totals and show a per-turn summary.
+                _sess = _chat_session_usage
+                for _k in ("input", "output", "cache_read", "cache_create"):
+                    _sess[_k] += turn_usage[_k]
+                _sess["turns"] += 1
+                root.after(0, _show_chat_usage,
+                           dict(turn_usage), dict(_sess))
+
+                def _commit() -> None:
+                    # type: ignore[arg-type]
+                    msgs = list(chat_state["messages"])
+                    msgs.append({"role": "user", "content": msg})
+                    msgs.append(
+                        {"role": "assistant", "content": final_reply or "(no text reply)"})
+                    chat_state["messages"] = msgs
+
+                root.after(0, _commit)
+            except Exception as exc:
+                err_text = str(exc)
+                root.after(0, lambda e=err_text: _append_chat("err", "error", e))
+            finally:
+                root.after(0, _update_chat_state)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _chat_history_up(_event: object = None) -> str:
+        # Only intercept when the cursor is on the FIRST visual line; otherwise
+        # let the default Text behavior move the cursor up within the message.
+        cur_line = int(str(chat_entry.index("insert")).split('.', 1)[0])
+        if cur_line > 1:
+            return ""
+        if not _chat_input_history:
+            return "break"
+        idx = int(_chat_history_state["idx"])  # type: ignore[arg-type]
+        if idx == -1:
+            _chat_history_state["draft"] = chat_entry.get("1.0", "end-1c")
+            new_idx = 0
+        else:
+            new_idx = min(idx + 1, len(_chat_input_history) - 1)
+        _chat_history_state["idx"] = new_idx
+        chat_entry.delete("1.0", "end")
+        chat_entry.insert("1.0", _chat_input_history[new_idx])
+        chat_entry.mark_set("insert", "end-1c")
+        return "break"
+
+    def _chat_history_down(_event: object = None) -> str:
+        # Only intercept on the LAST visual line; otherwise let default fire.
+        cur_line = int(str(chat_entry.index("insert")).split('.', 1)[0])
+        last_line = int(str(chat_entry.index("end-1c")).split('.', 1)[0])
+        if cur_line < last_line:
+            return ""
+        idx = int(_chat_history_state["idx"])  # type: ignore[arg-type]
+        if idx < 0:
+            return "break"
+        if idx == 0:
+            _chat_history_state["idx"] = -1
+            chat_entry.delete("1.0", "end")
+            chat_entry.insert("1.0", str(_chat_history_state["draft"]))
+            chat_entry.mark_set("insert", "end-1c")
+            _chat_history_state["draft"] = ""
+            return "break"
+        new_idx = idx - 1
+        _chat_history_state["idx"] = new_idx
+        chat_entry.delete("1.0", "end")
+        chat_entry.insert("1.0", _chat_input_history[new_idx])
+        chat_entry.mark_set("insert", "end-1c")
+        return "break"
+
+    chat_send_btn.config(command=_send_chat)
+    chat_reset_btn.config(command=_reset_chat)
+    # Enter sends; Shift+Enter falls through to default newline insert.
+    # Lambda wrapper guarantees we return "break" even when _send_chat runs
+    # the long path (worker thread) and exits with an implicit None — otherwise
+    # Tk would still insert a newline into the now-cleared input.
+    chat_entry.bind("<Return>", lambda e: _send_chat(e) or "break")
+    chat_entry.bind("<KP_Enter>", lambda e: _send_chat(e) or "break")
+    chat_entry.bind("<Up>", _chat_history_up)
+    chat_entry.bind("<Down>", _chat_history_down)
+    _update_chat_state()
+    _update_chat_context_label()
+
     _search_btn_hover = [False]
 
     def _apply_search_btn_colors() -> None:
@@ -1736,10 +3332,46 @@ def run_gui() -> int:
         """Recolor all raw tk (non-ttk) widgets and tree tags for palette t."""
         root.configure(background=t["BG"])
         with contextlib.suppress(Exception):
-            status_panel.configure(bg=t["BORDER"])
-            _status_inner.configure(bg=t["CARD_BG"])
-            _status_lbl.configure(bg=t["CARD_BG"], fg=t["TEXT"])
-            _selected_lbl.configure(bg=t["CARD_BG"], fg=t["MUTED"])
+            chat_outer.configure(bg=t["BORDER"])
+            chat_header.configure(bg=t["BG"])
+            chat_frame.configure(bg=t["BG"])
+            # tk.Label has no activebackground/activeforeground — including
+            # them in a single .configure() call atomically fails the whole
+            # call, which is why the chat header used to stay light in dark mode.
+            _chat_toggle_btn.configure(bg=t["BG"], fg=t["TEXT"])
+            _chat_model_lbl.configure(bg=t["BG"], fg=t["TEXT"])
+            _chat_ratelimit_lbl.configure(bg=t["BG"], fg=t["MUTED"])
+            chat_context_lbl.configure(foreground=t["MUTED"])
+        with contextlib.suppress(Exception):
+            chat_log_wrap.configure(bg=t["CHAT_BORDER"])
+            chat_log.configure(
+                background=t["CHAT_BG"], foreground=t["CHAT_FG"],
+                insertbackground=t["CHAT_FG"],
+                selectbackground=t["CHAT_SEL_BG"],
+                selectforeground=t["TEXT"])
+            _apply_chat_log_tags(t)
+        with contextlib.suppress(Exception):
+            chat_input_panel.configure(bg=t["CHAT_BORDER"])
+            _input_inner.configure(bg=t["CHAT_ENTRY_BG"])
+            _status_lbl.configure(bg=t["CHAT_ENTRY_BG"], fg=t["TAG_SYS_FG"])
+            _selected_lbl.configure(
+                bg=t["CHAT_ENTRY_BG"], fg=t["TAG_TOOL_RES_FG"])
+            chat_input_row.configure(bg=t["CHAT_ENTRY_BG"])
+            chat_entry_wrap.configure(bg=t["CHAT_ENTRY_BG"])
+            _chat_input_box.configure(bg=t["CHAT_ENTRY_BG"])
+            chat_prompt_lbl.configure(
+                bg=t["CHAT_ENTRY_BG"], fg=t["TAG_CLAUDE_FG"])
+            # tk.Text doesn't support disabledbackground/disabledforeground —
+            # honor whatever state the widget is in and pick matching colors.
+            if str(chat_entry.cget("state")) == "disabled":
+                chat_entry.configure(
+                    background=t["CHAT_DISABLED_BG"],
+                    foreground=t["CHAT_DISABLED_FG"],
+                    insertbackground=t["CHAT_FG"])
+            else:
+                chat_entry.configure(
+                    background=t["CHAT_ENTRY_BG"], foreground=t["CHAT_FG"],
+                    insertbackground=t["CHAT_FG"])
         with contextlib.suppress(Exception):
             tree.tag_configure("odd", background=t["ROW_ALT"])
             tree.tag_configure("even", background=t["CARD_BG"])
@@ -2205,6 +3837,42 @@ def run_gui() -> int:
             status_var.set(f"Open failed: {_ex}")
             messagebox.showerror("fuzzer", f"Could not open:\n{_ex}")
 
+    def set_api_key() -> None:
+        dlg = tk.Toplevel(root)
+        dlg.title("Claude API Key")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        ttk.Label(dlg, text="Paste your Anthropic API key:").pack(
+            padx=16, pady=(12, 4))
+        key_var = tk.StringVar(value=str(_gui_state.get("api_key", "")))
+        key_entry = ttk.Entry(dlg, textvariable=key_var, width=52, show="*")
+        key_entry.pack(padx=16, pady=4)
+        show_var = tk.BooleanVar()
+
+        def _toggle_show() -> None:
+            key_entry.config(show="" if show_var.get() else "*")
+
+        ttk.Checkbutton(dlg, text="Show key", variable=show_var,
+                        command=_toggle_show).pack(anchor="w", padx=16)
+
+        def _save() -> None:
+            k = key_var.get().strip()
+            _gui_state["api_key"] = k
+            _save_state(_gui_state)
+            os.environ["ANTHROPIC_API_KEY"] = k
+            dlg.destroy()
+            _update_chat_state()
+            _log_activity("API key updated")
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(pady=(8, 12))
+        ttk.Button(btn_row, text="Save", command=_save).pack(
+            side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(
+            side="left", padx=4)
+        key_entry.focus_set()
+        dlg.bind("<Return>", lambda _e: _save())
+
     # tk.Label has no "command" attribute — wire click manually and gate it on
     # the running state so we don't try to launch a second search while one is
     # in flight (which the original ttk.Button's state="disabled" handled).
@@ -2216,6 +3884,7 @@ def run_gui() -> int:
     stop_btn.config(command=stop_search)
     clear_btn.config(command=clear_results)
     export_btn.config(command=export_to_file)
+    apikey_btn.config(command=set_api_key)
 
     def _set_selected_preview_from_iid(iid: str) -> None:
         vals = tree.item(iid, "values")

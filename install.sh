@@ -106,6 +106,7 @@ CORE_DEPS=(
     pymupdf
     rapidfuzz
     pdfplumber
+    anthropic
     openpyxl
     python-docx
     pyarabic
