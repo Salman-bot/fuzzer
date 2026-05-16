@@ -6,7 +6,6 @@
 #
 # Usage:
 #   ./install.sh                 # core deps + native build
-#   ./install.sh --with-docs     # also install pdoc/markdown/pygments
 #   ./install.sh --with-corpus   # also fetch ~50 test PDFs (≈140 MB)
 #   ./install.sh --user          # pip install --user (useful when system Python is PEP 668-locked)
 #   ./install.sh --help          # show this help
@@ -16,17 +15,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-WITH_DOCS=0
 WITH_CORPUS=0
 PIP_USER=0
 
 for arg in "$@"; do
     case "$arg" in
-        --with-docs)   WITH_DOCS=1 ;;
         --with-corpus) WITH_CORPUS=1 ;;
         --user)        PIP_USER=1 ;;
         -h|--help)
-            sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -123,17 +120,9 @@ CORE_DEPS=(
     "python-bidi"
 )
 
-DOC_DEPS=(pdoc markdown pygments)
-
 step "installing Python dependencies (${#CORE_DEPS[@]} packages)…"
 "$PYTHON" -m pip "${PIP_ARGS[@]}" "${CORE_DEPS[@]}"
 ok "core dependencies installed"
-
-if [[ $WITH_DOCS -eq 1 ]]; then
-    step "installing doc dependencies (${#DOC_DEPS[@]} packages)…"
-    "$PYTHON" -m pip "${PIP_ARGS[@]}" "${DOC_DEPS[@]}"
-    ok "doc dependencies installed"
-fi
 
 # ── Build _ar_norm native extension ───────────────────────────────────────────
 if [[ -n "$CC_BIN" && $HAS_HEADERS -eq 1 ]]; then
@@ -149,6 +138,26 @@ if [[ -n "$CC_BIN" && $HAS_HEADERS -eq 1 ]]; then
     fi
 else
     warn "skipping native build (compiler or Python headers missing) — pure-Python fallback will be used."
+fi
+
+# ── Skim PDF viewer (optional but recommended) ────────────────────────────────
+# fuzzer prefers Skim over Preview for opening PDF results: Skim has reliable
+# `go to page N` AppleScript, where Preview needs fragile UI scripting via
+# Cmd+Opt+G. If Skim isn't installed we silently fall back to Preview.
+if [[ -d "/Applications/Skim.app" ]]; then
+    ok "Skim already installed (used as the PDF viewer)"
+elif command -v brew >/dev/null 2>&1; then
+    step "installing Skim (PDF viewer with robust page-nav AppleScript)…"
+    if brew install --cask skim; then
+        ok "Skim installed"
+    else
+        warn "Skim install failed — fuzzer will fall back to Preview."
+    fi
+else
+    warn "Homebrew not found — skipping Skim install."
+    warn "  fuzzer will fall back to Preview. To install Skim later:"
+    warn "    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+    warn "    brew install --cask skim"
 fi
 
 # ── Optional: test corpus ─────────────────────────────────────────────────────

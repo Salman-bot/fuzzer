@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3
 """fuzzer — search file contents for words/phrases.
 
 GUI app; run `fuzzer` with no arguments to launch it.
@@ -40,6 +40,34 @@ def _r() -> str:
 def _err(msg: str) -> None:
     print(f"{_c(_YEL)}warning:{_r()} {msg}", file=sys.stderr)
 
+
+# ── MuPDF crash blacklist + pdfplumber-missing warning ─────────────────────────
+# Some malformed PDFs reliably segfault MuPDF (NULL deref deep in fz_fill_text,
+# usually on Arabic Wikipedia dumps with broken font tables). We isolate the
+# extraction in a subprocess so the GUI survives, but the *same* file crashes
+# every search → re-running the subprocess is wasted work and spams the log.
+# Persist a blacklist so doomed files skip MuPDF entirely on next attempt.
+from pathlib import Path as _Path_for_blacklist
+import json as _json_blacklist
+_MUPDF_BLACKLIST_FILE = _Path_for_blacklist.home() / ".fuzzer_mupdf_blacklist.json"
+_mupdf_blacklist: set = set()
+try:
+    _mupdf_blacklist = set(_json_blacklist.loads(_MUPDF_BLACKLIST_FILE.read_text()))
+except Exception:
+    _mupdf_blacklist = set()
+
+
+def _blacklist_pdf_for_mupdf(fp: str) -> None:
+    _mupdf_blacklist.add(fp)
+    with contextlib.suppress(Exception):
+        _MUPDF_BLACKLIST_FILE.write_text(
+            _json_blacklist.dumps(sorted(_mupdf_blacklist)))
+
+
+# Don't spam "pdfplumber missing" for every PDF when MuPDF is blacklisting
+# them in bulk — log it once per session and let the user act on it.
+_pdfplumber_warned = [False]
+
 # ── types ──────────────────────────────────────────────────────────────────────
 
 
@@ -64,19 +92,59 @@ def _extract_plain(fp: str) -> Optional[List[str]]:
 _pdf_page_map: Dict[str, List[int]] = {}  # fp → page_num per line (1-based)
 
 
+# Inline worker script for the PyMuPDF subprocess. Kept short — it reads
+# the path from stdin, dumps {"lines": [...], "page_nums": [...]} to stdout.
+# sort=True re-orders glyphs by position to fix Arabic ligature order in
+# PDFs with non-standard glyph sequences.
+_PYMUPDF_WORKER = (
+    "import sys, json, fitz\n"
+    "fp = sys.stdin.read().strip()\n"
+    "doc = fitz.open(fp)\n"
+    "out = {'lines': [], 'page_nums': []}\n"
+    "for i in range(len(doc)):\n"
+    "    txt = doc[i].get_text('text', sort=True) or ''\n"
+    "    ls = txt.splitlines()\n"
+    "    out['lines'].extend(ls)\n"
+    "    out['page_nums'].extend([i + 1] * len(ls))\n"
+    "doc.close()\n"
+    "sys.stdout.write(json.dumps(out))\n"
+)
+
+
 def _extract_pdf_pymupdf(fp: str, lines: List[str], page_nums: List[int]) -> List[str]:
-    import fitz  # PyMuPDF
-    doc = fitz.open(fp)
-    for page_idx in range(1, len(doc) + 1):
-        page = doc[page_idx - 1]
-        # sort=True re-orders glyphs by position, fixing ligature order in
-        # Arabic PDFs that use non-standard glyph sequences.
-        # type: ignore[attr-defined]
-        text: str = page.get_text("text", sort=True) or ""  # type: ignore
-        page_lines = text.splitlines()
-        lines.extend(page_lines)
-        page_nums.extend([page_idx] * len(page_lines))
-    doc.close()
+    # MuPDF segfaults on certain malformed PDFs (NULL deref deep in
+    # fz_fill_text) — a C-level crash that no Python try/except can catch.
+    # To keep the GUI alive we run extraction in a short-lived subprocess;
+    # on non-zero exit we raise ImportError so _extract_pdf falls through
+    # to pdfplumber. ~50–100 ms startup cost per PDF, paid once because
+    # results are cached in SQLite.
+    # Files known to have crashed MuPDF before are skipped without even
+    # launching the subprocess — saves the cost + the warning spam.
+    if fp in _mupdf_blacklist:
+        raise ImportError(f"PyMuPDF blacklisted for {fp}")
+    import subprocess as _sp
+    import json as _json
+    try:
+        proc = _sp.run(
+            [sys.executable, "-c", _PYMUPDF_WORKER],
+            input=fp, capture_output=True, text=True, timeout=180,
+        )
+    except _sp.TimeoutExpired:
+        _err(f"{os.path.basename(fp)}: PyMuPDF timed out — blacklisting; falling back to pdfplumber")
+        _blacklist_pdf_for_mupdf(fp)
+        raise ImportError("PyMuPDF timed out")
+    if proc.returncode != 0 or not proc.stdout:
+        # SIGSEGV from the child shows up as a negative returncode on POSIX
+        # (e.g. -11 for SIGSEGV). Blacklist so future searches don't retry.
+        _err(
+            f"{os.path.basename(fp)}: PyMuPDF crashed (rc={proc.returncode}) — "
+            "blacklisting; falling back to pdfplumber"
+        )
+        _blacklist_pdf_for_mupdf(fp)
+        raise ImportError(f"PyMuPDF subprocess crashed (rc={proc.returncode})")
+    data = _json.loads(proc.stdout)
+    lines.extend(data["lines"])
+    page_nums.extend(data["page_nums"])
     _pdf_page_map[fp] = page_nums
     return lines
 
@@ -96,7 +164,12 @@ def _extract_pdf(fp: str) -> Optional[List[str]]:
     try:
         import pdfplumber
     except ImportError:
-        _err("PDF support requires pdfplumber or pymupdf — pip install pymupdf")
+        # Print once per session — when MuPDF is blacklisting dozens of
+        # Arabic PDFs in bulk, repeating this line per file is just noise.
+        if not _pdfplumber_warned[0]:
+            _err("PDF support requires pdfplumber or pymupdf — "
+                 "pip install pymupdf pdfplumber  (silenced for remaining files)")
+            _pdfplumber_warned[0] = True
         return None
     try:
         with pdfplumber.open(fp) as pdf:
@@ -557,6 +630,20 @@ def rga_search_file(
 # ── export ─────────────────────────────────────────────────────────────────────
 
 
+_EXPORT_WS_RE = re.compile(r"[ \t]+")
+
+
+def _normalize_export_text(s: str) -> str:
+    """Collapse runs of horizontal whitespace into single spaces. PyMuPDF's
+    ``sort=True`` extraction often inserts long stretches of spaces between
+    visually-separated columns; without this the xlsx export ends up with
+    huge gaps mid-cell."""
+    if not s:
+        return s
+    # Preserve real newlines (sentence context spans multiple lines).
+    return "\n".join(_EXPORT_WS_RE.sub(" ", line).strip() for line in s.splitlines())
+
+
 def _build_rows(
     results: Dict[str, Tuple[List[str], List[Match]]],
 ) -> List[Dict[str, object]]:
@@ -577,11 +664,13 @@ def _build_rows(
                 "page": m.page_num if m.page_num else "",
                 "match_type": match_type,
                 "score": score_val,
-                "content": m.line,
+                "content": _normalize_export_text(m.line),
             }
             offset = sum(len(l) + 1 for l in lines[:m.line_num - 1])
-            row["sentence"] = extract_sentence(
-                full_text, offset + max(0, len(m.line) // 2)
+            row["sentence"] = _normalize_export_text(
+                extract_sentence(
+                    full_text, offset + max(0, len(m.line) // 2)
+                )
             )
             rows.append(row)
     return rows
@@ -865,6 +954,58 @@ def run_gui() -> int:
         if hi < len(tokens):
             snippet += " …"
         return snippet
+
+    def _find_match_ranges(
+        text: str, pattern: str, *,
+        use_regex: bool = False,
+        case_sensitive: bool = False,
+        whole_word: bool = False,
+    ) -> List[Tuple[int, int]]:
+        """Return [(start, end), …] character ranges in `text` matched by
+        the active search mode. Empty list if pattern is empty, regex is
+        invalid, or no matches found. Ranges are deduped and non-overlapping;
+        overlap is resolved by keeping the earlier match."""
+        if not text or not pattern:
+            return []
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            if use_regex:
+                rx = re.compile(pattern, flags)
+            elif whole_word:
+                rx = re.compile(rf"\b{re.escape(pattern)}\b", flags)
+            else:
+                rx = re.compile(re.escape(pattern), flags)
+        except re.error:
+            return []
+        ranges: List[Tuple[int, int]] = []
+        prev_end = -1
+        for m in rx.finditer(text):
+            s, e = m.start(), m.end()
+            if s == e:  # zero-width match — skip, would loop forever to mark
+                continue
+            if s < prev_end:  # overlap with previous match — skip
+                continue
+            ranges.append((s, e))
+            prev_end = e
+        return ranges
+
+    _MARK_OPEN, _MARK_CLOSE = "‹", "›"  # ‹ ›
+
+    def _wrap_marks(text: str, ranges: List[Tuple[int, int]]) -> str:
+        """Wrap each range in `text` with ‹…› markers. Ranges must be
+        sorted and non-overlapping (which _find_match_ranges guarantees)."""
+        if not ranges:
+            return text
+        out: List[str] = []
+        cursor = 0
+        for s, e in ranges:
+            out.append(text[cursor:s])
+            out.append(_MARK_OPEN)
+            out.append(text[s:e])
+            out.append(_MARK_CLOSE)
+            cursor = e
+        out.append(text[cursor:])
+        return "".join(out)
 
     class _Tooltip:
 
@@ -1303,14 +1444,52 @@ def run_gui() -> int:
         value=bool(_gui_state.get("rga_mode", False)) and bool(_RGA_PATH))
 
     _opt_tooltips = [
-        ("Case-sensitive", case_var, "Match uppercase/lowercase exactly"),
+        ("Case-sensitive", case_var,
+         "Case-sensitive — uppercase and lowercase must match exactly.\n"
+         "\n"
+         "OFF (default):  'Hi' matches 'Hi', 'hi', 'HI', 'hI'\n"
+         "ON:             'Hi' matches only 'Hi'\n"
+         "\n"
+         "Applies to every mode — exact, whole-word, regex, and fuzzy.\n"
+         "Regex equivalent: when OFF, the regex compiles with re.IGNORECASE."),
         ("Whole word", whole_word_var,
-         "Pattern must match at word boundaries — 'asic' will NOT match 'basic'.\n"
-         "Works for ASCII; Arabic falls back to substring inside the same word."),
+         "Whole word — the match must align with word boundaries.\n"
+         "\n"
+         "OFF (default):  'asic'  matches 'basic'   (substring is enough)\n"
+         "                'cat'   matches 'category', 'concatenate'\n"
+         "ON:             'asic'  does NOT match 'basic'\n"
+         "                'cat'   matches 'cat' but NOT 'category'\n"
+         "\n"
+         "How it works: the pattern is wrapped with \\b…\\b before searching.\n"
+         "Regex equivalent: \\bpattern\\b (with regex specials escaped).\n"
+         "  e.g. searching 'foo' with this ON  ≡  regex \\bfoo\\b\n"
+         "\n"
+         "Arabic: Python's \\b doesn't treat Arabic letters as word chars,\n"
+         "so for Arabic we fall back to substring-within-the-same-word."),
         ("Regex", regex_var,
-         "Pattern is a Python regular expression (re.search per line).\n"
-         "Score is always 100; fuzzy fallback is disabled when this is on.\n"
-         "Invalid regex returns no matches for that file."),
+         "Regex — the pattern is a Python regular expression (re.search per line).\n"
+         "\n"
+         "Common syntax:\n"
+         "  .       any one character        \\d  digit       \\s  whitespace\n"
+         "  *       0 or more of preceding   \\w  word char   \\b  word boundary\n"
+         "  +       1 or more of preceding   ^   line start   $   line end\n"
+         "  ?       0 or 1 of preceding      |   OR\n"
+         "  [abc]   any of a, b, c           [^abc]  NOT a, b, c\n"
+         "  [a-z]   range                    (…)     group\n"
+         "\n"
+         "Examples:\n"
+         "  TODO|FIXME      either word\n"
+         "  \\d+             one or more digits\n"
+         "  [A-Z]\\w+        capitalized word\n"
+         "  func\\(.*?\\)     function call with anything in parens (non-greedy)\n"
+         "  ^import         lines starting with 'import'\n"
+         "  \\bcat\\b         exact word 'cat' — same as Whole word with 'cat'\n"
+         "\n"
+         "Notes:\n"
+         "  • Score is always 100; fuzzy fallback is disabled while Regex is on.\n"
+         "  • Invalid regex (e.g. '**hi') returns no matches for that file.\n"
+         "  • Case is controlled by the Case-sensitive checkbox.\n"
+         "  • Literal special chars must be escaped: . * + ? ( ) [ ] { } ^ $ | \\"),
         ("Recursive", recursive_var, "Search subfolders when a folder is given"),
         ("rga engine", rga_var,
          ("Use ripgrep-all (rga) as the search backend. Extends file coverage to "
@@ -1483,10 +1662,8 @@ def run_gui() -> int:
     table_frame.columnconfigure(0, weight=1)
 
     # ── status + selected state ─────────────────────────────────────────────
-    # Just declare the shared StringVars + handlers here. The actual labels
-    # are built later inside the chat input panel so they read as part of
-    # the chat textbox (terminal-style status header + selected hint line +
-    # `~/bin ❯` prompt) rather than as orphaned strips at the bottom of root.
+    # Declare the shared StringVars + handlers here. The labels themselves
+    # live in the bottom status bar (built a few blocks below).
     status_var = tk.StringVar(value="Ready")
     selected_var = tk.StringVar(
         value="Select a result row to preview it here (double-click to open)"
@@ -1524,6 +1701,225 @@ def run_gui() -> int:
             _log_activity(f"Revealed export: {os.path.basename(path)}")
 
     status_var.trace_add("write", _on_status_change)
+
+    # ── bottom status bar (VS Code-style) ───────────────────────────────────
+    # Two-row strip pinned to the bottom of the root window:
+    #   row 1: live status text (left) + selected-row preview (right)
+    #   row 2: engine indicators (left) + theme + window alpha (right)
+    # Packed with side="bottom" + before=main_paned so it claims its strip
+    # of the cavity first; main_paned then expands into the remainder. This
+    # keeps the bar visible regardless of the chat pane's collapse state.
+    import importlib.util as _iu_sb
+
+    def _strip_paren(s: str) -> str:
+        return s.split(" (")[0]
+    _sb_fuzzy = _strip_paren(_ENGINE_FUZZY)
+    _sb_arabic = _strip_paren(_ENGINE_ARABIC)
+    if _iu_sb.find_spec("fitz") is not None:
+        _sb_pdf = "PyMuPDF"
+    elif _iu_sb.find_spec("pdfplumber") is not None:
+        _sb_pdf = "pdfplumber"
+    else:
+        _sb_pdf = "—"
+    _sb_rga = "available" if _RGA_PATH else "—"
+
+    _statusbar_outer = tk.Frame(root, bg=_T["CHAT_BORDER"])
+    _statusbar_outer.pack(side="bottom", fill="x", before=main_paned)
+    _statusbar_inner = tk.Frame(_statusbar_outer, bg=_T["CHAT_ENTRY_BG"])
+    _statusbar_inner.pack(fill="x", padx=1, pady=1)
+
+    # Row 1 — live status (left) + selected-row preview (right).
+    _statusbar_row1 = tk.Frame(_statusbar_inner, bg=_T["CHAT_ENTRY_BG"])
+    _statusbar_row1.pack(fill="x")
+    _status_lbl = tk.Label(
+        _statusbar_row1, textvariable=status_var, anchor="w",
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_SYS_FG"],
+        font=("Menlo", 11), padx=10, pady=2,
+    )
+    _status_lbl.pack(side="left", fill="x", expand=True)
+    _status_widget_ref[0] = _status_lbl
+    _status_lbl.bind("<Button-1>", _on_status_click)
+
+    # Hover history popup — read the activity log (always recording, even
+    # when the debug panel is collapsed) and float it upward above the
+    # status bar. Snapshot on Enter, destroy on Leave. Capped at N lines
+    # so a long session doesn't paint a wall of text.
+    _STATUS_HISTORY_LINES = 25
+    _status_hist_tip: List[Optional[tk.Toplevel]] = [None]
+
+    def _show_status_history(_e: object = None) -> None:
+        if _status_hist_tip[0] is not None:
+            return
+        try:
+            full = dbg_act_log.get("1.0", "end-1c")
+        except Exception:
+            full = ""
+        lines = [ln for ln in full.splitlines() if ln.strip()]
+        if not lines:
+            body = "(no activity yet)"
+        else:
+            body = "\n".join(lines[-_STATUS_HISTORY_LINES:])
+        tip = tk.Toplevel(_status_lbl)
+        tip.wm_overrideredirect(True)
+        # Match the dark activity-log palette so the popup reads as
+        # "the log, just floating" rather than a generic tooltip.
+        _bg, _fg = "#1e1e1e", "#cdd6f4"
+        frame = tk.Frame(tip, bg=_T["CHAT_BORDER"])
+        frame.pack()
+        inner = tk.Frame(frame, bg=_bg)
+        inner.pack(padx=1, pady=1)
+        tk.Label(
+            inner, text="Activity history",
+            bg=_bg, fg="#9b8cf0", font=("Menlo", 9, "bold"),
+            anchor="w", padx=8, pady=(4, 0),
+        ).pack(fill="x")
+        tk.Label(
+            inner, text=body, justify="left", anchor="w",
+            bg=_bg, fg=_fg, font=("Menlo", 10),
+            padx=8, pady=(2, 6),
+        ).pack(fill="x")
+        # Force layout so winfo_height/width report real numbers, then
+        # position above the status label with a small gap.
+        tip.update_idletasks()
+        x = _status_lbl.winfo_rootx()
+        y = _status_lbl.winfo_rooty() - tip.winfo_height() - 4
+        tip.wm_geometry(f"+{x}+{max(0, y)}")
+        _status_hist_tip[0] = tip
+
+    def _hide_status_history(_e: object = None) -> None:
+        t = _status_hist_tip[0]
+        if t is not None:
+            with contextlib.suppress(Exception):
+                t.destroy()
+            _status_hist_tip[0] = None
+
+    _status_lbl.bind("<Enter>", _show_status_history, add="+")
+    _status_lbl.bind("<Leave>", _hide_status_history, add="+")
+    # `_selected_lbl` is a tk.Text (not Label) so we can tag the matched
+    # substring with a yellow background — Treeview cells can't render
+    # per-substring styling, so this is where the user actually *sees*
+    # the highlight. Width is in characters; long previews are truncated
+    # in _set_selected_preview() before writing.
+    _SELECTED_PREVIEW_CHARS = 80
+    _selected_lbl = tk.Text(
+        _statusbar_row1, height=1, width=_SELECTED_PREVIEW_CHARS,
+        wrap="none", state="disabled", cursor="arrow",
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_TOOL_RES_FG"],
+        insertbackground=_T["CHAT_ENTRY_BG"],  # hide caret
+        relief="flat", borderwidth=0, highlightthickness=0,
+        font=("Menlo", 11), padx=10, pady=2,
+        takefocus=0,
+    )
+    _selected_lbl.tag_configure("match", background="#ffd24a",
+                                foreground="#1a1426")
+    _selected_lbl.pack(side="right")
+    _selected_widget_ref[0] = _selected_lbl
+
+    # Seed the placeholder so first-run users see what this strip is for.
+    _SELECTED_PLACEHOLDER = (
+        "Select a result row to preview it here (double-click to open)"
+    )
+
+    def _set_selected_preview(text: str,
+                              ranges: Optional[List[Tuple[int, int]]] = None) -> None:
+        """Write `text` into the selected-row preview Text widget and tag
+        the given character ranges with the yellow `match` background.
+        Truncation to _SELECTED_PREVIEW_CHARS is performed here so callers
+        pass full strings."""
+        _selected_lbl.configure(state="normal")
+        try:
+            _selected_lbl.delete("1.0", "end")
+            # Truncate: prefer keeping the first match in view.
+            short = text
+            kept_ranges = ranges or []
+            if len(short) > _SELECTED_PREVIEW_CHARS:
+                if kept_ranges:
+                    # Window around the earliest match so the highlight stays visible.
+                    s0 = kept_ranges[0][0]
+                    half = _SELECTED_PREVIEW_CHARS // 2
+                    win_start = max(0, s0 - half)
+                    win_end = win_start + _SELECTED_PREVIEW_CHARS
+                    if win_end > len(short):
+                        win_end = len(short)
+                        win_start = max(0, win_end - _SELECTED_PREVIEW_CHARS)
+                    short = short[win_start:win_end]
+                    kept_ranges = [
+                        (max(0, s - win_start), min(_SELECTED_PREVIEW_CHARS, e - win_start))
+                        for (s, e) in kept_ranges
+                        if e > win_start and s < win_end
+                    ]
+                else:
+                    short = short[:_SELECTED_PREVIEW_CHARS - 1] + "…"
+            _selected_lbl.insert("1.0", short)
+            for s, e in kept_ranges:
+                _selected_lbl.tag_add("match", f"1.{s}", f"1.{e}")
+        finally:
+            _selected_lbl.configure(state="disabled")
+
+    _set_selected_preview(_SELECTED_PLACEHOLDER)
+
+    # Thin divider between the two rows.
+    _statusbar_div = tk.Frame(_statusbar_inner, bg=_T["CHAT_BORDER"], height=1)
+    _statusbar_div.pack(fill="x")
+
+    # Row 2 — engines (left), theme + alpha (right).
+    _statusbar_row2 = tk.Frame(_statusbar_inner, bg=_T["CHAT_ENTRY_BG"])
+    _statusbar_row2.pack(fill="x")
+    _sb_engines_text = (
+        f"  fuzzy: {_sb_fuzzy}   arabic: {_sb_arabic}   "
+        f"pdf: {_sb_pdf}   rga: {_sb_rga}"
+    )
+    _sb_engines_lbl = tk.Label(
+        _statusbar_row2, text=_sb_engines_text, anchor="w",
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["MUTED"],
+        font=("Menlo", 10), padx=4, pady=2,
+    )
+    _sb_engines_lbl.pack(side="left")
+
+    _sb_right = tk.Frame(_statusbar_row2, bg=_T["CHAT_ENTRY_BG"])
+    _sb_right.pack(side="right", padx=(0, 8))
+
+    def _theme_indicator_text() -> str:
+        # ◐ glyph reads as "half-moon" — light/dark are the two halves.
+        return f"◐ {_theme_name[0]}"
+    _sb_theme_lbl = tk.Label(
+        _sb_right, text=_theme_indicator_text(),
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["MUTED"],
+        font=("Menlo", 10), padx=8, pady=2, cursor="hand2",
+    )
+    _sb_theme_lbl.pack(side="left")
+    # _toggle_theme is defined later in this function. Late-binding via
+    # lambda works because Python resolves the name at click time.
+    _sb_theme_lbl.bind("<Button-1>", lambda _e: _toggle_theme())
+
+    _ALPHA_CYCLE = (0.88, 0.92, 0.96, 1.0)
+
+    def _alpha_indicator_text() -> str:
+        try:
+            a = float(root.wm_attributes("-alpha"))
+        except Exception:
+            a = 1.0
+        return f"α {int(round(a * 100))}%"
+    _sb_alpha_lbl = tk.Label(
+        _sb_right, text=_alpha_indicator_text(),
+        bg=_T["CHAT_ENTRY_BG"], fg=_T["MUTED"],
+        font=("Menlo", 10), padx=8, pady=2, cursor="hand2",
+    )
+    _sb_alpha_lbl.pack(side="left")
+
+    def _cycle_alpha(_e: object = None) -> None:
+        try:
+            a = float(root.wm_attributes("-alpha"))
+        except Exception:
+            a = 1.0
+        i = min(range(len(_ALPHA_CYCLE)),
+                key=lambda j: abs(_ALPHA_CYCLE[j] - a))
+        new_a = _ALPHA_CYCLE[(i + 1) % len(_ALPHA_CYCLE)]
+        with contextlib.suppress(Exception):
+            root.wm_attributes("-alpha", new_a)
+        _gui_state["window_alpha"] = new_a
+        _sb_alpha_lbl.configure(text=_alpha_indicator_text())
+    _sb_alpha_lbl.bind("<Button-1>", _cycle_alpha)
 
     # ── debug panel: live native-call inspector for py_normalize ─────────────
     # Always built so it can be toggled at runtime (View menu / Cmd+D); only
@@ -1847,10 +2243,8 @@ def run_gui() -> int:
         root.bind("<Command-d>", _toggle_debug_panel)
         root.bind("<Command-0>", lambda _e: _auto_fit(grow_only=False))
 
-    # NOTE: status_lbl + _selected_lbl are built later inside the chat input
-    # panel (terminal-style status header + selected hint line + `~/bin ❯`
-    # prompt) so they read as part of the chat textbox rather than as orphaned
-    # strips at the bottom of root.
+    # NOTE: _status_lbl + _selected_lbl are built earlier inside the
+    # bottom status bar (a permanent root-level strip below main_paned).
 
     def _wire_text_shortcuts(widget: tk.Widget, *,
                              allow_edit: bool = True) -> None:
@@ -2267,58 +2661,23 @@ def run_gui() -> int:
             chat_log.config(state="disabled")
 
     # ── unified input panel ─────────────────────────────────────────────────
-    # One bordered terminal-style box that visually groups three lines, top
-    # to bottom:
+    # Bordered prompt box — just the input row now. Status + selected moved
+    # to the bottom status bar (a permanent root-level strip), freeing the
+    # chat panel to look more like a focused REPL prompt:
     #   ┌──────────────────────────────────────────────────────────────────┐
-    #   │ status    ← what the app is doing right now (search, export, …) │
-    #   │ selected  ← the row the user has clicked in the results table   │
     #   │ ~/bin ❯ [input area ......................]  [Send] [Reset]    │
     #   └──────────────────────────────────────────────────────────────────┘
-    # Packed side="bottom" inside chat_frame so pack honors its full height
-    # FIRST and chat_log_wrap (with expand=True) takes the remainder. Result:
-    # the input panel can never be squeezed off-screen, no matter how small
-    # the chat pane gets.
+    # Bottom row of chat_frame's grid — guaranteed natural height even when
+    # the pane is short (the log shrinks instead of the input being clipped).
     chat_input_panel = tk.Frame(
         chat_frame, bg=_T["CHAT_BORDER"], padx=1, pady=1)
-    # Bottom row in chat_frame's grid — guaranteed natural height even when
-    # the pane is short (the log shrinks instead of the input being clipped).
     chat_input_panel.grid(row=2, column=0, sticky="ew", pady=(2, 0))
 
     _input_inner = tk.Frame(chat_input_panel, bg=_T["CHAT_ENTRY_BG"])
     _input_inner.pack(fill="x", expand=True)
 
-    # Status line (live "what's happening" — search progress, export path,
-    # debug toggles). Amber, monospace, looks like a shell prompt's pre-line.
-    _status_lbl = tk.Label(
-        _input_inner, textvariable=status_var, anchor="w",
-        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_SYS_FG"],
-        font=("Menlo", 11),
-        padx=10, pady=0,
-    )
-    _status_lbl.pack(fill="x", pady=(3, 0))
-    _status_widget_ref[0] = _status_lbl
-    _status_lbl.bind("<Button-1>", _on_status_click)
-
-    # Selected-row preview. Cyan, slightly indented so it reads as a sub-line.
-    _selected_lbl = tk.Label(
-        _input_inner, textvariable=selected_var, anchor="w",
-        bg=_T["CHAT_ENTRY_BG"], fg=_T["TAG_TOOL_RES_FG"],
-        font=("Menlo", 11),
-        padx=10, pady=0,
-    )
-    _selected_lbl.pack(fill="x", pady=(0, 3))
-    _selected_widget_ref[0] = _selected_lbl
-
-    # Thin divider between the info lines and the actual input row, for visual
-    # separation without breaking the "one box" feel.
-    tk.Frame(_input_inner, bg=_T["CHAT_BORDER"], height=1).pack(
-        fill="x", padx=2)
-
     chat_input_row = tk.Frame(_input_inner, bg=_T["CHAT_ENTRY_BG"])
     chat_input_row.pack(fill="x")
-    # Outer border around just the input box used to live here; the whole
-    # panel now provides the ring, so the input row is flush against the
-    # status/selected lines above it.
     chat_entry_wrap = tk.Frame(chat_input_row, bg=_T["CHAT_ENTRY_BG"])
     chat_entry_wrap.pack(side="left", fill="x", expand=True)
     # Inner box holds the zsh-style prompt prefix + the Text widget on one row.
@@ -3575,11 +3934,23 @@ def run_gui() -> int:
                 selectforeground=t["TEXT"])
             _apply_chat_log_tags(t)
         with contextlib.suppress(Exception):
-            chat_input_panel.configure(bg=t["CHAT_BORDER"])
-            _input_inner.configure(bg=t["CHAT_ENTRY_BG"])
+            _statusbar_outer.configure(bg=t["CHAT_BORDER"])
+            _statusbar_inner.configure(bg=t["CHAT_ENTRY_BG"])
+            _statusbar_row1.configure(bg=t["CHAT_ENTRY_BG"])
+            _statusbar_div.configure(bg=t["CHAT_BORDER"])
+            _statusbar_row2.configure(bg=t["CHAT_ENTRY_BG"])
             _status_lbl.configure(bg=t["CHAT_ENTRY_BG"], fg=t["TAG_SYS_FG"])
             _selected_lbl.configure(
                 bg=t["CHAT_ENTRY_BG"], fg=t["TAG_TOOL_RES_FG"])
+            _sb_engines_lbl.configure(bg=t["CHAT_ENTRY_BG"], fg=t["MUTED"])
+            _sb_right.configure(bg=t["CHAT_ENTRY_BG"])
+            _sb_theme_lbl.configure(
+                bg=t["CHAT_ENTRY_BG"], fg=t["MUTED"],
+                text=_theme_indicator_text())
+            _sb_alpha_lbl.configure(bg=t["CHAT_ENTRY_BG"], fg=t["MUTED"])
+        with contextlib.suppress(Exception):
+            chat_input_panel.configure(bg=t["CHAT_BORDER"])
+            _input_inner.configure(bg=t["CHAT_ENTRY_BG"])
             chat_input_row.configure(bg=t["CHAT_ENTRY_BG"])
             chat_entry_wrap.configure(bg=t["CHAT_ENTRY_BG"])
             _chat_input_box.configure(bg=t["CHAT_ENTRY_BG"])
@@ -3754,31 +4125,94 @@ def run_gui() -> int:
 
             _query = pattern_var.get().strip()
             _query_norm = _normalize_arabic(_query)
-            # Unique search terms: original + normalised (deduped, order kept)
-            _terms = list(dict.fromkeys(
-                t for t in [_query, _query_norm] if t))
+            _use_regex = bool(regex_var.get())
+            _case = bool(case_var.get())
+            _whole_word = bool(whole_word_var.get())
+            # Unique literal search terms for pass 1. In regex mode the
+            # raw pattern isn't a literal substring of the PDF — we collect
+            # the *actual* matched substrings per page below instead.
+            _terms = (
+                []
+                if _use_regex
+                else list(dict.fromkeys(t for t in [_query, _query_norm] if t))
+            )
 
             # Pages that actually had matches
             _hit_pages = set(m.page_num or 1 for m in matches)
             # Multi-word queries split into per-word normalized tokens for
             # word-level scanning; single-word queries fall straight into the
-            # token list.
+            # token list. In regex mode we still try word-level pass 2 — it
+            # often catches the same hits via Arabic normalization — but the
+            # primary path is the per-page regex finditer below.
             _query_words = [_normalize_arabic(w)
                             for w in _query.split() if w.strip()]
+
+            import string as _string
+            # ASCII punctuation that PyMuPDF's search_for tends to normalize
+            # differently than get_text returns (curly vs straight quotes,
+            # smart dashes, etc.). Stripping these from the end of a regex
+            # match before retrying recovers cases like `H"` where the raw
+            # pattern won't match but the alphanumeric core will.
+            _strip_chars = _string.punctuation
+
+            def _search_with_fallback(_pg_obj: object, _term: str) -> int:
+                """Add highlight annotations for `_term` on the page. Returns
+                the number of annotations added. If the direct search_for
+                returns no quads, retries with leading/trailing punctuation
+                stripped."""
+                _added = 0
+                for _q in _pg_obj.search_for(_term, quads=True):  # type: ignore[attr-defined]
+                    _pg_obj.add_highlight_annot(_q)  # type: ignore[attr-defined]
+                    _added += 1
+                if _added:
+                    return _added
+                _stripped = _term.strip(_strip_chars)
+                if _stripped and _stripped != _term:
+                    for _q in _pg_obj.search_for(_stripped, quads=True):  # type: ignore[attr-defined]
+                        _pg_obj.add_highlight_annot(_q)  # type: ignore[attr-defined]
+                        _added += 1
+                return _added
 
             for _pn in _hit_pages:
                 if not (1 <= _pn <= len(_doc)):
                     continue
                 _pg = _doc[_pn - 1]
                 _highlighted_any = False
-                # Pass 1: exact substring search via PyMuPDF
+                # Track which regex-matched substrings we found via search_for
+                # — pass 2 can then walk page words to catch substrings the
+                # CMap aliasing or column-merged text left invisible.
+                _regex_terms: List[str] = []
+                # Pass 1a (regex): run the pattern against the page text and
+                # collect the *actual* matched substrings. Those ARE literal
+                # substrings of the PDF, so search_for can locate their quads.
+                if _use_regex:
+                    try:
+                        _rx = re.compile(
+                            _query, 0 if _case else re.IGNORECASE)
+                        _page_text = _pg.get_text("text", sort=True) or ""
+                        _seen: set = set()
+                        for _m in _rx.finditer(_page_text):
+                            _t = _m.group(0)
+                            if _t and _t not in _seen:
+                                _seen.add(_t)
+                                _regex_terms.append(_t)
+                        for _term in _regex_terms:
+                            if _search_with_fallback(_pg, _term) > 0:
+                                _highlighted_any = True
+                    except re.error:
+                        pass
+                # Pass 1b (literal): exact substring search via PyMuPDF
                 for _term in _terms:
-                    for _quad in _pg.search_for(_term, quads=True):
-                        _pg.add_highlight_annot(_quad)
+                    if _search_with_fallback(_pg, _term) > 0:
                         _highlighted_any = True
                 # Pass 2: normalized word match. Always runs (cheap) so we
                 # catch additional hits the exact pass missed — e.g. words
-                # with fatha/damma/kasra or أ/إ/ا differences.
+                # with fatha/damma/kasra or أ/إ/ا differences AND words
+                # where search_for failed because of CMap / punctuation
+                # aliasing (regex mode adds the matched substrings to the
+                # per-word check too).
+                _regex_terms_norm = [
+                    _normalize_arabic(_t).lower() for _t in _regex_terms]
                 with contextlib.suppress(Exception):
                     _words = _pg.get_text("words")  # [(x0,y0,x1,y1,word,...)]
                     for _w in _words:
@@ -3788,7 +4222,13 @@ def run_gui() -> int:
                         _word_norm = _normalize_arabic(_word_text)
                         if not _word_norm:
                             continue
-                        if any(qw and qw in _word_norm for qw in _query_words):
+                        _word_norm_lower = _word_norm.lower()
+                        _hit = any(qw and qw in _word_norm
+                                   for qw in _query_words)
+                        if not _hit and _regex_terms_norm:
+                            _hit = any(rt and rt in _word_norm_lower
+                                       for rt in _regex_terms_norm)
+                        if _hit:
                             _rect = _fitz.Rect(_w[0], _w[1], _w[2], _w[3])
                             _pg.add_highlight_annot(_rect)
                             _highlighted_any = True
@@ -3824,10 +4264,52 @@ def run_gui() -> int:
                 match_type, score_text = "fuzzy", str(m.score)
             page_text = str(m.page_num) if m.page_num else ""
             _tag = "odd" if row_index % 2 else "even"
-            _snippet = _line_context(m.line, pattern_var.get())
+            # Anchor the snippet on the *actual* regex/literal match
+            # position when we can find one — `_line_context`'s fuzzy-token
+            # heuristic otherwise crops long joined lines (e.g. multi-column
+            # PDFs where PyMuPDF's sort=True merges two columns) before
+            # reaching the match, leaving the ‹…› markers nowhere to land.
+            _full_ranges = _find_match_ranges(
+                m.line, pattern_var.get(),
+                use_regex=regex_var.get(),
+                case_sensitive=case_var.get(),
+                whole_word=whole_word_var.get(),
+            )
+            if _full_ranges:
+                # Window of ~120 chars centered on the first match.
+                _ms, _me = _full_ranges[0]
+                _win_half = 60
+                _ws = max(0, _ms - _win_half)
+                _we = min(len(m.line), _me + _win_half)
+                _snippet = m.line[_ws:_we]
+                if _ws > 0:
+                    _snippet = "… " + _snippet
+                if _we < len(m.line):
+                    _snippet = _snippet + " …"
+                # Re-compute ranges in the trimmed snippet coordinates.
+                _snippet_ranges = _find_match_ranges(
+                    _snippet, pattern_var.get(),
+                    use_regex=regex_var.get(),
+                    case_sensitive=case_var.get(),
+                    whole_word=whole_word_var.get(),
+                )
+            else:
+                _snippet = _line_context(m.line, pattern_var.get())
+                _snippet_ranges = _find_match_ranges(
+                    _snippet, pattern_var.get(),
+                    use_regex=regex_var.get(),
+                    case_sensitive=case_var.get(),
+                    whole_word=whole_word_var.get(),
+                )
+            # Mark the matched substring(s) inside the snippet so the user
+            # can see *where* the hit is — Tk's Treeview cells can't paint
+            # per-substring backgrounds, so we wrap with ‹…› guillemets.
+            # The yellow-bg highlight lives in the selected-row preview
+            # below the table (a tk.Text widget supports per-range tags).
+            _snippet_marked = _wrap_marks(_snippet, _snippet_ranges)
             iid = tree.insert("", "end", values=(
                 display_name, m.line_num, page_text, match_type, score_text,
-                _fix_arabic(_snippet)), tags=(_tag,))
+                _fix_arabic(_snippet_marked)), tags=(_tag,))
             _row_paths[iid] = fp
             _row_full_lines[iid] = _fix_arabic(m.line)
             row_index += 1
@@ -3925,10 +4407,21 @@ def run_gui() -> int:
         results = state["results"]
         if not results:
             return
+        # Suggest a filename built from the active query + result count +
+        # timestamp so back-to-back exports don't all collide on the same
+        # name (the OS otherwise re-uses the last-used name).
+        import datetime as _dt
+        _pat_raw = (pattern_var.get() or "search").strip()
+        _pat_safe = re.sub(r"[^A-Za-z0-9._-]+", "-", _pat_raw).strip("-_.")[:32] or "search"
+        _n_total = sum(
+            len(m) for _, m in results.values())  # type: ignore[attr-defined]
+        _ts = _dt.datetime.now().strftime("%Y%m%d-%H%M")
+        _default_name = f"fuzzer-{_pat_safe}-{_n_total}m-{_ts}.xlsx"
         path = filedialog.asksaveasfilename(
             title="Export results",
             defaultextension=".xlsx",
             initialdir=str(_PROJECT_DIR),
+            initialfile=_default_name,
             filetypes=[
                 ("Excel workbook", "*.xlsx"),
                 ("CSV", "*.csv"),
@@ -3994,48 +4487,88 @@ def run_gui() -> int:
                 _tmp_path = _highlighted_pdfs.get(filepath, filepath)
                 hl_note = "" if _tmp_path != filepath else " (no highlight — fitz missing?)"
 
+                # Snap fuzzer to the left half and target the PDF viewer at
+                # the right half, so the user sees both panes side-by-side
+                # without manually arranging windows. macOS reserves the top
+                # ~30 px for the menu bar; we leave a similar margin at the
+                # bottom for the Dock.
+                _screen_w = root.winfo_screenwidth()
+                _screen_h = root.winfo_screenheight()
+                _margin = 30
+                _half = _screen_w // 2
+                _viewer_top = _margin
+                _viewer_left = _half
+                _viewer_right = _screen_w
+                _viewer_bottom = _screen_h - _margin
+                with contextlib.suppress(Exception):
+                    root.geometry(
+                        f"{_half}x{_screen_h - _margin * 2}+0+{_margin}")
+
                 _esc = _tmp_path.replace("\\", "\\\\").replace('"', '\\"')
-                # Open + resize + navigate via ⌘⌥G keyboard shortcut
-                _script = "\n".join([
-                    'tell application "Preview"',
-                    '  activate',
-                    f'  open POSIX file "{_esc}"',
-                    'end tell',
-                    'delay 0.35',
-                    'try',
-                    '  tell application "System Events"',
-                    '    tell process "Preview"',
-                    '      tell front window',
-                    '        if value of attribute "AXMinimized" is true then',
-                    '          set value of attribute "AXMinimized" to false',
-                    '        end if',
-                    '        set position to {120, 80}',
-                    '        set size to {1000, 720}',
-                    '      end tell',
-                    '    end tell',
-                    '  end tell',
-                    'end try',
-                    f'if {open_page} > 1 then',
-                    '  tell application "System Events"',
-                    '    tell process "Preview"',
-                    '      keystroke "g" using {command down, option down}',
-                    '      set n to 0',
-                    '      repeat',
-                    '        delay 0.06',
-                    '        set n to n + 1',
-                    '        if n > 30 then exit repeat',
-                    '        try',
-                    '          tell sheet 1 of front window',
-                    f'            set value of text field 1 to "{open_page}"',
-                    '            click button "OK"',
-                    '          end tell',
-                    '          exit repeat',
-                    '        end try',
-                    '      end repeat',
-                    '    end tell',
-                    '  end tell',
-                    'end if',
-                ])
+                # Prefer Skim when installed — its AppleScript dictionary has
+                # first-class `go to page N` and reliable annotation viewing.
+                # Preview is the fallback; it requires fragile UI scripting
+                # (Cmd+Opt+G → text-field-in-sheet) for page nav.
+                _skim_installed = os.path.isdir("/Applications/Skim.app")
+                if _skim_installed:
+                    _script = "\n".join([
+                        'tell application "Skim"',
+                        '  activate',
+                        f'  set d to open POSIX file "{_esc}"',
+                        f'  try',
+                        f'    set bounds of window 1 to '
+                        f'{{{_viewer_left}, {_viewer_top}, '
+                        f'{_viewer_right}, {_viewer_bottom}}}',
+                        f'  end try',
+                        f'  try',
+                        f'    tell d to go to page {open_page}',
+                        f'  end try',
+                        'end tell',
+                    ])
+                    _viewer_name = "Skim"
+                else:
+                    _script = "\n".join([
+                        'tell application "Preview"',
+                        '  activate',
+                        f'  open POSIX file "{_esc}"',
+                        'end tell',
+                        'delay 0.35',
+                        'try',
+                        '  tell application "System Events"',
+                        '    tell process "Preview"',
+                        '      tell front window',
+                        '        if value of attribute "AXMinimized" is true then',
+                        '          set value of attribute "AXMinimized" to false',
+                        '        end if',
+                        f'        set position to {{{_viewer_left}, {_viewer_top}}}',
+                        f'        set size to {{{_viewer_right - _viewer_left}, '
+                        f'{_viewer_bottom - _viewer_top}}}',
+                        '      end tell',
+                        '    end tell',
+                        '  end tell',
+                        'end try',
+                        f'if {open_page} > 1 then',
+                        '  tell application "System Events"',
+                        '    tell process "Preview"',
+                        '      keystroke "g" using {command down, option down}',
+                        '      set n to 0',
+                        '      repeat',
+                        '        delay 0.06',
+                        '        set n to n + 1',
+                        '        if n > 30 then exit repeat',
+                        '        try',
+                        '          tell sheet 1 of front window',
+                        f'            set value of text field 1 to "{open_page}"',
+                        '            click button "OK"',
+                        '          end tell',
+                        '          exit repeat',
+                        '        end try',
+                        '      end repeat',
+                        '    end tell',
+                        '  end tell',
+                        'end if',
+                    ])
+                    _viewer_name = "Preview"
                 _as_proc = subprocess.run(
                     ["osascript", "-e", _script],
                     capture_output=True, text=True
@@ -4049,8 +4582,10 @@ def run_gui() -> int:
 
                 status_var.set(
                     f"Opened page {open_page} — {os.path.basename(filepath)}{hl_note}")
-                _log_activity(f"Opened PDF '{os.path.basename(filepath)}' page {open_page}"
-                              + (" (highlighted)" if _tmp_path != filepath else " (no highlight)"))
+                _log_activity(
+                    f"Opened PDF '{os.path.basename(filepath)}' page {open_page} "
+                    f"in {_viewer_name}"
+                    + (" (highlighted)" if _tmp_path != filepath else " (no highlight)"))
 
             elif ext in _editor_exts:
                 if shutil.which("code"):
@@ -4127,7 +4662,7 @@ def run_gui() -> int:
     def _set_selected_preview_from_iid(iid: str) -> None:
         vals = tree.item(iid, "values")
         if not vals:
-            selected_var.set("")
+            _set_selected_preview("")
             return
 
         filepath = _row_paths.get(iid, "")
@@ -4143,7 +4678,6 @@ def run_gui() -> int:
         page_text = str(vals[2]) if len(vals) > 2 else ""
         match_type = str(vals[3]) if len(vals) > 3 else ""
         score_text = str(vals[4]) if len(vals) > 4 else ""
-        content = str(vals[5]) if len(vals) > 5 else ""
 
         score_suffix = ""
         if match_type == "fuzzy" and score_text:
@@ -4151,13 +4685,22 @@ def run_gui() -> int:
 
         page_suffix = f" (page {page_text})" if page_text else ""
 
-        short = content.strip().replace("\n", " ")
-        if len(short) > 160:
-            short = short[:157] + "…"
-
-        selected_var.set(
-            f"{filename}:{line_num} {match_type}{score_suffix}{page_suffix} — {short}"
+        # Use the unmarked full line (not the cell's marked snippet) so we
+        # can compute clean character ranges for the yellow `match` tag.
+        full_line = _row_full_lines.get(iid, "").replace("\n", " ").strip()
+        prefix = f"{filename}:{line_num} {match_type}{score_suffix}{page_suffix} — "
+        text = prefix + full_line
+        ranges = _find_match_ranges(
+            full_line, pattern_var.get(),
+            use_regex=regex_var.get(),
+            case_sensitive=case_var.get(),
+            whole_word=whole_word_var.get(),
         )
+        # Shift ranges by the prefix length since they were computed against
+        # `full_line` but applied against `prefix + full_line`.
+        shift = len(prefix)
+        shifted = [(s + shift, e + shift) for (s, e) in ranges]
+        _set_selected_preview(text, shifted)
 
     def on_tree_select(_event: object = None) -> None:
         sel = tree.selection()
@@ -4444,6 +4987,24 @@ def run_gui() -> int:
     # effect on startup, not just after toggling.
     _configure_ttk_styles(_T)
     _apply_raw_colors(_T)
+
+    # Land focus on the search input as soon as the window is realized, and
+    # re-focus it whenever the window comes back from the background with no
+    # specific widget owning focus. Feels like a search bar (open → type →
+    # search) rather than having to click first. `after_idle` waits until Tk
+    # has finished mapping widgets so focus_set sticks reliably on macOS.
+    root.after_idle(lambda: pattern_entry.focus_set())
+
+    def _refocus_on_window_activate(_e: object) -> None:
+        # Widget-specific bind (not bind_all) → only fires when root itself
+        # is the FocusIn target, which is the macOS signal that the window
+        # was just activated. Guard against stealing focus from a child the
+        # user has already clicked into.
+        with contextlib.suppress(Exception):
+            cur = root.focus_get()
+            if cur in (None, root):
+                pattern_entry.focus_set()
+    root.bind("<FocusIn>", _refocus_on_window_activate)
 
     root.after(100, poll_queue)
     root.mainloop()
