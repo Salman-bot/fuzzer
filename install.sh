@@ -96,10 +96,18 @@ ok "pip: $($PYTHON -m pip --version | awk '{print $1, $2}')"
 PIP_ARGS=(install --upgrade)
 [[ $PIP_USER -eq 1 ]] && PIP_ARGS+=(--user)
 
-# Auto-detect PEP 668 (externally-managed) Pythons and add --user if not already.
-if [[ $PIP_USER -eq 0 ]] && "$PYTHON" -m pip install --dry-run --quiet pip 2>&1 | grep -q "externally-managed"; then
-    warn "Python is externally-managed (PEP 668) — switching to --user install."
-    PIP_ARGS+=(--user)
+# Auto-detect PEP 668 (externally-managed) Pythons via the marker file. On
+# Homebrew Python the marker lives at <stdlib>/EXTERNALLY-MANAGED and pip
+# refuses system installs without --break-system-packages. --user alone is
+# NOT enough on pip 24.1+ — the marker still blocks. Detect and add both.
+if "$PYTHON" -c "
+import sysconfig, os, sys
+m = os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
+sys.exit(0 if os.path.exists(m) else 1)
+" 2>/dev/null; then
+    warn "Python is externally-managed (PEP 668) — adding --user --break-system-packages."
+    [[ $PIP_USER -eq 0 ]] && PIP_ARGS+=(--user)
+    PIP_ARGS+=(--break-system-packages)
 fi
 
 CORE_DEPS=(
@@ -154,19 +162,44 @@ fi
 step "smoke test: importing core deps…"
 "$PYTHON" - <<'PY'
 import importlib, sys
-mods = ["fitz", "rapidfuzz", "pdfplumber", "openpyxl", "docx", "pyarabic"]
-missing = []
-for m in mods:
+# PDF support is "either or": at least one of fitz / pdfplumber must import.
+# fuzzer prefers fitz (PyMuPDF — better Arabic) and falls back to pdfplumber.
+pdf_backends = ["fitz", "pdfplumber"]
+required = ["rapidfuzz", "openpyxl", "docx", "pyarabic"]
+missing_pdf = []
+for m in pdf_backends:
     try:
         importlib.import_module(m)
     except Exception as e:
-        missing.append((m, str(e)))
-if missing:
-    print("  some imports failed:")
-    for m, err in missing:
+        missing_pdf.append((m, str(e)))
+missing_req = []
+for m in required:
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        missing_req.append((m, str(e)))
+
+# Fail only if required modules are missing OR no PDF backend works at all.
+fatal = bool(missing_req) or len(missing_pdf) == len(pdf_backends)
+if missing_req:
+    print("  required imports failed:")
+    for m, err in missing_req:
         print(f"    - {m}: {err}")
+if len(missing_pdf) == len(pdf_backends):
+    print()
+    print("  WARNING: PDF support requires pdfplumber or pymupdf — pip install pymupdf")
+    print("  Both backends failed to import:")
+    for m, err in missing_pdf:
+        print(f"    - {m}: {err}")
+    print("  fuzzer will still launch, but .pdf files will be skipped.")
+elif missing_pdf:
+    # One backend works, the other doesn't — informational, not fatal.
+    have = [m for m in pdf_backends if m not in {n for n, _ in missing_pdf}][0]
+    print(f"  PDF support OK via {have} ({missing_pdf[0][0]} unavailable)")
+if fatal:
     sys.exit(1)
-print(f"  all {len(mods)} core modules import cleanly")
+ok_count = len(required) - len(missing_req) + len(pdf_backends) - len(missing_pdf)
+print(f"  {ok_count}/{len(required) + len(pdf_backends)} core modules import cleanly")
 PY
 ok "smoke test passed"
 
