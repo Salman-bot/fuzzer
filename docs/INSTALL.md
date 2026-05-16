@@ -43,8 +43,8 @@ cd ~/bin
 `install.sh` does the rest:
 
 - Installs every Python dependency fuzzer needs (`pymupdf`, `rapidfuzz`,
-  `pdfplumber`, `anthropic`, `openpyxl`, `python-docx`, `pyarabic`,
-  `tkinterdnd2`, `arabic_reshaper`, `python-bidi`).
+  `pdfplumber`, `openpyxl`, `python-docx`, `pyarabic`, `tkinterdnd2`,
+  `arabic_reshaper`, `python-bidi`).
 - Auto-handles PEP 668 (externally-managed Python) by switching to
   `--user` installs.
 - Builds the `_ar_norm` C extension.
@@ -70,17 +70,7 @@ source ~/.zshrc
 fuzzer                       # GUI
 ```
 
-## 6. Optional: AI mode
-
-The GUI's grounded chat panel needs an Anthropic API key:
-
-```sh
-export ANTHROPIC_API_KEY=sk-ant-…
-```
-
-Get one at <https://console.anthropic.com/settings/keys>.
-
-## 7. Optional: the `transcribe` helper
+## 6. Optional: the `transcribe` helper
 
 `transcribe` turns audio / video / YouTube URLs into searchable PDFs
 that fuzzer can then index. One extra dep beyond what `install.sh`

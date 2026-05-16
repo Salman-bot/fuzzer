@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — set up the fuzzer environment on a fresh device.
+# install.sh — set up the fuzzer environment on a fresh Mac.
 #
 # Installs Python dependencies, builds the _ar_norm C extension, and
 # verifies the toolchain. Designed to be safe to re-run.
@@ -48,21 +48,18 @@ ok()   { echo "${GRN}✓${RST} $*"; }
 warn() { echo "${YEL}!${RST} $*" >&2; }
 fail() { echo "${RED}✗${RST} $*" >&2; exit 1; }
 
-# ── platform + toolchain checks ───────────────────────────────────────────────
-case "$(uname -s)" in
-    Darwin) PLATFORM=macos ;;
-    Linux)  PLATFORM=linux ;;
-    *)      PLATFORM=other; warn "untested platform $(uname -s) — proceeding anyway" ;;
-esac
-ok "platform: $PLATFORM"
+# ── platform check ────────────────────────────────────────────────────────────
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    fail "This installer is macOS-only. Detected $(uname -s)."
+fi
+ok "platform: macOS"
 
+# ── toolchain checks ──────────────────────────────────────────────────────────
 PYTHON="$(command -v python3 || command -v python || true)"
 if [[ -z "$PYTHON" ]]; then
-    echo
-    fail "python3 not found.
-  macOS:  brew install python  (or install from https://www.python.org/downloads/)
-  Linux:  sudo apt install python3 python3-pip  (Debian/Ubuntu)
-          sudo dnf install python3 python3-pip  (Fedora)"
+    fail "python3 not found. Install via Homebrew:
+  brew install python@3.14
+  or download from https://www.python.org/downloads/"
 fi
 PYVER="$("$PYTHON" -c 'import sys; print("%d.%d"%sys.version_info[:2])')"
 ok "python: $PYTHON (v$PYVER)"
@@ -71,16 +68,11 @@ if ! "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 9)' 2>/dev/null; t
     fail "Python 3.9+ required (found $PYVER)."
 fi
 
-# C compiler — needed for _ar_norm. Try cc first (most portable).
-CC_BIN="$(command -v cc || command -v clang || command -v gcc || true)"
+# C compiler — needed for _ar_norm.
+CC_BIN="$(command -v cc || command -v clang || true)"
 if [[ -z "$CC_BIN" ]]; then
-    echo
     warn "no C compiler found — _ar_norm will fall back to pyarabic / pure Python."
-    case "$PLATFORM" in
-        macos) warn "  install Xcode CLT:  xcode-select --install" ;;
-        linux) warn "  Debian/Ubuntu:      sudo apt install build-essential python3-dev"
-               warn "  Fedora:             sudo dnf install gcc python3-devel" ;;
-    esac
+    warn "  install Xcode CLT:  xcode-select --install"
 else
     ok "C compiler: $CC_BIN"
 fi
@@ -90,17 +82,13 @@ HAS_HEADERS=1
 if ! "$PYTHON" -c 'import sysconfig, os; p=sysconfig.get_path("include"); assert os.path.exists(os.path.join(p, "Python.h"))' 2>/dev/null; then
     HAS_HEADERS=0
     warn "Python development headers (Python.h) not found — _ar_norm build will be skipped."
-    case "$PLATFORM" in
-        linux) warn "  Debian/Ubuntu:      sudo apt install python3-dev"
-               warn "  Fedora:             sudo dnf install python3-devel" ;;
-    esac
+    warn "  Homebrew Python ships them; if missing, reinstall with: brew reinstall python@3.14"
 fi
 
 # ── pip availability ──────────────────────────────────────────────────────────
 if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
     fail "pip not available for $PYTHON. Install it via:
-  $PYTHON -m ensurepip --upgrade
-  or your package manager (e.g. apt install python3-pip)."
+  $PYTHON -m ensurepip --upgrade"
 fi
 ok "pip: $($PYTHON -m pip --version | awk '{print $1, $2}')"
 
@@ -118,7 +106,6 @@ CORE_DEPS=(
     pymupdf
     rapidfuzz
     pdfplumber
-    anthropic
     openpyxl
     python-docx
     pyarabic
@@ -166,7 +153,7 @@ fi
 step "smoke test: importing core deps…"
 "$PYTHON" - <<'PY'
 import importlib, sys
-mods = ["fitz", "rapidfuzz", "pdfplumber", "anthropic", "openpyxl", "docx", "pyarabic"]
+mods = ["fitz", "rapidfuzz", "pdfplumber", "openpyxl", "docx", "pyarabic"]
 missing = []
 for m in mods:
     try:
@@ -191,14 +178,8 @@ next steps:
   ${DIM}# launch the GUI${RST}
   ./fuzzer
 
-  ${DIM}# one-shot CLI search${RST}
-  ./fuzzer "climate" *.pdf
-
   ${DIM}# run the unit tests${RST}
   make test
-
-  ${DIM}# (optional) AI mode — needs an Anthropic API key${RST}
-  export ANTHROPIC_API_KEY=sk-ant-…
 
   ${DIM}# (optional) fetch real PDFs for the corpus tests${RST}
   make test-corpus && make test

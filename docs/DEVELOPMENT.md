@@ -4,12 +4,12 @@
 
 ```sh
 make install
-# = pip install pymupdf rapidfuzz pdfplumber anthropic openpyxl
-#               python-docx pyarabic tkinterdnd2
+# = pip install pymupdf rapidfuzz pdfplumber openpyxl python-docx
+#               pyarabic tkinterdnd2 arabic_reshaper python-bidi
 ```
 
 All deps are optional — `fuzzer` falls back gracefully if any are missing
-(see [architecture.md](architecture.md#optional-dependencies)).
+(see [INTERNALS.md](INTERNALS.md#optional-dependencies)).
 
 ## Build the C extension
 
@@ -35,17 +35,6 @@ Preview and auto-closes it after the assertion. To skip:
 ```sh
 python3 -m pytest test_fuzzer.py --deselect test_fuzzer.py::TestVisualHighlight
 ```
-
-## Run the linter
-
-```sh
-sourcery review --check fuzzer test_fuzzer.py   # report
-sourcery review --fix   fuzzer test_fuzzer.py   # apply auto-fixes
-```
-
-Stylistic test-loop / test-conditional rules are disabled in
-[.sourcery.yaml](../.sourcery.yaml) because the project uses unittest-style
-test classes with loops, which is a legitimate choice.
 
 ## Build the docs
 

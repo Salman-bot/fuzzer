@@ -5,10 +5,6 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# Generated codebase overview — regenerate with `make doc`.
-project_info.md
-project_info__*.md
-
 # Test PDF corpus — fetched on demand with `make test-corpus`.
 # (Tarball lives outside the repo; pattern guards against accidental drops.)
 test_pdfs/
@@ -27,6 +23,3 @@ native/_ar_norm*.so
 
 # HTML docs build output (regenerate with `make docs`).
 docs/_build/
-
-# Chat-generated artifacts (Claude's write_file output lands in this folder).
-3_Pillars_of_Societal_Peace.html
