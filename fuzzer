@@ -830,12 +830,14 @@ def run_gui() -> int:
                 self._tip = None
 
     # tkinterdnd2 provides a drag-and-drop-aware Tk root; fall back to plain Tk
+    # if the tkdnd native library can't load (e.g. tkinterdnd2 ships an
+    # 8.x dylib but Python is linked against Tcl/Tk 9).
     try:
         from tkinterdnd2 import DND_FILES  # type: ignore[import-not-found]
         from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
         _dnd_available = True
-    except ImportError:
+    except Exception:
         root = tk.Tk()
         DND_FILES = None
         _dnd_available = False

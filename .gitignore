@@ -23,3 +23,6 @@ native/_ar_norm*.so
 
 # HTML docs build output (regenerate with `make docs`).
 docs/_build/
+
+# Generated codebase overview — regenerate with `make doc` (calls `claude -p`).
+project_info.md
