@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""transcribe — turn a YouTube URL or local A/V file into a transcript PDF.
+
+Pipeline: yt-dlp / ffmpeg  →  whisper (local)  →  PDF (pymupdf).
+
+Output lands in the current working directory by default — wherever you ran
+the command from. Pass -o PATH to override.
+
+Usage:
+    transcribe <url-or-file> [-o OUT.pdf] [--model M] [--lang L]
+               [--no-timestamps] [--also txt,md,srt]
+               [--append MASTER.pdf] [--keep-audio]
+
+Examples:
+    transcribe https://youtu.be/dQw4w9WgXcQ
+    transcribe lecture.mp4 -o lecture.pdf --model medium --lang ar
+    transcribe podcast.m4a --also txt,srt
+
+Languages: any Whisper-supported language (ar, ja, ko, es, fr, ru, tr, …).
+The PDF auto-picks a font with glyphs for the detected script (Arial Unicode
+for Arabic, Hiragino for CJK, Helvetica otherwise). Arabic gets proper RTL
+shaping via arabic-reshaper + python-bidi.
+
+Install on a fresh Mac: see INSTALL.md.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, NoReturn, TypedDict, cast
+
+# ── pretty output ─────────────────────────────────────────────────────────────
+_TTY = sys.stderr.isatty()
+def _c(code, s): return f"\033[{code}m{s}\033[0m" if _TTY else s
+def step(msg): print(_c("1", f"→ {msg}"), file=sys.stderr, flush=True)
+def ok(msg):   print(_c("32", f"✓ {msg}"), file=sys.stderr, flush=True)
+def warn(msg): print(_c("33", f"! {msg}"), file=sys.stderr, flush=True)
+def die(msg: str, code: int = 1) -> NoReturn:
+    print(_c("31", f"✗ {msg}"), file=sys.stderr)
+    sys.exit(code)
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".flv", ".wmv"}
+
+def is_url(s: str) -> bool:
+    return bool(re.match(r"^https?://", s, re.I))
+
+def need(cmd: str, hint: str) -> str:
+    p = shutil.which(cmd)
+    if not p:
+        die(f"'{cmd}' not found — {hint}")
+    return p
+
+def fmt_ts(seconds: float | None) -> str:
+    if seconds is None:
+        return "00:00"
+    s_total = int(seconds)
+    h, s_total = divmod(s_total, 3600)
+    m, s_total = divmod(s_total, 60)
+    return f"{h:02d}:{m:02d}:{s_total:02d}" if h else f"{m:02d}:{s_total:02d}"
+
+def fmt_srt_ts(seconds: float | None) -> str:
+    if seconds is None:
+        seconds_f = 0.0
+    else:
+        seconds_f = float(seconds)
+    ms = int(round(seconds_f * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def has_arabic(text: str) -> bool:
+    return any('؀' <= c <= 'ۿ' or 'ݐ' <= c <= 'ݿ' for c in text)
+
+def has_cjk(text: str) -> bool:
+    # Covers Hiragana, Katakana, CJK Unified Ideographs, Hangul.
+    for c in text:
+        o = ord(c)
+        if (0x3040 <= o <= 0x30FF        # Hiragana + Katakana
+                or 0x4E00 <= o <= 0x9FFF # CJK Unified Ideographs
+                or 0x3400 <= o <= 0x4DBF # CJK Extension A
+                or 0xAC00 <= o <= 0xD7AF # Hangul syllables
+                or 0xFF66 <= o <= 0xFF9F # Halfwidth Katakana
+        ):
+            return True
+    return False
+
+class WhisperSegment(TypedDict):
+    start: float
+    end: float
+    text: str
+
+# ── audio acquisition ─────────────────────────────────────────────────────────
+def fetch_youtube(url: str, workdir: Path) -> tuple[Path, str]:
+    """Download audio from YouTube, return (audio_path, title)."""
+    need("yt-dlp", "brew install yt-dlp")
+    step(f"downloading audio from {url}")
+    template = str(workdir / "src.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "-f", "bestaudio/best",
+        "-x", "--audio-format", "wav",
+        "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
+        "--print", "after_move:%(title)s",
+        "-o", template,
+        url,
+    ]
+    out = subprocess.check_output(cmd, text=True).strip().splitlines()
+    title = out[-1] if out else "YouTube video"
+    audios = list(workdir.glob("src.*"))
+    if not audios:
+        die("yt-dlp produced no audio file")
+    return audios[0], title
+
+def fetch_local(path: Path, workdir: Path) -> tuple[Path, str]:
+    if not path.exists():
+        die(f"file not found: {path}")
+    title = path.stem
+    if path.suffix.lower() in AUDIO_EXTS:
+        # Re-encode to 16k mono wav for whisper consistency.
+        need("ffmpeg", "brew install ffmpeg")
+        wav = workdir / "src.wav"
+        step(f"transcoding {path.name} → 16k mono wav")
+        subprocess.check_call(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-i", str(path), "-ac", "1", "-ar", "16000", str(wav)]
+        )
+        return wav, title
+    if path.suffix.lower() in VIDEO_EXTS or path.suffix == "":
+        need("ffmpeg", "brew install ffmpeg")
+        wav = workdir / "src.wav"
+        step(f"extracting audio from {path.name}")
+        subprocess.check_call(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", str(wav)]
+        )
+        return wav, title
+    die(f"unsupported file type: {path.suffix}")
+
+# ── transcription ─────────────────────────────────────────────────────────────
+def transcribe_whisper(audio: Path, model_name: str, language: str | None) -> dict[str, Any]:
+    step(f"loading whisper model: {model_name}")
+    try:
+        import whisper  # type: ignore
+    except ImportError:
+        die("whisper not installed — pip install openai-whisper (or: brew install whisper)")
+    model = whisper.load_model(model_name)
+    step("transcribing (this may take a while)…")
+    return model.transcribe(
+        str(audio),
+        language=language,          # None → auto-detect
+        verbose=False,
+        fp16=False,                 # CPU-safe; MPS uses fp32 anyway
+    )
+
+# ── output writers ────────────────────────────────────────────────────────────
+def _arabic_shape(text: str) -> str:
+    """Reshape Arabic text for visual ordering in PDF. Falls back to raw."""
+    try:
+        import arabic_reshaper  # type: ignore
+        from bidi.algorithm import get_display  # type: ignore
+    except ImportError:
+        return text
+    # Reshape each line so newlines are preserved.
+    lines = text.split("\n")
+    return "\n".join(get_display(arabic_reshaper.reshape(l)) for l in lines)
+
+def _pick_font(text: str) -> tuple[str, str | None]:
+    """Return (fontname, fontfile|None) suitable for the given text.
+
+    Arabic takes priority over CJK: Whisper-tiny commonly hallucinates a few
+    stray CJK glyphs into Arabic transcripts; picking Hiragino (no Arabic)
+    would tofu the whole page. Arial Unicode covers Arabic AND CJK as a
+    fallback, so it's the safe pick when both scripts are present.
+    """
+    if has_arabic(text):
+        for candidate in (
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/GeezaPro.ttc",
+        ):
+            if os.path.exists(candidate):
+                return "body", candidate
+        warn("no Arabic-capable font found — PDF may show tofu boxes for Arabic")
+    if has_cjk(text):
+        for candidate in (
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ):
+            if os.path.exists(candidate):
+                return "body", candidate
+        warn("no CJK-capable font found — PDF may show tofu boxes for Japanese/Chinese/Korean")
+    return "helv", None
+
+def write_pdf(out: Path, title: str, segments: list[WhisperSegment], full_text: str,
+              include_timestamps: bool, source: str) -> None:
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        die("pymupdf not installed — pip install pymupdf")
+
+    fontname, fontfile = _pick_font(full_text + " " + title)
+    rtl = has_arabic(full_text)
+    body_align = fitz.TEXT_ALIGN_RIGHT if rtl else fitz.TEXT_ALIGN_LEFT
+
+    doc = fitz.open()
+    W, H = fitz.paper_size("a4")
+    MARGIN = 50
+    body_rect = fitz.Rect(MARGIN, MARGIN + 60, W - MARGIN, H - MARGIN)
+
+    # Build the body text once. For RTL, put the timestamp AFTER the segment
+    # text so the bidi algorithm places the LTR timestamp on the visual left
+    # of each line, mirroring the right-aligned reading direction.
+    if include_timestamps and segments:
+        if rtl:
+            lines = [f"{s['text'].strip()}  [{fmt_ts(s['start'])}]"
+                     for s in segments]
+        else:
+            lines = [f"[{fmt_ts(s['start'])}]  {s['text'].strip()}"
+                     for s in segments]
+        body = "\n".join(lines)
+    else:
+        body = full_text.strip()
+
+    if rtl:
+        body = _arabic_shape(body)
+        title_disp = _arabic_shape(title)
+    else:
+        title_disp = title
+
+    remaining = body
+    first = True
+    while True:
+        page = doc.new_page(width=W, height=H)
+        if fontfile:
+            page.insert_font(fontname=fontname, fontfile=fontfile)
+        if first:
+            # Title block on page 1.
+            page.insert_textbox(
+                fitz.Rect(MARGIN, MARGIN, W - MARGIN, MARGIN + 30),
+                title_disp,
+                fontname=fontname, fontfile=fontfile,
+                fontsize=16, align=body_align,
+            )
+            page.insert_textbox(
+                fitz.Rect(MARGIN, MARGIN + 30, W - MARGIN, MARGIN + 55),
+                f"Source: {source}",
+                fontname="helv", fontsize=9, color=(0.4, 0.4, 0.4),
+            )
+            first = False
+        # insert_textbox returns negative of the unwritten character count, or
+        # positive remaining vertical space if everything fit.
+        rv = page.insert_textbox(
+            body_rect, remaining,
+            fontname=fontname, fontfile=fontfile,
+            fontsize=11, align=body_align,
+        )
+        if rv >= 0:
+            break
+        # Some text was clipped. Estimate how much fit and continue.
+        # pymupdf doesn't tell us exactly where it stopped, so we binary-search
+        # the longest prefix that fits.
+        lo, hi = 1, len(remaining)
+        fit_end = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            probe = doc.new_page(width=W, height=H)
+            if fontfile:
+                probe.insert_font(fontname=fontname, fontfile=fontfile)
+            r = probe.insert_textbox(
+                body_rect, remaining[:mid],
+                fontname=fontname, fontfile=fontfile,
+                fontsize=11, align=body_align,
+            )
+            doc.delete_page(-1)
+            if r >= 0:
+                fit_end = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if fit_end == 0:
+            # Couldn't fit even one char — bail to avoid infinite loop.
+            warn("PDF layout could not fit content; truncating")
+            break
+        # Re-render the page with the prefix that actually fits.
+        doc.delete_page(-1)
+        page = doc.new_page(width=W, height=H)
+        if fontfile:
+            page.insert_font(fontname=fontname, fontfile=fontfile)
+        page.insert_textbox(
+            body_rect, remaining[:fit_end],
+            fontname=fontname, fontfile=fontfile,
+            fontsize=11, align=body_align,
+        )
+        # Break on a newline if we can, to keep segments tidy.
+        nl = remaining.rfind("\n", 0, fit_end)
+        cut = nl + 1 if nl > fit_end - 200 else fit_end
+        remaining = remaining[cut:]
+        if not remaining.strip():
+            break
+
+    doc.save(str(out))
+    doc.close()
+
+def write_txt(out: Path, title: str, segments: list[WhisperSegment], full_text: str,
+              include_timestamps: bool) -> None:
+    parts = [title, "=" * len(title), ""]
+    if include_timestamps and segments:
+        for s in segments:
+            parts.append(f"[{fmt_ts(s['start'])}] {s['text'].strip()}")
+    else:
+        parts.append(full_text.strip())
+    out.write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+def write_md(out: Path, title: str, segments: list[WhisperSegment], full_text: str) -> None:
+    parts = [f"# {title}", ""]
+    if segments:
+        for s in segments:
+            parts.append(f"**[{fmt_ts(s['start'])}]** {s['text'].strip()}")
+            parts.append("")
+    else:
+        parts.append(full_text.strip())
+    out.write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+def write_srt(out: Path, segments: list[WhisperSegment]) -> None:
+    lines = []
+    for i, s in enumerate(segments, 1):
+        lines.append(str(i))
+        lines.append(f"{fmt_srt_ts(s['start'])} --> {fmt_srt_ts(s['end'])}")
+        lines.append(s["text"].strip())
+        lines.append("")
+    out.write_text("\n".join(lines), encoding="utf-8")
+
+# ── main ──────────────────────────────────────────────────────────────────────
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="transcribe",
+        description="Transcribe a YouTube URL or local A/V file to PDF using local Whisper.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Models: tiny, base, small, medium, large (RAM ~1, 1, 2, 5, 10 GB)",
+    )
+    ap.add_argument("source", help="YouTube URL or path to a local audio/video file")
+    ap.add_argument("-o", "--output",
+                    help="Output PDF path (default: <cwd>/<title>.pdf)")
+    ap.add_argument("--model", default="small",
+                    help="Whisper model size (default: small)")
+    ap.add_argument("--lang", default=None,
+                    help="Force language code (e.g. ar, en); default: auto-detect")
+    ap.add_argument("--no-timestamps", action="store_true",
+                    help="Plain prose without [hh:mm] markers")
+    ap.add_argument("--also", default="",
+                    help="Comma list of extra formats: txt,md,srt")
+    ap.add_argument("--append",
+                    help="Also append the generated PDF to this master PDF (created if missing)")
+    ap.add_argument("--keep-audio", action="store_true",
+                    help="Keep the intermediate audio file next to the output")
+    args = ap.parse_args()
+
+    extras = {x.strip().lower() for x in args.also.split(",") if x.strip()}
+    bad = extras - {"txt", "md", "srt"}
+    if bad:
+        die(f"unknown --also formats: {', '.join(bad)}")
+
+    workdir = Path(tempfile.mkdtemp(prefix="transcribe-"))
+    try:
+        # 1. Get audio.
+        if is_url(args.source):
+            audio, title = fetch_youtube(args.source, workdir)
+            source_label = args.source
+        else:
+            audio, title = fetch_local(Path(args.source).expanduser(), workdir)
+            source_label = str(Path(args.source).expanduser())
+        ok(f"audio ready: {audio.name}")
+
+        # 2. Pick output path. Default: <cwd>/<title>.pdf so the transcript
+        #    lands next to whatever the user was working on, not in a hidden
+        #    "user-friendly" Documents folder.
+        safe_title = re.sub(r"[^\w\s.-]", "_", title).strip() or "transcript"
+        out_pdf = Path(args.output).expanduser() if args.output \
+                  else Path.cwd() / f"{safe_title}.pdf"
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+        # 3. Transcribe.
+        result = transcribe_whisper(audio, args.model, args.lang)
+        segments = cast(list[WhisperSegment], result.get("segments", []) or [])
+        full_text = str(result.get("text", "") or "")
+        detected = str(result.get("language", "?") or "?")
+        ok(f"transcribed {len(segments)} segments (lang={detected})")
+
+        # 4. Write outputs.
+        write_pdf(out_pdf, title, segments, full_text,
+                  include_timestamps=not args.no_timestamps,
+                  source=source_label)
+        ok(f"wrote {out_pdf}")
+
+        stem = out_pdf.with_suffix("")
+        if "txt" in extras:
+            p = stem.with_suffix(".txt")
+            write_txt(p, title, segments, full_text,
+                      include_timestamps=not args.no_timestamps)
+            ok(f"wrote {p}")
+        if "md" in extras:
+            p = stem.with_suffix(".md")
+            write_md(p, title, segments, full_text)
+            ok(f"wrote {p}")
+        if "srt" in extras:
+            p = stem.with_suffix(".srt")
+            write_srt(p, segments)
+            ok(f"wrote {p}")
+
+        if args.append:
+            try:
+                import fitz
+            except ImportError:
+                die("pymupdf not installed — pip install pymupdf")
+            master = Path(args.append).expanduser()
+            master.parent.mkdir(parents=True, exist_ok=True)
+            if master.exists():
+                combined = fitz.open(master)
+            else:
+                combined = fitz.open()
+            src = fitz.open(out_pdf)
+            combined.insert_pdf(src)
+            src.close()
+            # Save to a temp file then atomic-rename, so a kill mid-write
+            # never leaves a half-written master.
+            tmp = master.with_suffix(master.suffix + ".tmp")
+            combined.save(str(tmp), deflate=True)
+            combined.close()
+            tmp.replace(master)
+            ok(f"appended to {master}")
+
+        if args.keep_audio:
+            kept = stem.with_suffix(audio.suffix)
+            shutil.copy2(audio, kept)
+            ok(f"kept audio: {kept}")
+
+        return 0
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n✗ interrupted", file=sys.stderr); sys.exit(130)
+    except subprocess.CalledProcessError as e:
+        die(f"subprocess failed: {e}")

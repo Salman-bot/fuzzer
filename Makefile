@@ -37,27 +37,27 @@ clean-native:
 	rm -f $(ROOT)_ar_norm*.so $(NATIVE)/_ar_norm*.so
 	rm -rf $(NATIVE)/build
 
-# Build the documentation site into doc/_build/.
+# Build the documentation site into docs/_build/.
 # Requires: pip install pdoc markdown pygments
 docs:
 	@$(PYTHON) -c "import pdoc, markdown" 2>/dev/null || \
 	  (echo "→ installing doc dependencies"; \
 	   $(PYTHON) -m pip install --quiet --user --break-system-packages pdoc markdown pygments)
-	@$(PYTHON) $(ROOT)doc/build.py
+	@$(PYTHON) $(ROOT)docs/build.py
 
 docs-api:
-	@$(PYTHON) $(ROOT)doc/build.py --api
+	@$(PYTHON) $(ROOT)docs/build.py --api
 
 docs-clean:
-	rm -rf $(ROOT)doc/_build
+	rm -rf $(ROOT)docs/_build
 
 # Serve docs locally on http://localhost:8765/ — handy for clicking through links.
 docs-serve: docs
-	@cd $(ROOT)doc/_build && $(PYTHON) -m http.server 8765
+	@cd $(ROOT)docs/_build && $(PYTHON) -m http.server 8765
 
 # Regenerate project_info.md from the current source via the Claude CLI.
 # The file is gitignored — it's a regenerable snapshot, not source of truth.
-# (Note: `make docs` builds the HTML site under doc/_build/; `make doc` is this one-file overview.)
+# (Note: `make docs` builds the HTML site under docs/_build/; `make doc` is this one-file overview.)
 doc:
 	@command -v claude >/dev/null || { \
 	  echo ""; \
@@ -75,7 +75,7 @@ doc:
 	  exit 2; \
 	}
 	@echo "→ regenerating project_info.md (calling claude -p)…"
-	@claude -p --permission-mode acceptEdits "Read this repository (fuzzer, test_fuzzer.py, Makefile, native/ar_normalize.c, doc/*.md, .sixth/mcp/sixth-mcp-settings.json if present) and write a concise codebase overview to project_info.md, overwriting any existing content. Use these sections: Summary, Architecture, Directory Structure, Key Abstractions, Data Flow, Non-Obvious Behaviours, Suggested Reading Order. Keep the existing HTML regen header comment at the top of the file. Be terse — link file paths inline; do not pad with restated obvious facts. Follow markdownlint defaults: a blank line around every heading, around every list block, and around every fenced code block; every fence must carry a language tag (use 'text' for the directory tree)." >/dev/null
+	@claude -p --permission-mode acceptEdits "Read this repository (fuzzer, test_fuzzer.py, Makefile, native/ar_normalize.c, docs/*.md, .sixth/mcp/sixth-mcp-settings.json if present) and write a concise codebase overview to project_info.md, overwriting any existing content. Use these sections: Summary, Architecture, Directory Structure, Key Abstractions, Data Flow, Non-Obvious Behaviours, Suggested Reading Order. Keep the existing HTML regen header comment at the top of the file. Be terse — link file paths inline; do not pad with restated obvious facts. Follow markdownlint defaults: a blank line around every heading, around every list block, and around every fenced code block; every fence must carry a language tag (use 'text' for the directory tree)." >/dev/null
 	@test -s $(ROOT)project_info.md && echo "✓ project_info.md updated" || { echo "✗ project_info.md was not written"; exit 1; }
 
 doc-clean:

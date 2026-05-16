@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Build the fuzzer documentation.
 
-Renders every doc/*.md to doc/_build/*.html with a shared template + sidebar,
-and runs pdoc to generate doc/_build/api.html from the fuzzer script.
+Renders every docs/*.md to docs/_build/*.html with a shared template + sidebar,
+and runs pdoc to generate docs/_build/api.html from the fuzzer script.
 
 Usage:
-    python3 doc/build.py        # full build
-    python3 doc/build.py --api  # only the pdoc API reference
+    python3 docs/build.py        # full build
+    python3 docs/build.py --api  # only the pdoc API reference
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from pathlib import Path
 import markdown
 
 ROOT = Path(__file__).resolve().parent.parent
-DOC = ROOT / "doc"
+DOC = ROOT / "docs"
 OUT = DOC / "_build"
 
 # Markdown extensions: tables, fenced code, code highlighting, table of contents.
@@ -93,12 +93,10 @@ blockquote {
 
 # Order matters: this drives the sidebar order.
 NAV = [
-    ("index.html",        "Overview"),
-    ("usage.html",        "Usage"),
-    ("architecture.html", "Architecture"),
-    ("c-extension.html",  "C extension"),
-    ("development.html",  "Development"),
-    ("sequence-diagram.html", "Sequence diagram"),
+    ("INSTALL.html",      "Install"),
+    ("USAGE.html",        "Usage"),
+    ("INTERNALS.html",    "Internals"),
+    ("DEVELOPMENT.html",  "Development"),
     ("api.html",          "API reference"),
 ]
 

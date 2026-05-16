@@ -166,3 +166,13 @@ fuzzer [options] PATTERN FILE [FILE ...]
 | `-r`, `--recursive` | Recurse into directories |
 | `--no-color` | Disable ANSI color codes |
 | `-o FILE`, `--output FILE` | Export results (format auto-detected from extension) |
+
+## Quick start
+
+```sh
+./install.sh          # Linux / macOS
+.\install.ps1         # Windows
+fuzzer                # launch the GUI
+```
+
+See also: [INTERNALS.md](INTERNALS.md), [DEVELOPMENT.md](DEVELOPMENT.md).

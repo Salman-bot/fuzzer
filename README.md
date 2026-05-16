@@ -16,7 +16,8 @@ chat panel.
 fuzzer
 ```
 
-GUI reference lives in [doc/usage.md](doc/usage.md).
+GUI reference lives in [docs/USAGE.md](docs/USAGE.md). Fresh-Mac setup
+walkthrough: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Features
 
@@ -96,43 +97,31 @@ No `__version__` constant ships in the script yet — versions track git tags / 
 
 ## Documentation
 
-Two doc systems live side-by-side:
-
-### Hand-maintained — [doc/](doc/)
-
-The source of truth, edited by humans:
+All docs live in [docs/](docs/):
 
 | File | Covers |
 | ---- | ------ |
-| [doc/index.md](doc/index.md) | Top page + quick start |
-| [doc/usage.md](doc/usage.md) | CLI flags, examples, GUI walkthrough |
-| [doc/architecture.md](doc/architecture.md) | Module layout, sequence diagram explanation |
-| [doc/c-extension.md](doc/c-extension.md) | `_ar_norm` reference |
-| [doc/development.md](doc/development.md) | Build / test / contribute |
-| [doc/sequence-diagram.mmd](doc/sequence-diagram.mmd) | Mermaid source for the architecture diagram |
+| [docs/INSTALL.md](docs/INSTALL.md) | Fresh-Mac setup (Homebrew → fuzzer → optional transcribe helper) |
+| [docs/USAGE.md](docs/USAGE.md) | GUI walkthrough + CLI flags |
+| [docs/INTERNALS.md](docs/INTERNALS.md) | Architecture, `_ar_norm` C extension, sequence diagram |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Build / test / contribute |
+| [docs/GenAI_Harms.md](docs/GenAI_Harms.md) | Research notes (lit review + summary table + evidence synthesis) |
 
 ### Generated
 
 | Artifact | Built by | What it is | Cleaned by |
 | -------- | -------- | ---------- | ---------- |
-| `doc/_build/*.html` | `make docs` | HTML site rendered from `doc/*.md` + pdoc API reference | `make docs-clean` |
-| `doc/_build/api.html` | `make docs-api` | pdoc API reference only (faster) | `make docs-clean` |
-| [project_info.md](project_info.md) | `make doc` | One-file codebase overview produced by `claude -p` (gitignored — regenerable) | `make doc-clean` |
+| `docs/_build/*.html` | `make docs` | HTML site rendered from `docs/*.md` + pdoc API reference | `make docs-clean` |
+| `docs/_build/api.html` | `make docs-api` | pdoc API reference only (faster) | `make docs-clean` |
 | `test_pdfs/*.pdf` | `make test-corpus` | ~50 public Arabic + English PDFs for the real-corpus test (gitignored — fetched from arXiv + Arabic Wikipedia) | `make test-corpus-clean` |
 
 #### Generating the docs
 
 ```sh
-make docs        # full HTML site under doc/_build/
+make docs        # full HTML site under docs/_build/
 make docs-serve  # docs + local web server at http://localhost:8765/
 make docs-api    # API reference only
-make doc         # regenerate project_info.md via Claude CLI
 ```
-
-`make doc` needs the [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
-CLI installed. The target prints install instructions and an API-key link if
-`claude` isn't found. You can sign in with a Claude.ai account or export an
-`ANTHROPIC_API_KEY` from <https://console.anthropic.com/settings/keys>.
 
 `make docs` auto-installs `pdoc markdown pygments` to the user site if they're
 missing.
@@ -158,15 +147,16 @@ remains the primary way to get the corpus.
 
 ## Repo layout
 
-See [doc/architecture.md](doc/architecture.md#file-layout) for the full tree.
-The short version:
+See [docs/INTERNALS.md](docs/INTERNALS.md) for the architecture section.
+The short tree:
 
 ```text
 fuzzer            ← the script (CLI + GUI + core logic, no .py extension)
+transcribe        ← helper: YouTube/audio/video → searchable PDF
 test_fuzzer.py    ← pytest suite
-Makefile          ← test / build-native / docs / doc targets
+Makefile          ← test / build-native / docs targets
 native/           ← C extension source
-doc/              ← hand-maintained docs (+ _build/ generated site)
+docs/             ← hand-maintained docs (+ _build/ generated site)
 ```
 
 ## License
