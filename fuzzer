@@ -908,6 +908,16 @@ def run_gui() -> int:
         DND_FILES = None
         _dnd_available = False
     root.title("fuzzer")
+
+    # Glossy-over-wallpaper feel. macOS Tk supports -alpha for whole-window
+    # translucency (true vibrancy/blur needs PyObjC + NSVisualEffectView —
+    # tracked as a future spike). Persisted per user preference; 1.0 disables.
+    _saved_alpha = float(_gui_state.get("window_alpha", 0.96))
+    if not 0.5 <= _saved_alpha <= 1.0:
+        _saved_alpha = 0.96
+    with contextlib.suppress(Exception):
+        root.wm_attributes("-alpha", _saved_alpha)
+
     _screen_w = root.winfo_screenwidth()
     _screen_h = root.winfo_screenheight()
     _max_w = max(800, _screen_w - 80)
@@ -1001,25 +1011,39 @@ def run_gui() -> int:
         BTN_GO_BG="#7c3aed", BTN_GO_HOVER="#6d28d9",
         BTN_RUN_BG="#f59e0b", BTN_RUN_HOVER="#d97706",
     )
+    # Midnight-purple palette. Backgrounds layered like night sky → fog →
+    # ink so the eye reads depth across panels: deepest at the window edge
+    # (BG), one step up for raised surfaces (CARD_BG), warmer purple ink for
+    # the chat pane (CHAT_BG). All accents draw from the violet ramp (#a78bfa
+    # → #c4b5fd) so highlights, focus rings, buttons, and "you" tags share
+    # the same hue.
     _DARK_PAL = dict(
-        BG="#12101e", CARD_BG="#1c1929", BORDER="#2d2842",
-        TEXT="#f5f0ff", MUTED="#a39ec5", ACCENT="#a78bfa",
-        ROW_ALT="#181626", SEL_BG="#3b2d6e",
-        CHAT_BG="#141220", CHAT_FG="#ddd6f3", CHAT_BORDER="#2d2842",
-        CHAT_SEL_BG="#3b2d6e", CHAT_ENTRY_BG="#1c1929",
-        CHAT_DISABLED_BG="#1e1b2e", CHAT_DISABLED_FG="#5a5470",
-        TAG_YOU_FG="#c4b5fd", TAG_YOU_BG="#241942",
-        TAG_CLAUDE_FG="#5eead4", TAG_CLAUDE_BG="#0f2e29",
-        TAG_ERR_FG="#ff7a7a", TAG_ERR_BG="#3a1717",
-        TAG_SYS_FG="#facc15",
+        BG="#0c0a1a", CARD_BG="#171225", BORDER="#3a2f5e",
+        TEXT="#ece6ff", MUTED="#a39ec5", ACCENT="#a78bfa",
+        ROW_ALT="#13102a", SEL_BG="#4c3a8a",
+        CHAT_BG="#100d22", CHAT_FG="#e8e0ff", CHAT_BORDER="#3a2f5e",
+        CHAT_SEL_BG="#4c3a8a", CHAT_ENTRY_BG="#171225",
+        CHAT_DISABLED_BG="#15122a", CHAT_DISABLED_FG="#5a5470",
+        TAG_YOU_FG="#c4b5fd", TAG_YOU_BG="#2a1f4d",
+        TAG_CLAUDE_FG="#7dd3c0", TAG_CLAUDE_BG="#0f2a26",
+        TAG_ERR_FG="#ff8a8a", TAG_ERR_BG="#3a1717",
+        TAG_SYS_FG="#fcd34d",
         TAG_TOOL_FG="#f0abfc", TAG_TOOL_BG="#2a1240",
         TAG_TOOL_RES_FG="#67e8f9", TAG_TOOL_RES_BG="#0d2738",
         TAG_THINK_FG="#94a3b8",
-        TIP_BG="#2d2842", TIP_FG="#ddd6f3",
-        BTN_GO_BG="#3b82f6", BTN_GO_HOVER="#2563eb",
+        TIP_BG="#3a2f5e", TIP_FG="#ece6ff",
+        BTN_GO_BG="#8b5cf6", BTN_GO_HOVER="#7c3aed",
         BTN_RUN_BG="#fbbf24", BTN_RUN_HOVER="#f59e0b",
     )
-    _theme_name = [str(_gui_state.get("theme", "light"))]
+    # Dark is the default: the user wants the midnight-purple aesthetic on
+    # first launch. One-shot migration: if `theme_default_v` is missing or
+    # older than current, override the saved theme to dark and stamp the
+    # version. Explicit toggles after that persist normally.
+    _THEME_DEFAULT_V = 1
+    if _gui_state.get("theme_default_v") != _THEME_DEFAULT_V:
+        _gui_state["theme"] = "dark"
+        _gui_state["theme_default_v"] = _THEME_DEFAULT_V
+    _theme_name = [str(_gui_state.get("theme", "dark"))]
     _T = (_DARK_PAL if _theme_name[0] == "dark" else _LIGHT_PAL).copy()
 
     def _configure_ttk_styles(t: dict) -> None:
