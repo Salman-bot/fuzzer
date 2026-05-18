@@ -4601,7 +4601,19 @@ def run_gui() -> int:
         _apply_search_btn_colors()
         stop_btn.config(state="normal")
         export_btn.config(state="disabled")
+        # Clear ALL per-result state, not just the visible tree rows. Forgetting
+        # the row-dicts caused stale `_row_paths`/`_row_full_lines` entries to
+        # accumulate between searches, and stale `_highlighted_pdfs` paths
+        # would route a double-click on a NEW row to an old (deleted) tmp PDF.
         tree.delete(*tree.get_children())
+        _row_paths.clear()
+        _row_full_lines.clear()
+        _row_lines_raw.clear()
+        _highlighted_pdfs.clear()
+        # Force Tk to flush the deletes before the worker starts streaming
+        # new matches — on some macOS Tk builds the delete is deferred until
+        # the next idle tick, which let the new rows interleave with the old.
+        tree.update_idletasks()
         status_var.set("Starting…")
         _opts = (f"case={'on' if case_var.get() else 'off'} "
                  f"thr={threshold_var.get()} "
