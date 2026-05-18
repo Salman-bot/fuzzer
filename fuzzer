@@ -1239,12 +1239,14 @@ def run_gui() -> int:
     # Glossy-over-wallpaper feel. macOS Tk supports -alpha for whole-window
     # translucency (true vibrancy/blur needs PyObjC + NSVisualEffectView —
     # tracked as a future spike). Persisted per user preference; 1.0 disables.
-    # Default alpha 0.92 -- gives the window a soft "glass" look without
-    # making text hard to read. Users can drag the alpha slider in the
-    # status row to taste; their choice is persisted in _gui_state.
-    _saved_alpha = float(_gui_state.get("window_alpha", 0.92))
+    # Default alpha 0.88 -- pushes the window further toward "glass" while
+    # keeping text readable. Real macOS vibrancy (NSVisualEffectView with
+    # blur-behind) needs PyObjC and isn't reachable from Tk; this is the
+    # closest approximation we can do natively. Users can drag the alpha
+    # slider in the status row to taste; their choice is persisted.
+    _saved_alpha = float(_gui_state.get("window_alpha", 0.88))
     if not 0.5 <= _saved_alpha <= 1.0:
-        _saved_alpha = 0.92
+        _saved_alpha = 0.88
     with contextlib.suppress(Exception):
         root.wm_attributes("-alpha", _saved_alpha)
 
@@ -1393,10 +1395,14 @@ def run_gui() -> int:
             _style.map("TCheckbutton",
                        background=[("active", t["BG"])],
                        foreground=[("disabled", t["MUTED"])])
+            # borderwidth=0 + matching light/dark border colors flattens the
+            # ttk Entry's inset 3D bevel into a single 1-px line that blends
+            # with the surrounding canvas -- the glassy "no chrome" look.
             _style.configure("TEntry", fieldbackground=t["CARD_BG"],
                              foreground=t["TEXT"], insertcolor=t["TEXT"],
                              bordercolor=t["BORDER"], lightcolor=t["BORDER"],
-                             darkcolor=t["BORDER"])
+                             darkcolor=t["BORDER"], borderwidth=0,
+                             relief="flat")
             _style.map("TEntry",
                        fieldbackground=[("!disabled", t["CARD_BG"]),
                                         ("readonly", t["CARD_BG"])],
@@ -1406,7 +1412,9 @@ def run_gui() -> int:
                        selectforeground=[("!disabled", t["TEXT"])])
             _style.configure("TCombobox", fieldbackground=t["CARD_BG"],
                              foreground=t["TEXT"], background=t["CARD_BG"],
-                             arrowcolor=t["TEXT"], bordercolor=t["BORDER"])
+                             arrowcolor=t["TEXT"], bordercolor=t["BORDER"],
+                             lightcolor=t["BORDER"], darkcolor=t["BORDER"],
+                             borderwidth=0, relief="flat")
             _style.map("TCombobox",
                        fieldbackground=[("readonly", t["CARD_BG"]),
                                         ("focus", t["CARD_BG"]),
@@ -1428,13 +1436,17 @@ def run_gui() -> int:
                        insertcolor=[("!disabled", t["TEXT"])])
             _style.configure("TSpinbox", fieldbackground=t["CARD_BG"],
                              foreground=t["TEXT"], background=t["CARD_BG"],
-                             arrowcolor=t["TEXT"], bordercolor=t["BORDER"])
+                             arrowcolor=t["TEXT"], bordercolor=t["BORDER"],
+                             lightcolor=t["BORDER"], darkcolor=t["BORDER"],
+                             borderwidth=0, relief="flat")
             _style.map("TSpinbox",
                        fieldbackground=[("!disabled", t["CARD_BG"])],
                        foreground=[("!disabled", t["TEXT"])],
                        background=[("!disabled", t["CARD_BG"])])
             _style.configure("TButton", background=t["CARD_BG"],
-                             foreground=t["TEXT"], bordercolor=t["BORDER"])
+                             foreground=t["TEXT"], bordercolor=t["BORDER"],
+                             lightcolor=t["BORDER"], darkcolor=t["BORDER"],
+                             borderwidth=0, relief="flat", padding=(10, 4))
             _style.map("TButton",
                        background=[("active", t["SEL_BG"]),
                                    ("pressed", t["BORDER"]),
