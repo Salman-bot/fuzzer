@@ -1379,6 +1379,23 @@ def run_gui() -> int:
                        arrowcolor=[("disabled", t["MUTED"])])
             _style.configure("TSeparator", background=t["BORDER"])
             _style.configure("TPanedwindow", background=t["BG"])
+            # Notebook (tab strip) — midnight-purple chrome. Inactive tabs
+            # sit on the card colour; the active tab uses the violet accent
+            # plus a brighter foreground so the eye locks onto it. Bottom
+            # border of inactive tabs blends into the canvas so the strip
+            # reads as ONE surface, not a forest of buttons.
+            _style.configure("TNotebook", background=t["BG"],
+                             borderwidth=0, tabmargins=(8, 6, 8, 0))
+            _style.configure("TNotebook.Tab",
+                             background=t["CARD_BG"], foreground=t["MUTED"],
+                             padding=(16, 6), borderwidth=0,
+                             font=(_ui_font_family, 11))
+            _style.map("TNotebook.Tab",
+                       background=[("selected", t.get("ACCENT", t["SEL_BG"])),
+                                   ("active", t["SEL_BG"])],
+                       foreground=[("selected", "#ffffff"),
+                                   ("active", t["TEXT"])],
+                       expand=[("selected", (1, 1, 1, 0))])
             # Combobox dropdown listbox isn't a ttk widget — set via option db.
             root.option_add("*TCombobox*Listbox.background", t["CARD_BG"])
             root.option_add("*TCombobox*Listbox.foreground", t["TEXT"])
@@ -1772,45 +1789,44 @@ def run_gui() -> int:
     # room to whichever pane they care about. Critically, when the window is
     # resized small the chat panel can never be clipped off — it just gets
     # smaller, and the user can drag the sash to grow it back.
-    main_paned = ttk.PanedWindow(root, orient="vertical")
-    main_paned.pack(fill="both", expand=True)
+    # ── tabbed workspace ────────────────────────────────────────────────────
+    # Each task gets its own focused canvas instead of fighting for stacked
+    # vertical space. Tabs:
+    #   🔍  Search & Results  —  results tree (the form above feeds it)
+    #   💬  Chat              —  full-canvas Claude chat
+    #   🎙  Transcribe        —  YouTube/audio → PDF workflow
+    #   ⚙   Settings          —  API key, theme, alpha
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
 
-    table_frame = ttk.Frame(main_paned, padding=(10, 0, 10, 0))
-    main_paned.add(table_frame, weight=2)
-    # chat_outer is created (and added as the second pane) here, before any
-    # widgets that want to parent to it (status, selected). The chat header,
-    # input box, and log are populated into chat_outer further down.
-    chat_outer = tk.Frame(main_paned, bg=_BORDER)
-    main_paned.add(chat_outer, weight=1)
+    table_frame = ttk.Frame(notebook, padding=(10, 6, 10, 6))
+    notebook.add(table_frame, text="🔍  Search")
 
-    # Floor for the chat pane height. Below this the chat input box gets
-    # crowded out by the status/selected strips. Enforced two ways:
-    #   • initial sashpos placed so chat starts at ~38 % of window height
-    #   • on every <Configure> we clamp the sash so chat ≥ _CHAT_PANE_MIN_PX
-    # User drags are honored as long as they leave at least the floor.
-    # Min height guarantees the chat input row (~3 lines) + status/selected
-    # strip (~2 lines) + a few rows of log are always visible. Initial fraction
-    # leans toward chat (44% rather than 38%) since the empty log otherwise
-    # reads as wasted real estate.
-    _CHAT_PANE_MIN_PX = 260
-    _sash_inited = [False]
+    # chat_outer is the second tab; the chat header/input/log are populated
+    # into it further down. tk.Frame (not ttk) so we can set bg directly.
+    chat_outer = tk.Frame(notebook, bg=_BORDER)
+    notebook.add(chat_outer, text="💬  Chat")
 
-    def _ensure_chat_pane_visible(_e: object = None) -> None:
-        with contextlib.suppress(Exception):
-            h = main_paned.winfo_height()
-            if h < _CHAT_PANE_MIN_PX + 80:
-                return  # Window too tiny — let widgets size themselves.
-            if not _sash_inited[0]:
-                target_chat = max(_CHAT_PANE_MIN_PX, int(h * 0.44))
-                main_paned.sashpos(0, h - target_chat)
-                _sash_inited[0] = True
-                return
-            pos = main_paned.sashpos(0)
-            chat_h = h - pos
-            if chat_h < _CHAT_PANE_MIN_PX:
-                main_paned.sashpos(0, max(80, h - _CHAT_PANE_MIN_PX))
+    transcribe_tab = ttk.Frame(notebook, padding=(20, 20, 20, 20))
+    notebook.add(transcribe_tab, text="🎙  Transcribe")
 
-    main_paned.bind("<Configure>", _ensure_chat_pane_visible)
+    settings_tab = ttk.Frame(notebook, padding=(20, 20, 20, 20))
+    notebook.add(settings_tab, text="⚙  Settings")
+
+    # Placeholder content for the new tabs — Phase B will move the real
+    # widgets here from the top toolbar.
+    ttk.Label(
+        transcribe_tab,
+        text="Transcribe workflow lives here in the next iteration.\n"
+             "For now: use the Transcribe… button in the toolbar above.",
+        justify="left",
+    ).pack(anchor="nw")
+    ttk.Label(
+        settings_tab,
+        text="Settings (API key, theme, window alpha) move here next.\n"
+             "For now: use the API Key… button and the Mode menu.",
+        justify="left",
+    ).pack(anchor="nw")
 
     columns = ("file", "line", "page", "match", "score", "content")
     tree = ttk.Treeview(table_frame, columns=columns, show="headings")
@@ -1922,7 +1938,7 @@ def run_gui() -> int:
     # Outer frame's CHAT_BORDER bg + 2px padding becomes a thin top border
     # that visually anchors the strip below the panes above it.
     _statusbar_outer = tk.Frame(root, bg=_T["CHAT_BORDER"])
-    _statusbar_outer.pack(side="bottom", fill="x", before=main_paned)
+    _statusbar_outer.pack(side="bottom", fill="x", before=notebook)
     _statusbar_inner = tk.Frame(_statusbar_outer, bg=_T["CHAT_ENTRY_BG"])
     _statusbar_inner.pack(fill="x", padx=0, pady=(2, 0))
 
@@ -4524,6 +4540,7 @@ def run_gui() -> int:
 
     _row_paths: Dict[str, str] = {}  # iid → full file path
     _row_full_lines: Dict[str, str] = {}  # iid → full match text for tooltips
+    _row_lines_raw: Dict[str, str] = {}  # iid → raw (un-bidi-fixed) line for Word find
     # original path → highlighted copy path
     _highlighted_pdfs: Dict[str, str] = {}
 
@@ -4738,6 +4755,7 @@ def run_gui() -> int:
                 _fix_arabic(_snippet_marked)), tags=(_tag,))
             _row_paths[iid] = fp
             _row_full_lines[iid] = _fix_arabic(m.line)
+            _row_lines_raw[iid] = m.line
             row_index += 1
         if Path(fp).suffix.lower() == ".pdf":
             _highlighted_pdfs[fp] = _build_highlighted_pdf(fp, matches)
@@ -4824,6 +4842,7 @@ def run_gui() -> int:
         tree.delete(*tree.get_children())
         _row_paths.clear()
         _row_full_lines.clear()
+        _row_lines_raw.clear()
         state["results"] = {}
         export_btn.config(state="disabled")
         status_var.set("Ready")
@@ -5012,6 +5031,76 @@ def run_gui() -> int:
                     f"Opened PDF '{os.path.basename(filepath)}' page {open_page} "
                     f"in {_viewer_name}"
                     + (" (highlighted)" if _tmp_path != filepath else " (no highlight)"))
+
+            elif ext in (".docx", ".doc"):
+                # DOCX has no real page concept in the file (Word computes pages
+                # at render time from paper size + fonts + margins), so we
+                # navigate by *text* instead: open in Word and run Find on the
+                # matched paragraph text. Falls back to a plain `open` if Word
+                # isn't installed.
+                _word_app = "/Applications/Microsoft Word.app"
+                _raw_line = _row_lines_raw.get(iid, "").strip()
+                # Word's Find handles long strings but truncate to keep the
+                # AppleScript event reasonably sized and dodge edge cases with
+                # paragraph breaks inside very long paragraphs.
+                _needle = _raw_line[:180]
+                _esc = filepath.replace("\\", "\\\\").replace('"', '\\"')
+                _needle_esc = _needle.replace("\\", "\\\\").replace('"', '\\"')
+                if os.path.isdir(_word_app) and _needle:
+                    # Word fires "open" asynchronously — `selection` is
+                    # `missing value` until the document is actually loaded.
+                    # Poll up to ~2s before grabbing the find object, otherwise
+                    # the find call silently no-ops on cold launches.
+                    _script = "\n".join([
+                        'tell application "Microsoft Word"',
+                        '  activate',
+                        f'  open POSIX file "{_esc}"',
+                        '  set _ready to false',
+                        '  repeat 20 times',
+                        '    if (count of documents) > 0 then',
+                        '      set _ready to true',
+                        '      exit repeat',
+                        '    end if',
+                        '    delay 0.1',
+                        '  end repeat',
+                        '  if _ready then',
+                        '    try',
+                        '      set myFind to find object of selection',
+                        '      clear formatting myFind',
+                        f'      execute find myFind find text "{_needle_esc}"',
+                        '    end try',
+                        '  end if',
+                        'end tell',
+                    ])
+                    _as_proc = subprocess.run(
+                        ["osascript", "-e", _script],
+                        capture_output=True, text=True,
+                    )
+                    if _as_proc.returncode != 0:
+                        _open_default(filepath)
+                        status_var.set(
+                            f"Opened {os.path.basename(filepath)} "
+                            f"(find failed — see log)")
+                        _log_activity(
+                            f"Opened '{os.path.basename(filepath)}' — Word "
+                            f"AppleScript error: "
+                            f"{(_as_proc.stderr or _as_proc.stdout).strip()[:120]}")
+                    else:
+                        status_var.set(
+                            f"Scrolled to match — "
+                            f"{os.path.basename(filepath)}")
+                        _log_activity(
+                            f"Opened DOCX '{os.path.basename(filepath)}' "
+                            f"and scrolled to line {line_num}")
+                else:
+                    _open_default(filepath)
+                    _reason = ("Word not installed" if not os.path.isdir(_word_app)
+                               else "no match text")
+                    status_var.set(
+                        f"Opened {os.path.basename(filepath)} "
+                        f"({_reason} — no scroll-to-match)")
+                    _log_activity(
+                        f"Opened '{os.path.basename(filepath)}' ({_reason})")
 
             elif ext in _editor_exts:
                 if shutil.which("code"):
