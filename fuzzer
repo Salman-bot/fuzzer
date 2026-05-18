@@ -1598,23 +1598,47 @@ def run_gui() -> int:
                 _w.drop_target_register(DND_FILES)
                 _w.dnd_bind("<<Drop>>", _on_drop)  # type: ignore[attr-defined]
 
+    def _existing_for_append() -> str:
+        """Current files_var value with placeholder text treated as empty.
+
+        We also check the literal placeholder text in addition to the
+        `active` flag, because focus changes from clicking a Pick button
+        can race the flag update — the picker reads `existing` before the
+        focus-out's `show()` has flipped `active` back to True.
+        """
+        if _files_ph["active"]:
+            return ""
+        raw = files_var.get().strip()
+        return "" if raw == _files_ph["text"] else raw
+
+    def _apply_files_value(new_val: str) -> None:
+        """Commit `new_val` to the files entry and make sure it's visible."""
+        _files_ph["active"] = False
+        files_var.set(new_val)
+        # ttk.Entry occasionally doesn't repaint after a textvariable .set()
+        # when the widget hasn't had focus since the variable was attached
+        # (seen on macOS Tk 8.6). Force a redraw + scroll the view to the
+        # tail so long paths are actually visible in the box.
+        with contextlib.suppress(Exception):
+            files_entry.update_idletasks()
+            files_entry.icursor("end")
+            files_entry.xview_moveto(1.0)
+
     def pick_files() -> None:
         paths = filedialog.askopenfilenames(title="Select files to search")
         if paths:
-            existing = ("" if _files_ph["active"]
-                        else files_var.get().strip())
+            existing = _existing_for_append()
             joined = " ".join(f'"{p}"' for p in paths)
-            files_var.set(f"{existing} {joined}".strip()
-                          if existing else joined)
+            _apply_files_value(
+                f"{existing} {joined}".strip() if existing else joined)
 
     def pick_folder() -> None:
         path = filedialog.askdirectory(title="Select folder")
         if path:
-            existing = ("" if _files_ph["active"]
-                        else files_var.get().strip())
+            existing = _existing_for_append()
             quoted = f'"{path}"'
-            files_var.set(f"{existing} {quoted}".strip()
-                          if existing else quoted)
+            _apply_files_value(
+                f"{existing} {quoted}".strip() if existing else quoted)
             recursive_var.set(True)
 
     ttk.Button(form, text="Pick files…", command=pick_files).grid(
