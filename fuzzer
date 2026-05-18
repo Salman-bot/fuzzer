@@ -2058,6 +2058,23 @@ def run_gui() -> int:
     clear_btn.pack(side="left", padx=2)
     export_btn = ttk.Button(actions, text="Export…", state="disabled")
     export_btn.pack(side="left", padx=2)
+    convert_btn = ttk.Button(actions, text="Convert→txt", state="disabled")
+    convert_btn.pack(side="left", padx=2)
+    _Tooltip(
+        convert_btn,
+        "Convert every file that had matches into a plain .txt copy.\n"
+        "\n"
+        "Output: ~/Documents/fuzzer-converts/<filename>.txt\n"
+        "\n"
+        "Arabic cleanup applied (via pyarabic + Unicode NFKC):\n"
+        "  • strip tashkeel (harakat)        إنَّ → إن\n"
+        "  • strip tatweel (kashida)         يـــــــارب → يارب\n"
+        "  • normalize hamza variants        إ آ أ ٱ → ا\n"
+        "  • decompose ligatures             ﻻ → ل + ا\n"
+        "  • collapse runs of whitespace\n"
+        "\n"
+        "Useful for feeding documents into other tools that prefer\n"
+        "clean text (LLMs, indexers, diff tools).")
 
     # Separator: search actions │ config │ companion tools.
     tk.Frame(actions, bg=_T["CHAT_BORDER"], width=1).pack(
@@ -4908,6 +4925,7 @@ def run_gui() -> int:
         _apply_search_btn_colors()
         stop_btn.config(state="normal")
         export_btn.config(state="disabled")
+        convert_btn.config(state="disabled")
         # Clear ALL per-result state, not just the visible tree rows. Forgetting
         # the row-dicts caused stale `_row_paths`/`_row_full_lines` entries to
         # accumulate between searches, and stale `_highlighted_pdfs` paths
@@ -5361,6 +5379,7 @@ def run_gui() -> int:
                     state["results"][fp] = (lines, matches)
                     _append_file_results(fp, matches)
                     export_btn.config(state="normal")
+                    convert_btn.config(state="normal")
                     _refresh_status()
                 elif kind == "done":
                     was_cancelled = state.get("cancel_search", False)
@@ -5387,6 +5406,7 @@ def run_gui() -> int:
                             "Stopped — no results yet" if was_cancelled
                             else "No matches found.")
                         export_btn.config(state="disabled")
+                        convert_btn.config(state="disabled")
                         _log_activity(
                             "Search cancelled — no results" if was_cancelled
                             else "Done — no matches found")
@@ -5412,8 +5432,96 @@ def run_gui() -> int:
         _row_lines_raw.clear()
         state["results"] = {}
         export_btn.config(state="disabled")
+        convert_btn.config(state="disabled")
         status_var.set("Ready")
         _log_activity("Results cleared")
+
+    def convert_to_txt() -> None:
+        """Write a normalized .txt per result file into ~/Documents/fuzzer-converts/.
+
+        Each file gets a header (source path + match count) followed by the
+        full extracted text, run through:
+          • pyarabic.araby.strip_tashkeel / strip_tatweel / normalize_hamza
+          • unicodedata.normalize('NFKC')       (decomposes Arabic ligatures)
+          • a whitespace-collapse pass
+
+        Errors per-file are logged but don't abort the batch.
+        """
+        results = state["results"]
+        if not results:
+            return
+        try:
+            import pyarabic.araby as _araby  # type: ignore[import-not-found]
+        except ImportError:
+            _araby = None  # type: ignore[assignment]
+        import unicodedata as _ud
+
+        out_dir = Path.home() / "Documents" / "fuzzer-converts"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror(
+                "fuzzer", f"Cannot create output folder:\n{out_dir}\n\n{e}")
+            return
+
+        # Collision-safe naming: <stem>.txt, then <stem>-2.txt, etc. We don't
+        # overwrite -- a user might be iterating searches and want history.
+        def _unique_path(stem: str) -> Path:
+            cand = out_dir / f"{stem}.txt"
+            n = 2
+            while cand.exists():
+                cand = out_dir / f"{stem}-{n}.txt"
+                n += 1
+            return cand
+
+        _ws_re = re.compile(r"[ \t]+")
+        _blank_run_re = re.compile(r"\n{3,}")
+        ok_count = 0
+        fail_count = 0
+        for fp, payload in results.items():
+            try:
+                lines, matches = payload  # type: ignore[misc]
+                if not lines:
+                    fail_count += 1
+                    continue
+                text = "\n".join(lines)
+                # NFKC first so ligatures split before we strip diacritics.
+                text = _ud.normalize("NFKC", text)
+                if _araby is not None:
+                    text = _araby.strip_tashkeel(text)
+                    text = _araby.strip_tatweel(text)
+                    with contextlib.suppress(Exception):
+                        text = _araby.normalize_hamza(text, method="tasheel")
+                    # Yeh fold isn't in pyarabic; do it explicitly.
+                    text = text.replace("ى", "ي").replace("ئ", "ي")
+                # Whitespace cleanup: collapse runs of spaces/tabs, dedupe
+                # blank-line runs of 3+ to 2.
+                text = _ws_re.sub(" ", text)
+                text = _blank_run_re.sub("\n\n", text)
+                stem = Path(fp).stem or "untitled"
+                out_path = _unique_path(stem)
+                header = (
+                    f"# Source: {fp}\n"
+                    f"# Matches: {len(matches)}\n"
+                    f"# Normalized: NFKC + pyarabic "
+                    f"(tashkeel/tatweel/hamza/yeh)\n"
+                    f"# Generated: {Path(__file__).name}\n"
+                    f"\n")
+                out_path.write_text(header + text, encoding="utf-8")
+                ok_count += 1
+            except Exception as e:
+                fail_count += 1
+                _log_activity(f"convert failed for {Path(fp).name}: {e}")
+
+        status_var.set(
+            f"Converted {ok_count} file(s) → {out_dir}"
+            + (f"  ({fail_count} failed)" if fail_count else ""))
+        _log_activity(
+            f"Convert→txt: {ok_count} file(s) written to {out_dir}"
+            + (f", {fail_count} failed" if fail_count else ""))
+        # Reveal the output folder so the user can immediately see results.
+        with contextlib.suppress(Exception):
+            subprocess.Popen(["open", str(out_dir)])
 
     def export_to_file() -> None:
         results = state["results"]
@@ -5742,6 +5850,7 @@ def run_gui() -> int:
     stop_btn.config(command=stop_search)
     clear_btn.config(command=clear_results)
     export_btn.config(command=export_to_file)
+    convert_btn.config(command=convert_to_txt)
     apikey_btn.config(command=set_api_key)
 
     # ── Transcribe: docx-of-links → batch of PDFs via sibling `transcribe` ──
