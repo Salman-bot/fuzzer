@@ -1380,22 +1380,27 @@ def run_gui() -> int:
             _style.configure("TSeparator", background=t["BORDER"])
             _style.configure("TPanedwindow", background=t["BG"])
             # Notebook (tab strip) — midnight-purple chrome. Inactive tabs
-            # sit on the card colour; the active tab uses the violet accent
-            # plus a brighter foreground so the eye locks onto it. Bottom
-            # border of inactive tabs blends into the canvas so the strip
-            # reads as ONE surface, not a forest of buttons.
-            _style.configure("TNotebook", background=t["BG"],
-                             borderwidth=0, tabmargins=(8, 6, 8, 0))
-            _style.configure("TNotebook.Tab",
-                             background=t["CARD_BG"], foreground=t["MUTED"],
-                             padding=(16, 6), borderwidth=0,
-                             font=(_ui_font_family, 11))
-            _style.map("TNotebook.Tab",
-                       background=[("selected", t.get("ACCENT", t["SEL_BG"])),
-                                   ("active", t["SEL_BG"])],
-                       foreground=[("selected", "#ffffff"),
-                                   ("active", t["TEXT"])],
-                       expand=[("selected", (1, 1, 1, 0))])
+            # sit on the card colour; the active tab uses the violet accent.
+            # Wrapped in suppress() because Tk 8.6.x from the Apple Xcode CLT
+            # Python rejects some of these options ("expected screen distance"
+            # TclError) — losing the styling is OK; losing the whole window
+            # because one style call blew up is not. Defensive against any
+            # stock-Tk install where ttk Notebook options vary.
+            with contextlib.suppress(Exception):
+                _style.configure("TNotebook", background=t["BG"],
+                                 borderwidth=0, tabmargins=(8, 6, 8, 0))
+            with contextlib.suppress(Exception):
+                _style.configure("TNotebook.Tab",
+                                 background=t["CARD_BG"], foreground=t["MUTED"],
+                                 padding=(16, 6), borderwidth=0,
+                                 font=(_ui_font_family, 11))
+            with contextlib.suppress(Exception):
+                _style.map("TNotebook.Tab",
+                           background=[("selected", t.get("ACCENT", t["SEL_BG"])),
+                                       ("active", t["SEL_BG"])],
+                           foreground=[("selected", "#ffffff"),
+                                       ("active", t["TEXT"])],
+                           expand=[("selected", (1, 1, 1, 0))])
             # Combobox dropdown listbox isn't a ttk widget — set via option db.
             root.option_add("*TCombobox*Listbox.background", t["CARD_BG"])
             root.option_add("*TCombobox*Listbox.foreground", t["TEXT"])

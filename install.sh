@@ -52,7 +52,16 @@ fi
 ok "platform: macOS"
 
 # ── toolchain checks ──────────────────────────────────────────────────────────
-PYTHON="$(command -v python3 || command -v python || true)"
+# Prefer Homebrew Python over Apple's Xcode CLT Python. Apple's /usr/bin/python3
+# is 3.9 with a Tk 8.6.x build that's too old for the tabbed-Notebook styling
+# in fuzzer — using it produces a blank window and a TclError on startup.
+# We probe well-known Brew paths directly instead of relying on PATH, since
+# Brew's shellenv often isn't loaded in scripted contexts.
+PYTHON=""
+for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    [[ -x "$cand" ]] && { PYTHON="$cand"; break; }
+done
+[[ -z "$PYTHON" ]] && PYTHON="$(command -v python3 || command -v python || true)"
 if [[ -z "$PYTHON" ]]; then
     fail "python3 not found. Install via Homebrew:
   brew install python@3.14
@@ -63,6 +72,15 @@ ok "python: $PYTHON (v$PYVER)"
 
 if ! "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 9)' 2>/dev/null; then
     fail "Python 3.9+ required (found $PYVER)."
+fi
+
+# Apple's CLT Python is technically fine for headless work but its Tk is too
+# old for the tabbed UI. Warn loudly so the user installs Brew Python instead.
+if [[ "$PYTHON" == /usr/bin/python3 ]] || \
+   [[ "$PYTHON" == /Library/Developer/CommandLineTools/* ]]; then
+    warn "Using Apple's Xcode CLT Python — its Tk is too old for the tabbed UI."
+    warn "The window will likely launch blank. Recommended:"
+    warn "  brew install python@3.14   # then re-run ./install.sh"
 fi
 
 # C compiler — needed for _ar_norm.
@@ -249,12 +267,22 @@ cat <<EOF
 ${BOLD}done.${RST}
 
 next steps:
-  ${DIM}# launch the GUI${RST}
-  ./fuzzer
-
   ${DIM}# run the unit tests${RST}
   make test
 
   ${DIM}# (optional) fetch real PDFs for the corpus tests${RST}
   make test-corpus && make test
 EOF
+
+# ── Launch fuzzer ─────────────────────────────────────────────────────────────
+# Run the GUI now so the user lands directly in the app rather than having to
+# task-switch back from Terminal. Detach via `nohup`+`&` so closing the
+# Terminal doesn't kill the GUI, then activate the Python app via AppleScript
+# to pull focus off the current window (Terminal, fullscreen browser, etc.).
+step "launching fuzzer…"
+nohup "$ROOT/fuzzer" >/dev/null 2>&1 &
+disown 2>/dev/null || true
+# Tk needs a moment to register its NSApplication before `activate` works.
+sleep 1
+osascript -e 'tell application "Python" to activate' 2>/dev/null || true
+ok "fuzzer launched"
