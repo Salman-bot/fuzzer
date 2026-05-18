@@ -4524,6 +4524,14 @@ def run_gui() -> int:
 
     def start_search() -> None:
         if state["searching"]:
+            # User clicked Search while a previous search is still running.
+            # Cancel it and queue a fresh start once the worker thread notices
+            # cancellation and posts its `done` message. poll_queue picks up
+            # `_pending_restart` and re-invokes start_search() automatically.
+            state["cancel_search"] = True
+            state["_pending_restart"] = True
+            status_var.set("Cancelling previous search to start a new one...")
+            stop_btn.config(state="disabled")
             return
         # Skip the ghost-text placeholders when reading: an active placeholder
         # means "the box is logically empty," even if the StringVar holds the
@@ -4890,6 +4898,8 @@ def run_gui() -> int:
                         _log_activity(
                             "Search cancelled — no results" if was_cancelled
                             else "Done — no matches found")
+                    if state.pop("_pending_restart", False):
+                        root.after(50, start_search)
                 elif kind == "error":
                     state["searching"] = False
                     state["cancel_search"] = False
@@ -4899,6 +4909,8 @@ def run_gui() -> int:
                     status_var.set(f"Error: {msg[1]}")
                     _log_activity(f"Error: {str(msg[1])[:120]}")
                     messagebox.showerror("fuzzer", str(msg[1]))
+                    if state.pop("_pending_restart", False):
+                        root.after(50, start_search)
         root.after(100, poll_queue)
 
     def clear_results() -> None:
