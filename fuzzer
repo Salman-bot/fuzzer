@@ -5745,8 +5745,52 @@ def run_gui() -> int:
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+# Set to 1 to allow multiple fuzzer windows at once. Default 0 -- launching a
+# new fuzzer terminates any previous instance so duplicate windows don't pile
+# up (especially when ./install.sh auto-launches on top of a running copy).
+# Env var MULTIPLE_INSTANCES=1 has the same effect without editing the file.
+MULTIPLE_INSTANCES = 0
+
+
+def _enforce_single_instance() -> None:
+    """Kill any prior fuzzer process and stake out this PID as the active one."""
+    if MULTIPLE_INSTANCES or os.environ.get("MULTIPLE_INSTANCES") == "1":
+        return
+    pidfile = Path(_PROJECT_DIR) / ".fuzzer.pid"
+    if pidfile.exists():
+        try:
+            old_pid = int(pidfile.read_text().strip())
+        except (ValueError, OSError):
+            old_pid = 0
+        if old_pid and old_pid != os.getpid():
+            try:
+                # `kill -0` probes liveness without sending a signal.
+                os.kill(old_pid, 0)
+                # Alive — ask it to exit politely, then force after a beat.
+                os.kill(old_pid, signal.SIGTERM)
+                for _ in range(20):
+                    time.sleep(0.05)
+                    try:
+                        os.kill(old_pid, 0)
+                    except ProcessLookupError:
+                        break
+                else:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(old_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # stale pidfile, ignore
+            except PermissionError:
+                pass  # different user owns it, give up
+    with contextlib.suppress(OSError):
+        pidfile.write_text(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: pidfile.unlink(missing_ok=True))
+
 
 if __name__ == "__main__":
+    import signal
+    import time
+    _enforce_single_instance()
     sys.exit(run_gui())
 
 

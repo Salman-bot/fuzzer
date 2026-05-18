@@ -99,20 +99,23 @@ if [[ -z "$PYTHON" ]]; then
 fi
 PYVER="$("$PYTHON" -c 'import sys; print("%d.%d"%sys.version_info[:2])')"
 
-# Brew split Tcl/Tk out of python@X starting with 3.13 — without the matching
+# Brew split Tcl/Tk out of python@X starting with 3.13 -- without the matching
 # python-tk@X formula, `import tkinter` errors with "No module named '_tkinter'"
 # and fuzzer's GUI can't launch at all. Detect and auto-install.
+# (Use ${PYVER} with braces -- bare $PYVER followed by a Unicode ellipsis
+# made macOS bash 3.2 treat the ellipsis bytes as part of the variable name,
+# tripping `set -u` with a confusing "PYVER?: unbound variable" error.)
 if ! "$PYTHON" -c 'import tkinter' 2>/dev/null; then
     if command -v brew >/dev/null 2>&1 && [[ "$PYTHON" == /opt/homebrew/* || "$PYTHON" == /usr/local/* ]]; then
-        step "Brew Python missing Tk bindings — installing python-tk@$PYVER…"
-        if brew install "python-tk@$PYVER"; then
-            ok "python-tk@$PYVER installed"
+        step "Brew Python missing Tk bindings - installing python-tk@${PYVER}..."
+        if brew install "python-tk@${PYVER}"; then
+            ok "python-tk@${PYVER} installed"
         else
-            warn "brew install python-tk@$PYVER failed — GUI will fail to launch."
-            warn "  try manually: brew install python-tk@$PYVER"
+            warn "brew install python-tk@${PYVER} failed - GUI will fail to launch."
+            warn "  try manually: brew install python-tk@${PYVER}"
         fi
     else
-        warn "tkinter not importable for $PYTHON — GUI will fail to launch."
+        warn "tkinter not importable for $PYTHON - GUI will fail to launch."
     fi
 fi
 ok "python: $PYTHON (v$PYVER)"
@@ -344,12 +347,49 @@ next steps:
   make test-corpus && make test
 EOF
 
+# ── Desktop launcher (Fuzzer.app) ─────────────────────────────────────────────
+# Drop a minimal .app bundle on the user's Desktop so they can launch fuzzer
+# by double-clicking instead of opening a Terminal. The bundle is just a
+# shim — Info.plist + a 3-line shell script that exec's the real fuzzer.
+step "creating Desktop launcher (Fuzzer.app)..."
+APP_DIR="$HOME/Desktop/Fuzzer.app"
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+
+cat >"$APP_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key><string>Fuzzer</string>
+    <key>CFBundleIdentifier</key><string>com.salman.fuzzer</string>
+    <key>CFBundleName</key><string>Fuzzer</string>
+    <key>CFBundleDisplayName</key><string>Fuzzer</string>
+    <key>CFBundleVersion</key><string>1.0</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>LSMinimumSystemVersion</key><string>10.13</string>
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+
+cat >"$APP_DIR/Contents/MacOS/Fuzzer" <<LAUNCHER
+#!/bin/bash
+exec "$ROOT/fuzzer"
+LAUNCHER
+chmod +x "$APP_DIR/Contents/MacOS/Fuzzer"
+
+# Bump mtime so Finder/LaunchServices re-reads the bundle metadata.
+touch "$APP_DIR"
+ok "Fuzzer.app created at $APP_DIR (double-click to launch)"
+
 # ── Launch fuzzer ─────────────────────────────────────────────────────────────
 # Run the GUI now so the user lands directly in the app rather than having to
 # task-switch back from Terminal. Detach via `nohup`+`&` so closing the
 # Terminal doesn't kill the GUI. Stderr goes to a log so a silent-blank-window
 # failure (Tk error during widget setup, etc.) leaves a trail.
-step "launching fuzzer…"
+step "launching fuzzer..."
 LAUNCH_LOG="$ROOT/.fuzzer-launch.log"
 : >"$LAUNCH_LOG" 2>/dev/null || LAUNCH_LOG="/tmp/fuzzer-launch.log"
 nohup "$ROOT/fuzzer" >"$LAUNCH_LOG" 2>&1 &
@@ -357,4 +397,4 @@ disown 2>/dev/null || true
 # Tk needs a moment to register its NSApplication before `activate` works.
 sleep 1
 osascript -e 'tell application "Python" to activate' 2>/dev/null || true
-ok "fuzzer launched (stderr → $LAUNCH_LOG if it blanks/crashes)"
+ok "fuzzer launched (stderr -> $LAUNCH_LOG if it blanks/crashes)"
