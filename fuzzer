@@ -1953,7 +1953,14 @@ def run_gui() -> int:
     ).pack(anchor="nw")
 
     columns = ("file", "line", "page", "match", "score", "content")
-    tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+    # `line` and `match` stay in the data model (double-click handler and
+    # selected-row preview both read them) but are hidden from the user
+    # via `displaycolumns` -- the line number lives in the snippet preview
+    # below the table, and `match` ("exact"/"fuzzy"/"ai") duplicates info
+    # already conveyed by `score` (100 vs <100). Less visual noise.
+    _display_columns = ("file", "page", "score", "content")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings",
+                        displaycolumns=_display_columns)
 
     # Use a font with solid Arabic support; fall back gracefully
     import tkinter.font as _tkfont
