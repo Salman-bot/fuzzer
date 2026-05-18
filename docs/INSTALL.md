@@ -250,13 +250,54 @@ transcribe --help
 
 ## Troubleshooting
 
-| Symptom                              | Fix                                                |
-| ------------------------------------ | -------------------------------------------------- |
-| `command not found: brew`            | Re-run the two `eval` lines from step 2.           |
-| `command not found: git`             | Re-run step 3 — `brew install git`.                |
-| `command not found: fuzzer`          | `source ~/.zshrc` or open a new Terminal window.   |
-| Installer says "PDF backend missing" | `pip3 install --break-system-packages pymupdf`.    |
-| Chat panel says "No API key"         | Click **API Key…**, paste your key (step 8d).      |
-| Chat panel says "Insufficient credit"| Add credits at console.anthropic.com → Billing.    |
-| Transcribe button greyed out         | Whisper isn't installed — re-run step 9.           |
-| Anything else                        | Re-run `./install.sh` — safe to run again.         |
+| Symptom                                       | Fix                                                                                                              |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `command not found: brew`                     | Re-run the two `eval` lines from step 2.                                                                         |
+| `command not found: git`                      | Re-run step 3 — `brew install git`.                                                                              |
+| `command not found: fuzzer`                   | `source ~/.zshrc` or open a new Terminal window.                                                                 |
+| Installer says "PDF backend missing"          | `pip3 install --break-system-packages pymupdf`.                                                                  |
+| Status bar shows `arabic: regex fallback`     | C extension didn't build — see **Engine fallbacks** below.                                                       |
+| Status bar shows `fuzzy: builtin Levenshtein` | `rapidfuzz` isn't installed for the Python `fuzzer` is using. Run `./install.sh` again.                          |
+| Activity log floods `DOCX support requires…`  | Same root cause as Arabic fallback — wrong Python. See **Engine fallbacks** below.                               |
+| Chat panel says "No API key"                  | Click **API Key…**, paste your key (step 8d).                                                                    |
+| Chat panel says "Insufficient credit"         | Add credits at console.anthropic.com → Billing.                                                                  |
+| Transcribe button greyed out                  | Whisper isn't installed — re-run step 9.                                                                         |
+| Anything else                                 | Re-run `./install.sh` — safe to run again.                                                                       |
+
+### Engine fallbacks (Arabic / DOCX / fuzzy still showing fallback after install)
+
+The status bar at the bottom of the fuzzer window tells you which engine is
+live. After a clean install it should read:
+
+```text
+fuzzy: rapidfuzz   arabic: C ext (_ar_norm)   pdf: PyMuPDF
+```
+
+If `arabic:` says `regex fallback` *and/or* the activity log floods with
+`DOCX support requires python-docx`, fuzzer is launching against a
+different Python than the one `install.sh` put the packages into. This
+mostly happens when fuzzer is launched from the **Dock/Spotlight** (GUI
+launches get a stripped PATH that resolves to Apple's system Python,
+which has no packages).
+
+`install.sh` pins fuzzer's shebang to the absolute path of the Python it
+installed into — re-running fixes silent fallbacks. Check what fuzzer is
+using:
+
+```sh
+head -1 ~/bin/fuzzer                          # the python fuzzer launches
+$(head -1 ~/bin/fuzzer | sed 's|^#!||') \
+    -c 'import docx, _ar_norm, rapidfuzz; print("OK")'
+```
+
+If the second command errors, re-run `./install.sh` from `~/bin`. The
+smoke test prints `arabic engine: …` at the end so silent fallbacks
+become loud.
+
+If the C extension specifically refuses to build, the cause is almost
+always missing Xcode Command Line Tools:
+
+```sh
+xcode-select --install
+cd ~/bin && make build-native
+```

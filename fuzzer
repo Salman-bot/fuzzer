@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3
+#!/opt/homebrew/opt/python@3.14/bin/python3.14
 """fuzzer — search file contents for words/phrases.
 
 GUI app; run `fuzzer` with no arguments to launch it.

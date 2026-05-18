@@ -167,14 +167,32 @@ if [[ $WITH_CORPUS -eq 1 ]]; then
     ok "test corpus ready under test_pdfs/"
 fi
 
+# ── Pin fuzzer's shebang to the absolute install Python ──────────────────────
+# Tracked fuzzer uses `#!/usr/bin/env python3` for portability, but when the
+# GUI is launched from Dock/Spotlight (not a terminal) macOS hands the process
+# a stripped PATH that resolves to /usr/bin/python3 (Apple system Python, no
+# packages). Rewriting to an absolute path makes the launch context irrelevant.
+step "pinning fuzzer shebang to $PYTHON …"
+ABS_PYTHON="$("$PYTHON" -c 'import sys; print(sys.executable)')"
+if [[ -x "$ROOT/fuzzer" ]]; then
+    # Portable in-place edit — BSD sed (macOS) requires the empty -i arg.
+    sed -i '' "1s|^#!.*python.*|#!${ABS_PYTHON}|" "$ROOT/fuzzer"
+    ok "fuzzer shebang → $ABS_PYTHON"
+else
+    warn "fuzzer script not found at $ROOT/fuzzer — skipping shebang pin."
+fi
+
 # ── Smoke test ────────────────────────────────────────────────────────────────
-step "smoke test: importing core deps…"
-"$PYTHON" - <<'PY'
-import importlib, sys
+step "smoke test: importing core deps via $ABS_PYTHON …"
+"$ABS_PYTHON" - "$ROOT" <<'PY'
+import importlib, sys, os
+sys.path.insert(0, sys.argv[1])  # so _ar_norm next to fuzzer is importable
+
 # PDF support is "either or": at least one of fitz / pdfplumber must import.
 # fuzzer prefers fitz (PyMuPDF — better Arabic) and falls back to pdfplumber.
 pdf_backends = ["fitz", "pdfplumber"]
-required = ["rapidfuzz", "openpyxl", "docx", "pyarabic"]
+required = ["rapidfuzz", "openpyxl", "docx", "pyarabic",
+            "arabic_reshaper", "bidi", "anthropic", "tkinterdnd2"]
 missing_pdf = []
 for m in pdf_backends:
     try:
@@ -187,6 +205,15 @@ for m in required:
         importlib.import_module(m)
     except Exception as e:
         missing_req.append((m, str(e)))
+
+# Check the native Arabic-normalize extension (the thing that flips the status
+# bar from "regex fallback" to "C ext (_ar_norm)"). Non-fatal but loud.
+try:
+    import _ar_norm  # noqa: F401
+    ar_ext_ok = True
+except Exception as e:
+    ar_ext_ok = False
+    ar_ext_err = str(e)
 
 # Fail only if required modules are missing OR no PDF backend works at all.
 fatal = bool(missing_req) or len(missing_pdf) == len(pdf_backends)
@@ -202,13 +229,17 @@ if len(missing_pdf) == len(pdf_backends):
         print(f"    - {m}: {err}")
     print("  fuzzer will still launch, but .pdf files will be skipped.")
 elif missing_pdf:
-    # One backend works, the other doesn't — informational, not fatal.
     have = [m for m in pdf_backends if m not in {n for n, _ in missing_pdf}][0]
     print(f"  PDF support OK via {have} ({missing_pdf[0][0]} unavailable)")
+if not ar_ext_ok:
+    print(f"  ! _ar_norm C ext not importable — Arabic status bar will read 'regex fallback'")
+    print(f"    reason: {ar_ext_err}")
+    print(f"    fix:    re-run `make build-native` (needs Xcode CLT + Python headers)")
 if fatal:
     sys.exit(1)
 ok_count = len(required) - len(missing_req) + len(pdf_backends) - len(missing_pdf)
 print(f"  {ok_count}/{len(required) + len(pdf_backends)} core modules import cleanly")
+print(f"  arabic engine: {'C ext (_ar_norm)' if ar_ext_ok else 'regex fallback'}")
 PY
 ok "smoke test passed"
 
