@@ -1156,32 +1156,70 @@ def run_gui() -> int:
         return "".join(out)
 
     class _Tooltip:
+        """Polished hover tooltip: 350ms delay, system font, soft border,
+        word-wrap at ~70 chars, and a one-pixel outer frame that doubles as
+        a subtle shadow against the canvas."""
+
+        _SHOW_DELAY_MS = 350
+        _MAX_WIDTH_PX = 480
 
         def __init__(self, widget: tk.Widget, text: str) -> None:
             self._w = widget
             self._text = text
             self._tip: Optional[tk.Toplevel] = None
-            widget.bind("<Enter>", self._show)
+            self._after_id: Optional[str] = None
+            widget.bind("<Enter>", self._schedule)
             widget.bind("<Leave>", self._hide)
+            widget.bind("<ButtonPress>", self._hide)
 
-        def _show(self, _event: object = None) -> None:
-            x = self._w.winfo_rootx() + 16
-            y = self._w.winfo_rooty() + self._w.winfo_height() + 4
+        def _schedule(self, _event: object = None) -> None:
+            self._cancel()
+            self._after_id = self._w.after(self._SHOW_DELAY_MS, self._show)
+
+        def _cancel(self) -> None:
+            if self._after_id is not None:
+                with contextlib.suppress(Exception):
+                    self._w.after_cancel(self._after_id)
+                self._after_id = None
+
+        def _show(self) -> None:
+            self._after_id = None
+            x = self._w.winfo_rootx() + 14
+            y = self._w.winfo_rooty() + self._w.winfo_height() + 6
             self._tip = tk.Toplevel(self._w)
             self._tip.wm_overrideredirect(True)
+            self._tip.wm_attributes("-topmost", True)
             self._tip.wm_geometry(f"+{x}+{y}")
-            _tip_pal = _gui_state.get("theme", "light")
-            _tbg = "#2d2842" if _tip_pal == "dark" else "#ffffc0"
-            _tfg = "#ddd6f3" if _tip_pal == "dark" else "#1c1e22"
-            ttk.Label(
-                self._tip, text=self._text,
-                background=_tbg, foreground=_tfg,
-                relief="solid", borderwidth=1, padding=(6, 3)
-            ).pack()
+            # Theme-aware: deep purple-grey in dark mode, soft cream in light.
+            _is_dark = _gui_state.get("theme", "dark") == "dark"
+            _border = "#4a3f7a" if _is_dark else "#d0c8a0"
+            _bg = "#1f1934" if _is_dark else "#fffce0"
+            _fg = "#ece6ff" if _is_dark else "#1c1e22"
+            # System UI font -- crisper than Tk default on macOS.
+            import tkinter.font as _tkf
+            _families = set(_tkf.families())
+            _font_family = next(
+                (f for f in ("SF Pro Text", "Helvetica Neue", "Helvetica",
+                             "Arial")
+                 if f in _families),
+                "TkDefaultFont")
+            # Outer 1-px frame in border color makes the shadow-like edge.
+            _outer = tk.Frame(self._tip, bg=_border)
+            _outer.pack(fill="both", expand=True)
+            tk.Label(
+                _outer, text=self._text,
+                background=_bg, foreground=_fg,
+                font=(_font_family, 12),
+                justify="left", anchor="w",
+                wraplength=self._MAX_WIDTH_PX,
+                padx=12, pady=8,
+            ).pack(padx=1, pady=1)
 
         def _hide(self, _event: object = None) -> None:
+            self._cancel()
             if self._tip:
-                self._tip.destroy()
+                with contextlib.suppress(Exception):
+                    self._tip.destroy()
                 self._tip = None
 
     # tkinterdnd2 provides a drag-and-drop-aware Tk root; fall back to plain Tk
@@ -1792,13 +1830,18 @@ def run_gui() -> int:
     ]
     # Group the checkboxes by role so the strip reads as three clusters
     # rather than one wall: match-style ┊ scope ┊ backend ┊ threshold.
-    _OPT_GROUPS = {"Case-sensitive", "Whole word", "Smart search"}  # match style
+    # rga engine is hidden entirely when ripgrep-all isn't installed -- a
+    # disabled checkbox just adds visual noise for users who'll never use it.
+    if not _RGA_PATH:
+        _opt_tooltips = [t for t in _opt_tooltips if t[0] != "rga engine"]
     _OPT_AFTER_GROUP = {"Smart search": True, "Recursive": True, "rga engine": True}
+    # Keep refs to the checkbutton widgets so the mutual-exclusion handlers
+    # below can toggle their `disabled` state.
+    _cb_widgets: Dict[str, ttk.Checkbutton] = {}
     for _label, _var, _tip in _opt_tooltips:
         _cb = ttk.Checkbutton(opts, text=_label, variable=_var)
         _cb.pack(side="left", padx=4)
-        if _label == "rga engine" and not _RGA_PATH:
-            _cb.state(["disabled"])
+        _cb_widgets[_label] = _cb
         _Tooltip(_cb, _tip)
         if _OPT_AFTER_GROUP.get(_label):
             tk.Frame(opts, bg=_T["CHAT_BORDER"], width=1).pack(
@@ -1841,6 +1884,59 @@ def run_gui() -> int:
     def _show_threshold_help(_e: object = None) -> None:
         messagebox.showinfo("Threshold — what does it do?", _THRESHOLD_TIP)
     _thr_info.bind("<Button-1>", _show_threshold_help)
+
+    # ── Mutual exclusion between options that don't compose ────────────────
+    # Some checkbox/threshold combinations are silently ignored by the
+    # search backend. Rather than let the user toggle them and wonder why
+    # nothing changed, we gray out the incompatible options and uncheck
+    # them when their conflict is enabled.
+    #
+    # Pairs we enforce:
+    #   Smart search   ⊥  Whole word   (Smart has its own phrase syntax)
+    #   rga engine     ⊥  Threshold    (rga doesn't do fuzzy at all)
+    #   rga engine     ⊥  Smart search (rga uses literal/regex, not Smart parsing)
+
+    def _set_widget_enabled(w, enabled: bool) -> None:
+        with contextlib.suppress(Exception):
+            if enabled:
+                w.state(["!disabled"])
+            else:
+                w.state(["disabled"])
+
+    def _enforce_exclusions(*_args) -> None:
+        smart = smart_var.get()
+        rga = rga_var.get()
+
+        # Smart search ⊥ Whole word
+        if "Whole word" in _cb_widgets:
+            if smart:
+                whole_word_var.set(False)
+                _set_widget_enabled(_cb_widgets["Whole word"], False)
+            else:
+                _set_widget_enabled(_cb_widgets["Whole word"], True)
+
+        # rga engine ⊥ Smart search
+        if "Smart search" in _cb_widgets:
+            if rga:
+                smart_var.set(False)
+                _set_widget_enabled(_cb_widgets["Smart search"], False)
+            else:
+                # Don't re-enable Smart if it's already disabled by Whole word
+                # (Whole word doesn't disable Smart -- only the other way).
+                _set_widget_enabled(_cb_widgets["Smart search"], True)
+
+        # rga engine ⊥ Threshold (gray out the spinbox + label)
+        _thr_enabled = not rga
+        _set_widget_enabled(_thr_spin, _thr_enabled)
+        with contextlib.suppress(Exception):
+            _thr_lbl.configure(foreground=_T["MUTED"] if not _thr_enabled
+                               else _T["TEXT"])
+
+    # Wire trace_add on the conflict variables so toggles propagate live.
+    smart_var.trace_add("write", _enforce_exclusions)
+    rga_var.trace_add("write", _enforce_exclusions)
+    # Initial sync — saved state may have a conflicting combination.
+    _enforce_exclusions()
 
     # Engine indicator — small ⓘ pill that, on hover, lists which engines are
     # actually being used. Demystifies "is this the slow Python path or
