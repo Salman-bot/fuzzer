@@ -3,7 +3,7 @@ ROOT   := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TEST   := $(ROOT)test_fuzzer.py
 NATIVE := $(ROOT)native
 
-.PHONY: test test-v test-vv demo install build-native clean-native bench-native test-corpus test-corpus-clean
+.PHONY: test test-v test-vv demo install build-native clean-native bench-native test-corpus test-corpus-clean refresh-corpus
 
 test: build-native
 	$(PYTHON) -m pytest $(TEST) -s
@@ -42,6 +42,12 @@ clean-native:
 # (large binary blobs; regenerate any time).
 test-corpus:
 	@$(PYTHON) $(ROOT)tools/fetch_test_pdfs.py --target 50
+
+# Wipe previously-fetched corpus PDFs and pull a fresh copy. Use this when
+# upstream sources update (arXiv revisions, Wikipedia article changes) or
+# after `git pull` brings in new URLs in fetch_test_pdfs.py.
+refresh-corpus:
+	@$(PYTHON) $(ROOT)tools/fetch_test_pdfs.py --replace --target 50
 
 test-corpus-clean:
 	rm -rf $(ROOT)test_pdfs

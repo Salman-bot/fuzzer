@@ -12,8 +12,10 @@ skipped (so the script is idempotent and resumable). Failures are logged and
 do not abort the run — we make best effort to hit the target count.
 
 Run:
-    python3 tools/fetch_test_pdfs.py            # default target: 50
+    python3 tools/fetch_test_pdfs.py                 # default target: 50
     python3 tools/fetch_test_pdfs.py --target 30
+    python3 tools/fetch_test_pdfs.py --replace       # wipe test_pdfs/ first
+    python3 tools/fetch_test_pdfs.py --replace -t 20 # fresh corpus of 20
 """
 from __future__ import annotations
 
@@ -101,12 +103,23 @@ def _wiki_ar_url(title: str) -> tuple[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", type=int, default=50,
+    parser.add_argument("-t", "--target", type=int, default=50,
                         help="stop after this many successful downloads (default: 50)")
     parser.add_argument("--out", type=Path,
                         default=Path(__file__).resolve().parent.parent / "test_pdfs",
                         help="output directory")
+    parser.add_argument("--replace", action="store_true",
+                        help="wipe the output directory before fetching")
     args = parser.parse_args()
+    if args.replace and args.out.exists():
+        # Only remove PDFs we plausibly created — keep any other files the
+        # user dropped in. Matches the prefixes our two fetchers produce.
+        removed = 0
+        for p in list(args.out.glob("arxiv_*.pdf")) + list(args.out.glob("wiki_ar_*.pdf")):
+            p.unlink(missing_ok=True)
+            removed += 1
+        if removed:
+            print(f"→ --replace: removed {removed} previously-fetched PDFs")
     args.out.mkdir(parents=True, exist_ok=True)
 
     # Interleave English + Arabic so a partial run still gives a mixed corpus.

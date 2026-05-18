@@ -1654,8 +1654,22 @@ def run_gui() -> int:
             files_entry.xview_moveto(1.0)
             files_entry.update_idletasks()
 
+    # Build the "Supported documents" filter once from _EXT_MAP so adding a new
+    # extension to _EXT_MAP automatically extends the picker filter.
+    _SUPPORTED_GLOB = " ".join(f"*{e}" for e in sorted(_EXT_MAP))
+    _PICK_FILETYPES = [
+        ("Supported documents", _SUPPORTED_GLOB),
+        ("PDF", "*.pdf"),
+        ("Word", "*.docx *.doc"),
+        ("Plain text", "*.txt *.md *.rst *.csv *.tsv *.log *.json *.xml *.html *.htm"),
+        ("All files", "*.*"),
+    ]
+
     def pick_files() -> None:
-        paths = filedialog.askopenfilenames(title="Select files to search")
+        paths = filedialog.askopenfilenames(
+            title="Select files to search",
+            filetypes=_PICK_FILETYPES,
+        )
         if paths:
             existing = _existing_for_append()
             joined = " ".join(f'"{p}"' for p in paths)
