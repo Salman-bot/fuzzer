@@ -98,6 +98,23 @@ if [[ -z "$PYTHON" ]]; then
   or download from https://www.python.org/downloads/"
 fi
 PYVER="$("$PYTHON" -c 'import sys; print("%d.%d"%sys.version_info[:2])')"
+
+# Brew split Tcl/Tk out of python@X starting with 3.13 — without the matching
+# python-tk@X formula, `import tkinter` errors with "No module named '_tkinter'"
+# and fuzzer's GUI can't launch at all. Detect and auto-install.
+if ! "$PYTHON" -c 'import tkinter' 2>/dev/null; then
+    if command -v brew >/dev/null 2>&1 && [[ "$PYTHON" == /opt/homebrew/* || "$PYTHON" == /usr/local/* ]]; then
+        step "Brew Python missing Tk bindings — installing python-tk@$PYVER…"
+        if brew install "python-tk@$PYVER"; then
+            ok "python-tk@$PYVER installed"
+        else
+            warn "brew install python-tk@$PYVER failed — GUI will fail to launch."
+            warn "  try manually: brew install python-tk@$PYVER"
+        fi
+    else
+        warn "tkinter not importable for $PYTHON — GUI will fail to launch."
+    fi
+fi
 ok "python: $PYTHON (v$PYVER)"
 
 if ! "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 9)' 2>/dev/null; then
@@ -189,14 +206,23 @@ if [[ -n "$CC_BIN" && $HAS_HEADERS -eq 1 ]]; then
     # Force clean rebuild — a leftover .so built against a different Python
     # ABI would ghost-pass `make`'s mtime check and ghost-fail the import.
     make clean-native >/dev/null 2>&1 || true
-    if make build-native; then
+    # Pass PYTHON to make explicitly — the Makefile defaults to
+    # `command -v python3` which can resolve to a different Python than the
+    # one we chose above (Apple system, Brew without symlink, etc.). Build
+    # output goes to a log so failures aren't silent.
+    BUILD_LOG="$ROOT/.ar_norm-build.log"
+    if make PYTHON="$PYTHON" build-native >"$BUILD_LOG" 2>&1; then
         if "$PYTHON" -c "import sys; sys.path.insert(0, '$ROOT'); import _ar_norm; print(_ar_norm.normalize('أ'))" >/dev/null 2>&1; then
             ok "_ar_norm built and importable"
+            rm -f "$BUILD_LOG"
         else
             warn "_ar_norm built but import failed — pure-Python fallback will be used."
+            warn "  build log: $BUILD_LOG"
         fi
     else
         warn "native build failed — pure-Python fallback will be used."
+        warn "  full build log: $BUILD_LOG  — last 10 lines:"
+        tail -10 "$BUILD_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
     fi
 else
     warn "skipping native build (compiler or Python headers missing) — pure-Python fallback will be used."

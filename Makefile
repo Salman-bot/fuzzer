@@ -25,8 +25,8 @@ install:
 build-native:
 	@if [ -z "$$(ls $(ROOT)_ar_norm*.so 2>/dev/null)" ] || \
 	    [ $(NATIVE)/ar_normalize.c -nt "$$(ls $(ROOT)_ar_norm*.so 2>/dev/null | head -1)" ]; then \
-	  echo "→ building _ar_norm C extension"; \
-	  cd $(NATIVE) && $(PYTHON) setup.py build_ext --inplace >/dev/null 2>&1 && \
+	  echo "→ building _ar_norm C extension (python: $(PYTHON))"; \
+	  cd $(NATIVE) && $(PYTHON) setup.py build_ext --inplace && \
 	  cp $(NATIVE)/_ar_norm*.so $(ROOT) && \
 	  echo "✓ _ar_norm installed at $(ROOT)"; \
 	else \
