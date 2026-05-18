@@ -187,6 +187,7 @@ sys.exit(0 if os.path.exists(m) else 1)
 fi
 
 CORE_DEPS=(
+    setuptools
     pymupdf
     rapidfuzz
     pdfplumber
