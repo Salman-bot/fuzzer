@@ -324,15 +324,30 @@ try:
     _ENGINE_ARABIC = "C ext (_ar_norm)"
 
 except ImportError:
-    _AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")
-    _ALEF_VARIANTS = str.maketrans(
-        {"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
-    _YEH_VARIANTS = str.maketrans({"ى": "ي", "ئ": "ي"})
+    try:
+        # pyarabic is in CORE_DEPS, so this tier is effectively the default
+        # whenever the C extension didn't build (missing CLT, header mismatch,
+        # cross-Python ABI, etc.). Slower than _ar_norm but a proper Arabic
+        # tokenizer — far better than the pure-regex fallback for searches
+        # involving hamza/yeh normalization edge cases.
+        import pyarabic.araby as _araby  # type: ignore[import-not-found]
 
-    def _normalize_arabic(s: str) -> str:
-        s = _AR_DIACRITICS.sub("", s)
-        return s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
-    _ENGINE_ARABIC = "regex fallback"
+        def _normalize_arabic(s: str) -> str:
+            s = _araby.strip_tashkeel(s)
+            s = _araby.strip_tatweel(s)
+            s = _araby.normalize_hamza(s, method="tasheel")
+            return s.replace("ى", "ي").replace("ئ", "ي")
+        _ENGINE_ARABIC = "pyarabic"
+    except ImportError:
+        _AR_DIACRITICS = re.compile(r"[ً-ْٰـ]")
+        _ALEF_VARIANTS = str.maketrans(
+            {"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
+        _YEH_VARIANTS = str.maketrans({"ى": "ي", "ئ": "ي"})
+
+        def _normalize_arabic(s: str) -> str:
+            s = _AR_DIACRITICS.sub("", s)
+            return s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
+        _ENGINE_ARABIC = "regex fallback"
 
 # ── native-call instrumentation (toggleable at runtime via the GUI) ──────────
 # When debug mode is ON, every call to _normalize_arabic is recorded into
