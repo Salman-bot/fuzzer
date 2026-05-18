@@ -44,6 +44,11 @@ test_pdfs.tar.gz
 # Per-search highlighted PDF copies (regenerated on every search).
 .fuzzer_tmp/
 
+# Single-instance pidfile + auto-launch stderr capture (runtime, not source).
+.fuzzer.pid
+.fuzzer-launch.log
+.ar_norm-build.log
+
 # Built C extension (regenerate with `make build-native`).
 _ar_norm*.so
 native/build/

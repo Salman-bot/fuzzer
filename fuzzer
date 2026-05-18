@@ -894,11 +894,18 @@ def collect_files(paths: List[str], recursive: bool) -> List[str]:
                     for f in sorted(path.rglob("*"))
                     if f.is_file()
                     and f.suffix.lower() in _EXT_MAP
-                    # Skip Microsoft Office "owner" lock files (~$foo.docx).
-                    # They're tiny placeholders Word writes when a doc is
-                    # open — python-docx can't read them and would spam
-                    # "Package not found" warnings for every Arabic filename.
+                    # Skip junk files that show up by extension but are never
+                    # what the user means to search:
+                    #   ~$foo.docx   Microsoft Office owner lock files
+                    #   .DS_Store    macOS Finder metadata
+                    #   ._foo.pdf    macOS resource forks on non-HFS volumes
+                    #   *.swp/*.swo  vim swap files
+                    #   *~           emacs/vim backup
+                    #   *.bak        generic backup
                     and not f.name.startswith("~$")
+                    and not f.name.startswith("._")
+                    and f.name != ".DS_Store"
+                    and not f.name.endswith(("~", ".swp", ".swo", ".bak"))
                 )
             else:
                 _err(f"{p} is a directory — use -r to search recursively")
@@ -2839,6 +2846,24 @@ def run_gui() -> int:
         )
     root.bind_all("<Control-Shift-c>", _toggle_chat)
     root.bind_all("<Command-Shift-c>", _toggle_chat)
+
+    # Standard macOS Cmd+W -> close window (also wired to Ctrl+W for Linux
+    # muscle memory). Tk on Aqua doesn't bind this by default.
+    root.bind_all("<Command-w>", lambda _e: root.destroy())
+    root.bind_all("<Control-w>", lambda _e: root.destroy())
+
+    # ESC clears whichever entry is focused (Pattern, Files/folders, chat).
+    # No global wipe — only the focused widget so we don't clobber state.
+    def _esc_clear(_e: object = None) -> None:
+        focused = root.focus_get()
+        if focused is pattern_entry:
+            pattern_var.set("")
+        elif focused is files_entry:
+            _files_ph["active"] = False
+            files_var.set("")
+            with contextlib.suppress(Exception):
+                files_entry.delete(0, "end")
+    root.bind_all("<Escape>", _esc_clear)
 
     # Always mount the chat body on launch (we force _chat_collapsed=False above).
     # fill="both", expand=True so dragging the PanedWindow sash actually grows
@@ -5013,6 +5038,14 @@ def run_gui() -> int:
             f"{total} match{'es' if total != 1 else ''} "
             f"in {n_files} file{'s' if n_files != 1 else ''}"
         )
+        # Mirror match count in the window title so it's visible in the
+        # Window menu / Dock preview without bringing the app to front.
+        if total:
+            root.title(
+                f"fuzzer — {total} match{'es' if total != 1 else ''} "
+                f"in {n_files} file{'s' if n_files != 1 else ''}")
+        else:
+            root.title("fuzzer")
 
     def populate(results: Dict[str, Tuple[List[str], List[Match]]]) -> None:
         """Rebuild tree from scratch (used for cancel/error replay)."""
