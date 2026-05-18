@@ -186,6 +186,9 @@ ok "core dependencies installed"
 # ── Build _ar_norm native extension ───────────────────────────────────────────
 if [[ -n "$CC_BIN" && $HAS_HEADERS -eq 1 ]]; then
     step "building _ar_norm C extension…"
+    # Force clean rebuild — a leftover .so built against a different Python
+    # ABI would ghost-pass `make`'s mtime check and ghost-fail the import.
+    make clean-native >/dev/null 2>&1 || true
     if make build-native; then
         if "$PYTHON" -c "import sys; sys.path.insert(0, '$ROOT'); import _ar_norm; print(_ar_norm.normalize('أ'))" >/dev/null 2>&1; then
             ok "_ar_norm built and importable"
@@ -318,12 +321,14 @@ EOF
 # ── Launch fuzzer ─────────────────────────────────────────────────────────────
 # Run the GUI now so the user lands directly in the app rather than having to
 # task-switch back from Terminal. Detach via `nohup`+`&` so closing the
-# Terminal doesn't kill the GUI, then activate the Python app via AppleScript
-# to pull focus off the current window (Terminal, fullscreen browser, etc.).
+# Terminal doesn't kill the GUI. Stderr goes to a log so a silent-blank-window
+# failure (Tk error during widget setup, etc.) leaves a trail.
 step "launching fuzzer…"
-nohup "$ROOT/fuzzer" >/dev/null 2>&1 &
+LAUNCH_LOG="$ROOT/.fuzzer-launch.log"
+: >"$LAUNCH_LOG" 2>/dev/null || LAUNCH_LOG="/tmp/fuzzer-launch.log"
+nohup "$ROOT/fuzzer" >"$LAUNCH_LOG" 2>&1 &
 disown 2>/dev/null || true
 # Tk needs a moment to register its NSApplication before `activate` works.
 sleep 1
 osascript -e 'tell application "Python" to activate' 2>/dev/null || true
-ok "fuzzer launched"
+ok "fuzzer launched (stderr → $LAUNCH_LOG if it blanks/crashes)"
