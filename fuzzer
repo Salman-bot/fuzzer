@@ -1239,9 +1239,12 @@ def run_gui() -> int:
     # Glossy-over-wallpaper feel. macOS Tk supports -alpha for whole-window
     # translucency (true vibrancy/blur needs PyObjC + NSVisualEffectView —
     # tracked as a future spike). Persisted per user preference; 1.0 disables.
-    _saved_alpha = float(_gui_state.get("window_alpha", 0.96))
+    # Default alpha 0.92 -- gives the window a soft "glass" look without
+    # making text hard to read. Users can drag the alpha slider in the
+    # status row to taste; their choice is persisted in _gui_state.
+    _saved_alpha = float(_gui_state.get("window_alpha", 0.92))
     if not 0.5 <= _saved_alpha <= 1.0:
-        _saved_alpha = 0.96
+        _saved_alpha = 0.92
     with contextlib.suppress(Exception):
         root.wm_attributes("-alpha", _saved_alpha)
 
@@ -1437,8 +1440,12 @@ def run_gui() -> int:
                                    ("pressed", t["BORDER"]),
                                    ("disabled", t["BG"])],
                        foreground=[("disabled", t["MUTED"])])
+            # `borderwidth=0` + `relief="flat"` removes the visible inset
+            # bevel around the Treeview, which makes the results pane look
+            # like part of the surrounding canvas instead of a sunken box.
             _style.configure("Treeview", background=t["CARD_BG"],
-                             fieldbackground=t["CARD_BG"], foreground=t["TEXT"])
+                             fieldbackground=t["CARD_BG"], foreground=t["TEXT"],
+                             borderwidth=0, relief="flat")
             _style.map("Treeview",
                        background=[("selected", t["SEL_BG"])],
                        foreground=[("selected", t["TEXT"])])
@@ -1614,6 +1621,16 @@ def run_gui() -> int:
 
     _pattern_ph = _install_entry_placeholder(
         pattern_entry, pattern_var, _PATTERN_PH_TEXT)
+    _Tooltip(
+        pattern_entry,
+        "What to search for.\n"
+        "\n"
+        "Clear with:\n"
+        "  • the ✕ button to the right\n"
+        "  • or press ESC while focused here\n"
+        "\n"
+        "Enable Smart search for phrase/AND/OR/NOT syntax.\n"
+        "Press ↑/↓ or click the ▼ to browse recent searches.")
 
     def _clear_pattern() -> None:
         pattern_var.set("")
@@ -1621,7 +1638,9 @@ def run_gui() -> int:
     _pat_clear_btn = ttk.Button(form, text="✕", width=2,
                                 command=_clear_pattern)
     _pat_clear_btn.grid(row=0, column=3, padx=(2, 2), pady=2)
-    _Tooltip(_pat_clear_btn, "Clear the pattern")
+    _Tooltip(_pat_clear_btn,
+             "Clear the Pattern box.\n"
+             "Keyboard: focus the box and press ESC.")
 
     ttk.Label(form, text="Files/folders:").grid(row=1, column=0, sticky="w")
     # Defensive: if a previous version saved the placeholder text into
@@ -1637,6 +1656,18 @@ def run_gui() -> int:
                      sticky="ew", padx=4, pady=2)
     _files_ph = _install_entry_placeholder(
         files_entry, files_var, _FILES_PH_TEXT)
+    _Tooltip(
+        files_entry,
+        "What to search through. Paths are space-separated; quote any\n"
+        "path with spaces in it.\n"
+        "\n"
+        "Easiest ways to fill this in:\n"
+        "  • drag a folder/file from Finder into this box\n"
+        "  • click  Pick files…  or  Pick folder…  on the right\n"
+        "\n"
+        "Clear with:\n"
+        "  • the ✕ button to the right\n"
+        "  • or press ESC while focused here")
 
     # Drag-and-drop file paths onto the files entry (or anywhere on the window)
     if _dnd_available and DND_FILES is not None:
@@ -1747,7 +1778,9 @@ def run_gui() -> int:
     _files_clear_btn = ttk.Button(form, text="✕", width=2,
                                   command=_clear_files)
     _files_clear_btn.grid(row=1, column=5, padx=(2, 2), pady=2)
-    _Tooltip(_files_clear_btn, "Clear the Files/folders box")
+    _Tooltip(_files_clear_btn,
+             "Clear the Files/folders box.\n"
+             "Keyboard: focus the box and press ESC.")
 
     # options row
     opts = ttk.Frame(form)
@@ -2128,7 +2161,12 @@ def run_gui() -> int:
 
     vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
-    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    # Strip the Treeview's outer 1px highlight ring so the results pane
+    # blends with the surrounding canvas (glassier, less "boxed-in" look).
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set,
+                   selectmode="extended")
+    with contextlib.suppress(Exception):
+        tree.configure(highlightthickness=0, borderwidth=0)
     tree.tag_configure("odd", background=_ROW_ALT)
     tree.tag_configure("even", background=_CARD_BG)
     tree.grid(row=0, column=0, sticky="nsew")
