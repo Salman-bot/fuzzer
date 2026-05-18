@@ -4555,15 +4555,29 @@ def run_gui() -> int:
 
     def start_search() -> None:
         if state["searching"]:
-            # User clicked Search while a previous search is still running.
-            # Cancel it and queue a fresh start once the worker thread notices
-            # cancellation and posts its `done` message. poll_queue picks up
-            # `_pending_restart` and re-invokes start_search() automatically.
-            state["cancel_search"] = True
-            state["_pending_restart"] = True
-            status_var.set("Cancelling previous search to start a new one...")
-            stop_btn.config(state="disabled")
-            return
+            # Zombie-worker safety: if state still says "searching" but the
+            # worker thread is dead (crashed, hung, killed without posting
+            # `done`/`error`), we'd be stuck forever waiting for a restart
+            # signal that never arrives. Detect and force-reset, then fall
+            # through to start the new search normally.
+            worker_thread = state.get("worker_thread")
+            if worker_thread is None or not worker_thread.is_alive():
+                _log_activity(
+                    "Previous worker is no longer alive — resetting state.")
+                state["searching"] = False
+                state["cancel_search"] = False
+                state.pop("_pending_restart", None)
+            else:
+                # Worker is genuinely alive — cancel it and queue a fresh start
+                # once the worker thread notices cancellation and posts its
+                # `done` message. poll_queue picks up `_pending_restart` and
+                # re-invokes start_search() automatically.
+                state["cancel_search"] = True
+                state["_pending_restart"] = True
+                status_var.set(
+                    "Cancelling previous search to start a new one...")
+                stop_btn.config(state="disabled")
+                return
         # Skip the ghost-text placeholders when reading: an active placeholder
         # means "the box is logically empty," even if the StringVar holds the
         # hint text. Treat both as empty and prompt the user.
@@ -4624,6 +4638,7 @@ def run_gui() -> int:
         _row_full_lines.clear()
         _row_lines_raw.clear()
         _highlighted_pdfs.clear()
+        _highlighted_docx.clear()
         # Force Tk to flush the deletes before the worker starts streaming
         # new matches — on some macOS Tk builds the delete is deferred until
         # the next idle tick, which let the new rows interleave with the old.
@@ -4650,6 +4665,7 @@ def run_gui() -> int:
             ),
             daemon=True,
         )
+        state["worker_thread"] = t  # tracked for zombie detection
         t.start()
 
     _row_paths: Dict[str, str] = {}  # iid → full file path
@@ -4657,6 +4673,8 @@ def run_gui() -> int:
     _row_lines_raw: Dict[str, str] = {}  # iid → raw (un-bidi-fixed) line for Word find
     # original path → highlighted copy path
     _highlighted_pdfs: Dict[str, str] = {}
+    # original path -> highlighted copy path (DOCX)
+    _highlighted_docx: Dict[str, str] = {}
 
     # Monotonic counter so each highlighted-copy filename is unique. We used to
     # use id(_doc) here, but CPython reuses object IDs after the doc is closed
@@ -4808,6 +4826,73 @@ def run_gui() -> int:
             _log_activity(f"Highlight failed for {os.path.basename(fp)}: {_e}")
             return fp
 
+    def _build_highlighted_docx(fp: str, matches: List[Match]) -> str:
+        """Highlight query matches in a DOCX copy via python-docx.
+
+        Strategy: open the source doc, walk paragraphs whose 1-based index
+        equals a match's `line_num`, and apply yellow highlight to any run
+        whose text contains the query (after Arabic normalization). Save to
+        a tmp copy and return its path. On any failure, return the original
+        path so the caller falls back to opening the source.
+        """
+        try:
+            from docx import Document
+            from docx.enum.text import WD_COLOR_INDEX
+        except ImportError:
+            return fp
+        try:
+            doc = Document(fp)
+            _query = pattern_var.get().strip()
+            _use_smart = bool(smart_var.get())
+            # Pull positive-only terms in Smart mode; otherwise just the query.
+            if _use_smart:
+                _parsed = _parse_smart_query(_query)
+                _terms: List[str] = []
+                _seen: set = set()
+                for og in _parsed["required"]:
+                    for t in og:  # type: ignore[union-attr]
+                        if t and t not in _seen:
+                            _seen.add(t)
+                            _terms.append(t)
+            else:
+                _terms = [_query] if _query else []
+            _terms_norm = [
+                _normalize_arabic(t).lower() for t in _terms if t.strip()]
+            if not _terms_norm:
+                return fp
+
+            _target_paras = {m.line_num for m in matches}
+            _hit_count = 0
+            for i, para in enumerate(doc.paragraphs, start=1):
+                if i not in _target_paras:
+                    continue
+                for run in para.runs:
+                    rtext = run.text
+                    if not rtext:
+                        continue
+                    rnorm = _normalize_arabic(rtext).lower()
+                    if any(t in rnorm for t in _terms_norm):
+                        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                        _hit_count += 1
+            if _hit_count == 0:
+                # Couldn't pin matches to specific runs — fall back to original
+                # so the user at least sees the file, even if unhighlighted.
+                return fp
+
+            _tmp_dir = _PROJECT_DIR / ".fuzzer_tmp"
+            _tmp_dir.mkdir(exist_ok=True)
+            _tmp = str(
+                _tmp_dir
+                / f"fuzzer_{os.getpid()}_{next(_tmp_counter)}_{Path(fp).stem}.highlighted.docx")
+            doc.save(_tmp)
+            _log_activity(
+                f"DOCX highlighted: {os.path.basename(fp)} ({_hit_count} runs)")
+            return _tmp
+        except Exception as _e:
+            _log_activity(
+                f"DOCX highlight failed for {os.path.basename(fp)}: {_e}")
+            return fp
+
     def _append_file_results(fp: str, matches: List[Match]) -> None:
         """Add one file's matches to the tree and pre-build its PDF highlight."""
         display_name = _fix_arabic(os.path.basename(fp))
@@ -4871,8 +4956,11 @@ def run_gui() -> int:
             _row_full_lines[iid] = _fix_arabic(m.line)
             _row_lines_raw[iid] = m.line
             row_index += 1
-        if Path(fp).suffix.lower() == ".pdf":
+        _ext_lc = Path(fp).suffix.lower()
+        if _ext_lc == ".pdf":
             _highlighted_pdfs[fp] = _build_highlighted_pdf(fp, matches)
+        elif _ext_lc in (".docx", ".doc"):
+            _highlighted_docx[fp] = _build_highlighted_docx(fp, matches)
 
     def _refresh_status() -> None:
         results = state["results"]
@@ -5154,15 +5242,18 @@ def run_gui() -> int:
                 # DOCX has no real page concept in the file (Word computes pages
                 # at render time from paper size + fonts + margins), so we
                 # navigate by *text* instead: open in Word and run Find on the
-                # matched paragraph text. Falls back to a plain `open` if Word
-                # isn't installed.
+                # matched paragraph text. The pre-built highlighted copy (from
+                # _append_file_results) is preferred; falls back to the
+                # original if highlighting failed or python-docx isn't there.
                 _word_app = "/Applications/Microsoft Word.app"
                 _raw_line = _row_lines_raw.get(iid, "").strip()
+                _open_path = _highlighted_docx.get(filepath, filepath)
+                _hl_note = "" if _open_path == filepath else " (highlighted)"
                 # Word's Find handles long strings but truncate to keep the
                 # AppleScript event reasonably sized and dodge edge cases with
                 # paragraph breaks inside very long paragraphs.
                 _needle = _raw_line[:180]
-                _esc = filepath.replace("\\", "\\\\").replace('"', '\\"')
+                _esc = _open_path.replace("\\", "\\\\").replace('"', '\\"')
                 _needle_esc = _needle.replace("\\", "\\\\").replace('"', '\\"')
                 if os.path.isdir(_word_app) and _needle:
                     # Word fires "open" asynchronously — `selection` is
@@ -5206,9 +5297,9 @@ def run_gui() -> int:
                     else:
                         status_var.set(
                             f"Scrolled to match — "
-                            f"{os.path.basename(filepath)}")
+                            f"{os.path.basename(filepath)}{_hl_note}")
                         _log_activity(
-                            f"Opened DOCX '{os.path.basename(filepath)}' "
+                            f"Opened DOCX '{os.path.basename(filepath)}'{_hl_note} "
                             f"and scrolled to line {line_num}")
                 else:
                     _open_default(filepath)
