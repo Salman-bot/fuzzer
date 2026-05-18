@@ -1798,6 +1798,11 @@ def run_gui() -> int:
     # isn't on PATH so the user sees the option exists but knows it needs install.
     rga_var = tk.BooleanVar(
         value=bool(_gui_state.get("rga_mode", False)) and bool(_RGA_PATH))
+    # When ON, the results pane shows one row per file (file + match count +
+    # page range + best score + snippet) rather than one row per match. Saves
+    # a lot of vertical scrolling on corpora with hundreds of hits per file.
+    group_by_file_var = tk.BooleanVar(
+        value=bool(_gui_state.get("group_by_file", False)))
 
     _opt_tooltips = [
         ("Case-sensitive", case_var,
@@ -1860,6 +1865,18 @@ def run_gui() -> int:
          "\n"
          + ("Detected at: " + _RGA_PATH if _RGA_PATH else
             "NOT INSTALLED — run `brew install ripgrep-all` to enable.")),
+        ("Group by file", group_by_file_var,
+         "Collapse multiple matches in the same file into a single row.\n"
+         "\n"
+         "OFF (default) — one row per match. Page, Score, and Content\n"
+         "                are exact per-match values.\n"
+         "ON            — one row per file. Page shows the page range\n"
+         "                (e.g. '3, 7, 12' or '3–28'), Score is the best\n"
+         "                match's score, and Content is the top match's\n"
+         "                snippet with '(+N more)' appended.\n"
+         "\n"
+         "Double-clicking a grouped row opens the file at the best-scoring\n"
+         "match. Turn OFF if you need to jump to a specific later match."),
     ]
     # Group the checkboxes by role so the strip reads as three clusters
     # rather than one wall: match-style ┊ scope ┊ backend ┊ threshold.
@@ -1970,6 +1987,17 @@ def run_gui() -> int:
     rga_var.trace_add("write", _enforce_exclusions)
     # Initial sync — saved state may have a conflicting combination.
     _enforce_exclusions()
+
+    def _on_group_toggle(*_args) -> None:
+        """Persist the toggle + re-render any existing results in the new mode."""
+        _gui_state["group_by_file"] = group_by_file_var.get()
+        _save_state(_gui_state)
+        # If a search has completed, redraw the tree from cached results
+        # using the new grouping. Skipped during an active search -- the
+        # next streamed match will pick up the new mode automatically.
+        if not state.get("searching") and state.get("results"):
+            populate(state["results"])
+    group_by_file_var.trace_add("write", _on_group_toggle)
 
     # Engine indicator — small ⓘ pill that, on hover, lists which engines are
     # actually being used. Demystifies "is this the slow Python path or
@@ -2302,16 +2330,21 @@ def run_gui() -> int:
         frame.pack()
         inner = tk.Frame(frame, bg=_bg)
         inner.pack(padx=1, pady=1)
+        # NOTE: pady/padx in a Tk widget constructor must be a single screen
+        # distance -- only pack()/grid() accept 2-tuples for asymmetric pad.
+        # Passing pady=(4, 0) to tk.Label raises
+        #   TclError: expected screen distance but got "4 0"
+        # on Tk 9.x. Keep all asymmetric padding on the layout call instead.
         tk.Label(
             inner, text="Activity history",
             bg=_bg, fg="#9b8cf0", font=("Menlo", 9, "bold"),
-            anchor="w", padx=8, pady=(4, 0),
-        ).pack(fill="x")
+            anchor="w", padx=8,
+        ).pack(fill="x", pady=(4, 0))
         tk.Label(
             inner, text=body, justify="left", anchor="w",
             bg=_bg, fg=_fg, font=("Menlo", 10),
-            padx=8, pady=(2, 6),
-        ).pack(fill="x")
+            padx=8,
+        ).pack(fill="x", pady=(2, 6))
         # Force layout so winfo_height/width report real numbers, then
         # position above the status label with a small gap.
         tip.update_idletasks()
@@ -4853,6 +4886,7 @@ def run_gui() -> int:
         _gui_state["rga_mode"] = rga_var.get()
         _gui_state["whole_word"] = whole_word_var.get()
         _gui_state["smart_mode"] = smart_var.get()
+        _gui_state["group_by_file"] = group_by_file_var.get()
         _save_state(_gui_state)
         state["searching"] = True
         state["cancel_search"] = False
@@ -5127,9 +5161,83 @@ def run_gui() -> int:
             return fp
 
     def _append_file_results(fp: str, matches: List[Match]) -> None:
-        """Add one file's matches to the tree and pre-build its PDF highlight."""
+        """Add one file's matches to the tree and pre-build its PDF highlight.
+
+        When `group_by_file_var` is on, emits a single summary row instead of
+        one row per match. The summary row's values are aggregated from the
+        match list (page range, max score, best snippet + "(+N more)").
+        """
         display_name = _fix_arabic(os.path.basename(fp))
         row_index = len(_row_paths)
+
+        if group_by_file_var.get() and matches:
+            # Pick the best-scoring match to drive the snippet + line_num.
+            # On ties (common in exact/Smart mode where everything is 100),
+            # the first match wins -- preserves source order.
+            best = max(matches, key=lambda mm: (mm.score, -mm.line_num))
+            n = len(matches)
+            # Page summary: up to 3 distinct pages comma-separated, or "X pages"
+            pages = sorted({mm.page_num for mm in matches if mm.page_num})
+            if not pages:
+                page_text = ""
+            elif len(pages) <= 3:
+                page_text = ", ".join(str(p) for p in pages)
+            else:
+                page_text = f"{pages[0]}–{pages[-1]} ({len(pages)} pages)"
+            # Score: best across matches (mixing exact + fuzzy in the row).
+            max_score = max(mm.score for mm in matches)
+            if max_score == 100:
+                match_type, score_text = "exact", "100"
+            elif max_score == -1:
+                match_type, score_text = "ai", ""
+            else:
+                match_type, score_text = "fuzzy", str(max_score)
+            # Build the snippet from the best match -- same logic as the per-
+            # match path below, but only for the chosen match.
+            _full_ranges = _find_match_ranges(
+                best.line, pattern_var.get(),
+                use_smart=smart_var.get(),
+                case_sensitive=case_var.get(),
+                whole_word=whole_word_var.get(),
+            )
+            if _full_ranges:
+                _ms, _me = _full_ranges[0]
+                _ws, _we = max(0, _ms - 60), min(len(best.line), _me + 60)
+                _snippet = best.line[_ws:_we]
+                if _ws > 0:
+                    _snippet = "… " + _snippet
+                if _we < len(best.line):
+                    _snippet = _snippet + " …"
+            else:
+                _snippet = _line_context(best.line, pattern_var.get())
+            _snippet_ranges = _find_match_ranges(
+                _snippet, pattern_var.get(),
+                use_smart=smart_var.get(),
+                case_sensitive=case_var.get(),
+                whole_word=whole_word_var.get(),
+            )
+            _snippet_marked = _wrap_marks(_snippet, _snippet_ranges)
+            if n > 1:
+                _snippet_marked = f"{_snippet_marked}   (+{n - 1} more)"
+            # Suffix the file column with the count so it's visible even when
+            # the Content column is narrow.
+            _display = f"{display_name}  ({n} match{'es' if n != 1 else ''})"
+            iid = tree.insert("", "end", values=(
+                _display, best.line_num, page_text, match_type, score_text,
+                _fix_arabic(_snippet_marked)),
+                tags=("odd" if row_index % 2 else "even",))
+            _row_paths[iid] = fp
+            _row_full_lines[iid] = _fix_arabic(best.line)
+            _row_lines_raw[iid] = best.line
+            row_index += 1
+            # Skip the per-match loop; jump to the highlight pre-build.
+            _ext_lc = Path(fp).suffix.lower()
+            if _ext_lc == ".pdf":
+                _highlighted_pdfs[fp] = _build_highlighted_pdf(fp, matches)
+            elif _ext_lc in (".docx", ".doc"):
+                _highlighted_docx[fp] = _build_highlighted_docx(fp, matches)
+            return
+
         for m in matches:
             if m.score == 100:
                 match_type, score_text = "exact", "100"
