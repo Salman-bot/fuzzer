@@ -53,17 +53,47 @@ ok "platform: macOS"
 
 # ── toolchain checks ──────────────────────────────────────────────────────────
 # Prefer Homebrew Python over Apple's Xcode CLT Python. Apple's /usr/bin/python3
-# is 3.9 with a Tk 8.6.x build that's too old for the tabbed-Notebook styling
-# in fuzzer — using it produces a blank window and a TclError on startup.
-# We probe well-known Brew paths directly instead of relying on PATH, since
-# Brew's shellenv often isn't loaded in scripted contexts.
-PYTHON=""
-for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-    [[ -x "$cand" ]] && { PYTHON="$cand"; break; }
-done
+# is 3.9 with a Tk 8.6.x too old for the tabbed Notebook (blank window +
+# "expected screen distance" TclError) AND ships without Python.h, so the
+# _ar_norm C extension can't build against it. Brew Python solves both.
+#
+# Probe Brew installs exhaustively — `brew install python@X` only creates
+# /opt/homebrew/bin/python3 when that version becomes the default; if the user
+# has multiple Pythons installed, the symlink may be missing entirely. Pick
+# the newest Cellar install by sorting the python@X dirs.
+find_brew_python() {
+    local p
+    for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        [[ -x "$p" ]] && { echo "$p"; return 0; }
+    done
+    # Sort numerically descending on the python@X suffix so 3.14 wins over 3.13.
+    while IFS= read -r p; do
+        [[ -x "$p" ]] && { echo "$p"; return 0; }
+    done < <(find /opt/homebrew/opt /usr/local/opt -maxdepth 3 \
+                  -name python3 -path '*python@*/bin/python3' 2>/dev/null \
+             | sort -t@ -k2 -V -r)
+    return 1
+}
+
+PYTHON="$(find_brew_python || true)"
+
+# If no Brew Python and Homebrew itself is available, install python@3.14
+# rather than falling back to Apple's CLT Python (which would break the GUI
+# and the native build).
+if [[ -z "$PYTHON" ]] && command -v brew >/dev/null 2>&1; then
+    step "no Brew Python found — installing python@3.14 via Homebrew…"
+    if brew install python@3.14; then
+        ok "python@3.14 installed"
+        PYTHON="$(find_brew_python || true)"
+    else
+        warn "brew install python@3.14 failed — falling back to system Python."
+    fi
+fi
+
+# Last resort: whatever's on PATH (usually Apple's CLT Python).
 [[ -z "$PYTHON" ]] && PYTHON="$(command -v python3 || command -v python || true)"
 if [[ -z "$PYTHON" ]]; then
-    fail "python3 not found. Install via Homebrew:
+    fail "python3 not found and Brew install didn't work. Install manually:
   brew install python@3.14
   or download from https://www.python.org/downloads/"
 fi
@@ -74,20 +104,31 @@ if ! "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 9)' 2>/dev/null; t
     fail "Python 3.9+ required (found $PYVER)."
 fi
 
-# Apple's CLT Python is technically fine for headless work but its Tk is too
-# old for the tabbed UI. Warn loudly so the user installs Brew Python instead.
+# Apple's CLT Python is technically usable for the headless parts but the GUI
+# and native build both break against it. Warn loudly with the exact fix.
 if [[ "$PYTHON" == /usr/bin/python3 ]] || \
    [[ "$PYTHON" == /Library/Developer/CommandLineTools/* ]]; then
-    warn "Using Apple's Xcode CLT Python — its Tk is too old for the tabbed UI."
-    warn "The window will likely launch blank. Recommended:"
+    warn "Using Apple's Xcode CLT Python — its Tk is too old for the tabbed UI"
+    warn "and it ships no Python.h (so _ar_norm can't build). Recommended:"
     warn "  brew install python@3.14   # then re-run ./install.sh"
 fi
 
-# C compiler — needed for _ar_norm.
+# Xcode Command Line Tools — needed for the C compiler that builds _ar_norm.
+# The install dialog is async (user clicks Install, download takes ~5-10 min)
+# so we kick it off and let the user re-run install.sh after it finishes.
+if ! xcode-select -p >/dev/null 2>&1; then
+    step "Xcode Command Line Tools not installed — triggering install…"
+    xcode-select --install 2>/dev/null || true
+    warn "A macOS popup should have appeared. Click 'Install' and wait for it"
+    warn "  to finish (~5-10 min), then re-run ./install.sh."
+    fail "aborting until Xcode CLT install completes."
+fi
+
+# C compiler — needed for _ar_norm. With CLT installed this should be present.
 CC_BIN="$(command -v cc || command -v clang || true)"
 if [[ -z "$CC_BIN" ]]; then
-    warn "no C compiler found — _ar_norm will fall back to pyarabic / pure Python."
-    warn "  install Xcode CLT:  xcode-select --install"
+    warn "no C compiler on PATH — _ar_norm will fall back to pyarabic / pure Python."
+    warn "  try: sudo xcode-select --reset && xcode-select --install"
 else
     ok "C compiler: $CC_BIN"
 fi
