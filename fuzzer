@@ -185,6 +185,9 @@ def _extract_pdf(fp: str) -> Optional[List[str]]:
         return None
 
 
+_DOCX_WARNED: set = set()
+
+
 def _extract_docx(fp: str) -> Optional[List[str]]:
     try:
         from docx import Document
@@ -195,7 +198,15 @@ def _extract_docx(fp: str) -> Optional[List[str]]:
         doc = Document(fp)
         return [p.text for p in doc.paragraphs if p.text.strip()]
     except Exception as e:
-        _err(f"{fp}: {e}")
+        # Quiet by basename + dedupe — python-docx's error includes the full
+        # path which makes the line look duplicated, and on Arabic-named
+        # folders it dumps unreadable Unicode into the terminal. One short
+        # line per unreadable file is enough.
+        name = Path(fp).name
+        if name not in _DOCX_WARNED:
+            _DOCX_WARNED.add(name)
+            err = str(e).split(":", 1)[-1].strip()  # drop python-docx's path prefix
+            _err(f"skipping {name} (unreadable docx: {err[:60]})")
         return None
 
 
@@ -881,7 +892,13 @@ def collect_files(paths: List[str], recursive: bool) -> List[str]:
                 out.extend(
                     str(f)
                     for f in sorted(path.rglob("*"))
-                    if f.is_file() and f.suffix.lower() in _EXT_MAP
+                    if f.is_file()
+                    and f.suffix.lower() in _EXT_MAP
+                    # Skip Microsoft Office "owner" lock files (~$foo.docx).
+                    # They're tiny placeholders Word writes when a doc is
+                    # open — python-docx can't read them and would spam
+                    # "Package not found" warnings for every Arabic filename.
+                    and not f.name.startswith("~$")
                 )
             else:
                 _err(f"{p} is a directory — use -r to search recursively")
