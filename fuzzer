@@ -1730,59 +1730,65 @@ def run_gui() -> int:
 
     _opt_tooltips = [
         ("Case-sensitive", case_var,
-         "Case-sensitive — uppercase and lowercase must match exactly.\n"
+         "Treat UPPERCASE and lowercase as different letters.\n"
          "\n"
-         "OFF (default):  'Hi' matches 'Hi', 'hi', 'HI', 'hI'\n"
-         "ON:             'Hi' matches only 'Hi'\n"
+         "OFF (default) — 'Hi' finds Hi, hi, HI, hI\n"
+         "ON            — 'Hi' finds only 'Hi'\n"
          "\n"
-         "Applies to every mode — exact, whole-word, regex, and fuzzy.\n"
-         "Regex equivalent: when OFF, the regex compiles with re.IGNORECASE."),
+         "Use ON when capitalization actually matters (proper nouns,\n"
+         "acronyms, code identifiers). Otherwise leave OFF — most\n"
+         "natural-language searches don't care."),
         ("Whole word", whole_word_var,
-         "Whole word — the match must align with word boundaries.\n"
+         "Match only complete words, not substrings.\n"
          "\n"
-         "OFF (default):  'asic'  matches 'basic'   (substring is enough)\n"
-         "                'cat'   matches 'category', 'concatenate'\n"
-         "ON:             'asic'  does NOT match 'basic'\n"
-         "                'cat'   matches 'cat' but NOT 'category'\n"
+         "OFF (default) — 'cat' finds  cat, category, concatenate, locate\n"
+         "ON            — 'cat' finds  cat   only\n"
          "\n"
-         "How it works: the pattern is wrapped with \\b…\\b before searching.\n"
-         "Regex equivalent: \\bpattern\\b (with regex specials escaped).\n"
-         "  e.g. searching 'foo' with this ON  ≡  regex \\bfoo\\b\n"
+         "Use ON when you want 'AI' but not 'maintain', or 'art' but not\n"
+         "'department'. Leave OFF for partial-match exploration.\n"
          "\n"
-         "Arabic: Python's \\b doesn't treat Arabic letters as word chars,\n"
-         "so for Arabic we fall back to substring-within-the-same-word."),
+         "Note for Arabic: Python's word-boundary detection doesn't fully\n"
+         "understand Arabic letters, so this falls back to 'inside the\n"
+         "same whitespace-separated chunk' — usually does what you want."),
         ("Smart search", smart_var,
-         "Smart search — Google-Scholar-style query language.\n"
+         "Google-Scholar-style query syntax. Lets one pattern express\n"
+         "multiple words, exact phrases, and exclusions at once.\n"
          "\n"
          "Operators:\n"
-         "  \"phrase\"        exact phrase  (quotes group multi-word phrases)\n"
-         "  word1 word2     all words must appear on the same line (AND)\n"
-         "  word1 OR word2  either word satisfies the term  (capital OR)\n"
-         "  -word           exclude lines containing the word  (NOT)\n"
+         "  \"two words\"      → exact phrase, in order\n"
+         "  word1 word2      → both must appear on the same line (AND)\n"
+         "  cat OR dog       → either word (uppercase OR, lowercase \"or\" is a word)\n"
+         "  -word            → exclude lines containing this word (NOT)\n"
          "\n"
          "Examples:\n"
-         "  \"machine learning\"           exact phrase\n"
-         "  transformer attention        both words must appear (any order)\n"
-         "  cat OR dog                   either word\n"
-         "  python -snake                python WITHOUT snake\n"
-         "  \"neural network\" -survey     phrase WITHOUT 'survey'\n"
-         "  apple OR banana pie          (apple|banana) AND pie\n"
+         "  \"machine learning\"           — exact phrase\n"
+         "  transformer attention        — both, any order\n"
+         "  python -snake                — python, but NOT lines mentioning snake\n"
+         "  \"neural network\" -survey     — phrase, but skip survey papers\n"
+         "  apple OR banana pie          — (apple OR banana) AND pie\n"
          "\n"
-         "Precedence:  -word  >  OR  >  AND  (e.g. `a b OR c d`  ≡  a AND (b OR c) AND d)\n"
+         "Precedence:  -word  >  OR  >  AND\n"
+         "Score is always 100 in Smart mode (no fuzzy fallback).\n"
+         "Quotes must be balanced — unbalanced quotes are ignored."),
+        ("Recursive", recursive_var,
+         "When a folder is picked, also search every subfolder inside it.\n"
          "\n"
-         "Notes:\n"
-         "  • Score is always 100; fuzzy fallback is disabled while Smart is on.\n"
-         "  • At least one positive term is required — pure -negation matches nothing.\n"
-         "  • Case is controlled by the Case-sensitive checkbox.\n"
-         "  • Quotes must be balanced; unbalanced quotes fall back to a space-split."),
-        ("Recursive", recursive_var, "Search subfolders when a folder is given"),
+         "OFF — only files directly inside the chosen folder.\n"
+         "ON  — the folder and everything inside it, at any depth.\n"
+         "\n"
+         "Auto-enabled when you pick a folder via 'Pick folder…' or drag\n"
+         "one onto the window."),
         ("rga engine", rga_var,
-         ("Use ripgrep-all (rga) as the search backend. Extends file coverage to "
-          "docx, epub, xlsx, sqlite, mkv subtitles, etc.\n"
-          "Trade-off: substring/whole-word only (no fuzzy fallback). Regex mode "
-          "stays in-process even when this box is on.\n\n"
-          + ("Detected: " + _RGA_PATH if _RGA_PATH else
-             "NOT INSTALLED — run `brew install ripgrep-all` to enable."))),
+         "Use ripgrep-all as the search backend instead of fuzzer's own\n"
+         "extractor. Trades fuzzy matching for much wider file support.\n"
+         "\n"
+         "Pros: also reads epub, xlsx, sqlite, mkv subtitles, and a few\n"
+         "      other formats fuzzer doesn't natively support.\n"
+         "Cons: substring/whole-word only — no fuzzy similarity scoring.\n"
+         "      Threshold is ignored. Smart search still works.\n"
+         "\n"
+         + ("Detected at: " + _RGA_PATH if _RGA_PATH else
+            "NOT INSTALLED — run `brew install ripgrep-all` to enable.")),
     ]
     # Group the checkboxes by role so the strip reads as three clusters
     # rather than one wall: match-style ┊ scope ┊ backend ┊ threshold.
@@ -1806,10 +1812,35 @@ def run_gui() -> int:
     _thr_spin = ttk.Spinbox(opts, from_=0, to=100,
                             textvariable=threshold_var, width=5)
     _thr_spin.pack(side="left", padx=4)
-    _Tooltip(
-        _thr_lbl, "Minimum fuzzy similarity score (0 = anything, 100 = exact only)")
-    _Tooltip(
-        _thr_spin, "Minimum fuzzy similarity score (0 = anything, 100 = exact only)")
+    _THRESHOLD_TIP = (
+        "Minimum fuzzy-match similarity, 0–100.\n"
+        "\n"
+        "Each result gets a Score column (the percentage match).\n"
+        "Threshold filters out anything below this number.\n"
+        "\n"
+        "Common values:\n"
+        "  100 → exact only. Pattern must appear literally (or as a Smart phrase).\n"
+        "   80 → default. Catches most typos and minor spelling drift.\n"
+        "   60 → loose. Useful when you're not sure of spelling.\n"
+        "   40 → very loose. Many false positives; good for exploration.\n"
+        "    0 → no filter. Everything that even slightly resembles the pattern.\n"
+        "\n"
+        "Tip: start strict (80–100), drop lower only if you're getting no hits.\n"
+        "rga engine: ignores threshold entirely (rga doesn't do fuzzy)."
+    )
+    _Tooltip(_thr_lbl, _THRESHOLD_TIP)
+    _Tooltip(_thr_spin, _THRESHOLD_TIP)
+    # Tiny ⓘ pill next to Threshold, matching the existing ⓘ engine indicator.
+    # Hovers show the same tip; clicking opens a stay-open dialog for users
+    # who don't realize tooltips exist.
+    _thr_info = ttk.Label(opts, text="ⓘ",
+                          foreground=_T["MUTED"], cursor="hand2")
+    _thr_info.pack(side="left", padx=(0, 4))
+    _Tooltip(_thr_info, _THRESHOLD_TIP)
+
+    def _show_threshold_help(_e: object = None) -> None:
+        messagebox.showinfo("Threshold — what does it do?", _THRESHOLD_TIP)
+    _thr_info.bind("<Button-1>", _show_threshold_help)
 
     # Engine indicator — small ⓘ pill that, on hover, lists which engines are
     # actually being used. Demystifies "is this the slow Python path or
