@@ -1690,6 +1690,20 @@ def run_gui() -> int:
     ttk.Button(form, text="Pick folder…", command=pick_folder).grid(
         row=1, column=4, padx=2)
 
+    def _clear_files() -> None:
+        """Wipe the Files/folders entry and let the placeholder reappear."""
+        _files_ph["active"] = False
+        files_var.set("")
+        with contextlib.suppress(Exception):
+            files_entry.delete(0, "end")
+            files_entry.update_idletasks()
+        files_entry.focus_set()
+        # On focus-out the placeholder logic will re-show the ghost text.
+    _files_clear_btn = ttk.Button(form, text="✕", width=2,
+                                  command=_clear_files)
+    _files_clear_btn.grid(row=1, column=5, padx=(2, 2), pady=2)
+    _Tooltip(_files_clear_btn, "Clear the Files/folders box")
+
     # options row
     opts = ttk.Frame(form)
     opts.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
@@ -1898,6 +1912,12 @@ def run_gui() -> int:
     transcribe_tab = ttk.Frame(notebook, padding=(20, 20, 20, 20))
     notebook.add(transcribe_tab, text="🎙  Transcribe")
 
+    chatgpt_tab = ttk.Frame(notebook, padding=(20, 20, 20, 20))
+    notebook.add(chatgpt_tab, text="🤖  ChatGPT")
+
+    copilot_tab = ttk.Frame(notebook, padding=(20, 20, 20, 20))
+    notebook.add(copilot_tab, text="🧭  Copilot")
+
     settings_tab = ttk.Frame(notebook, padding=(20, 20, 20, 20))
     notebook.add(settings_tab, text="⚙  Settings")
 
@@ -1907,6 +1927,22 @@ def run_gui() -> int:
         transcribe_tab,
         text="Transcribe workflow lives here in the next iteration.\n"
              "For now: use the Transcribe… button in the toolbar above.",
+        justify="left",
+    ).pack(anchor="nw")
+    ttk.Label(
+        chatgpt_tab,
+        text="ChatGPT integration is a planned tab.\n"
+             "It will mirror the Claude Chat experience but talk to "
+             "OpenAI's API instead.\n"
+             "For now: use the 💬 Chat tab (Anthropic / Claude).",
+        justify="left",
+    ).pack(anchor="nw")
+    ttk.Label(
+        copilot_tab,
+        text="Microsoft Copilot integration is a planned tab.\n"
+             "Will support file-grounded Q&A via Microsoft Graph + "
+             "Copilot endpoints.\n"
+             "For now: use the 💬 Chat tab.",
         justify="left",
     ).pack(anchor="nw")
     ttk.Label(
