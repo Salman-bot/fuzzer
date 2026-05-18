@@ -96,6 +96,72 @@ The GUI opens. See [USAGE.md](USAGE.md) for the tour.
 
 ---
 
+## 7b — Arabic search engine (native C extension)
+
+Look at the bottom-left of the fuzzer window. The status bar shows
+which Arabic engine is live:
+
+```text
+fuzzy: rapidfuzz   arabic: C ext (_ar_norm)   pdf: PyMuPDF
+```
+
+There are **three tiers**, in order of preference:
+
+| Tier | Status bar label   | Speed   |
+| ---- | ------------------ | ------- |
+| 1    | `C ext (_ar_norm)` | fastest |
+| 2    | `pyarabic`         | medium  |
+| 3    | `regex fallback`   | slowest |
+
+**Tier 1 — `C ext (_ar_norm)` is the best and what you want.** Native
+C, roughly 10× faster than pyarabic, and frees the GIL on big batches.
+Built from `native/ar_normalize.c` against the same Python `fuzzer`
+launches with.
+
+**Tier 2 — `pyarabic`.** Pure-Python tokenizer. Correct results, just
+slower on large corpora. Auto-installed via pip, no compilation
+needed — this is the fallback if the C extension can't build.
+
+**Tier 3 — `regex fallback`.** Last-resort. Handles diacritics and
+basic alef/yeh normalization but misses some hamza edge cases.
+
+`./install.sh` from step 5 already tries to build the C extension —
+on a clean Brew Python install it just works. If you see `arabic:
+pyarabic` or `regex fallback` in the status bar, force a rebuild:
+
+```sh
+cd ~/bin && PY=$(awk 'NR==1{sub(/^#!/,""); print}' fuzzer) && "$PY" -m pip install --break-system-packages setuptools && make clean-native && make PYTHON="$PY" build-native && "$PY" -c "import sys; sys.path.insert(0,'.'); import _ar_norm; print(_ar_norm.normalize('أنا'))"
+```
+
+That one line (no shell comments — paste as-is): finds the exact
+Python `fuzzer` launches with, installs `setuptools` if missing,
+cleans any stale `.so`, rebuilds the C extension, and tests it. If
+the final command prints **`انا`** the build worked — quit and
+relaunch fuzzer, and the status bar will read `arabic: C ext
+(_ar_norm)`.
+
+If the build fails, the full compiler output is at
+`~/bin/.ar_norm-build.log`. The three usual suspects:
+
+- **`Python.h: No such file or directory`** — fuzzer's shebang points
+  to a Python that doesn't ship headers. Check `head -1 ~/bin/fuzzer`.
+  If it's `/usr/bin/python3` or anything under `/Library/Developer/
+  CommandLineTools/`, re-run `./install.sh` — it now prefers Brew
+  Python.
+- **`command 'cc' failed`** — Xcode Command Line Tools missing. Run
+  `xcode-select --install`, click **Install** in the popup, wait
+  5–10 min for it to finish, then retry.
+- **`ModuleNotFoundError: No module named 'setuptools'`** — the
+  one-liner above handles this; if you ran it some other way, just
+  `pip install --break-system-packages setuptools` first.
+
+You don't *need* the C extension to use fuzzer — tier 2 (`pyarabic`)
+gives correct results out of the box. But if you search large Arabic
+corpora (50+ PDFs, hundreds of MB), tier 1 is noticeably faster and
+worth the one-time setup.
+
+---
+
 ## 8 — Claude API key (optional, for the chat panel)
 
 The right side of the fuzzer window has a chat box that asks Claude
