@@ -1485,7 +1485,11 @@ def run_gui() -> int:
     form.columnconfigure(1, weight=1)
 
     ttk.Label(form, text="Pattern:").grid(row=0, column=0, sticky="w")
-    pattern_var = tk.StringVar(value=str(_gui_state.get("last_pattern", "")))
+    _PATTERN_PH_TEXT = "Type a word or phrase…  e.g. machine learning"
+    _saved_pattern = str(_gui_state.get("last_pattern", ""))
+    if _saved_pattern.strip() == _PATTERN_PH_TEXT:
+        _saved_pattern = ""
+    pattern_var = tk.StringVar(value=_saved_pattern)
     _search_history: List[str] = [str(x) for x in _gui_state.get(
         "search_history", [])]  # type: ignore[arg-type]
     # Wrap the combobox in a 1px frame that doubles as a focus ring (color
@@ -1547,8 +1551,7 @@ def run_gui() -> int:
         return state
 
     _pattern_ph = _install_entry_placeholder(
-        pattern_entry, pattern_var,
-        "Type a word or phrase…  e.g. machine learning")
+        pattern_entry, pattern_var, _PATTERN_PH_TEXT)
 
     def _clear_pattern() -> None:
         pattern_var.set("")
@@ -1559,13 +1562,19 @@ def run_gui() -> int:
     _Tooltip(_pat_clear_btn, "Clear the pattern")
 
     ttk.Label(form, text="Files/folders:").grid(row=1, column=0, sticky="w")
-    files_var = tk.StringVar(value=str(_gui_state.get("last_files", "")))
+    # Defensive: if a previous version saved the placeholder text into
+    # last_files (fixed now, but state files in the wild may still carry it),
+    # treat it as empty so the placeholder logic can run normally.
+    _FILES_PH_TEXT = "Drag a folder or file here, or paste a path…"
+    _saved_files = str(_gui_state.get("last_files", ""))
+    if _saved_files.strip() == _FILES_PH_TEXT:
+        _saved_files = ""
+    files_var = tk.StringVar(value=_saved_files)
     files_entry = ttk.Entry(form, textvariable=files_var)
     files_entry.grid(row=1, column=1, columnspan=2,
                      sticky="ew", padx=4, pady=2)
     _files_ph = _install_entry_placeholder(
-        files_entry, files_var,
-        "Drag a folder or file here, or paste a path…")
+        files_entry, files_var, _FILES_PH_TEXT)
 
     # Drag-and-drop file paths onto the files entry (or anywhere on the window)
     if _dnd_available and DND_FILES is not None:
@@ -1612,17 +1621,21 @@ def run_gui() -> int:
         return "" if raw == _files_ph["text"] else raw
 
     def _apply_files_value(new_val: str) -> None:
-        """Commit `new_val` to the files entry and make sure it's visible."""
+        """Commit `new_val` to the files entry and make sure it's visible.
+
+        Belt + suspenders: textvariable .set() should repaint the entry
+        but doesn't reliably on macOS Tk when the widget hasn't had focus
+        since the variable was attached. We additionally clear and
+        re-insert the value through the widget API, which always paints.
+        """
         _files_ph["active"] = False
         files_var.set(new_val)
-        # ttk.Entry occasionally doesn't repaint after a textvariable .set()
-        # when the widget hasn't had focus since the variable was attached
-        # (seen on macOS Tk 8.6). Force a redraw + scroll the view to the
-        # tail so long paths are actually visible in the box.
         with contextlib.suppress(Exception):
-            files_entry.update_idletasks()
+            files_entry.delete(0, "end")
+            files_entry.insert(0, new_val)
             files_entry.icursor("end")
             files_entry.xview_moveto(1.0)
+            files_entry.update_idletasks()
 
     def pick_files() -> None:
         paths = filedialog.askopenfilenames(title="Select files to search")
@@ -4532,8 +4545,14 @@ def run_gui() -> int:
             messagebox.showwarning("fuzzer", "Threshold must be 0-100.")
             return
 
-        _gui_state["last_files"] = files_var.get()
-        _gui_state["last_pattern"] = pat
+        # Don't poison gui_state with the placeholder text — on next launch
+        # that text would get loaded as the "saved" value, the ghost-text
+        # logic would think the entry already has real content, and the
+        # placeholder would never show. Save the real value (or empty).
+        _gui_state["last_files"] = (
+            "" if _files_ph["active"] else files_var.get())
+        _gui_state["last_pattern"] = (
+            "" if _pattern_ph["active"] else pat)
         # Prepend to history, deduplicate, cap at 30
         if pat in _search_history:
             _search_history.remove(pat)
