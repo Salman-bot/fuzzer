@@ -8,15 +8,27 @@ it or it's in Arabic — and it finds it inside your files. Works on
 
 Full step-by-step walkthrough is in
 **[docs/INSTALL.md](docs/INSTALL.md)** — written for someone who has
-never touched a terminal before. Quick version if you have Homebrew,
-git, and Python 3.14 already:
+never touched a terminal before.
+
+If you're on a brand-new Mac, run this first and wait for the popup
+to finish (5–10 min) before doing anything else:
 
 ```sh
-git clone https://github.com/Salman-bot/fuzzer.git ~/bin
+xcode-select --install
+```
+
+Then the quick install (works whether `~/bin` exists already or not):
+
+```sh
+rm -rf ~/bin && git clone https://github.com/Salman-bot/fuzzer.git ~/bin
 cd ~/bin && ./install.sh
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 fuzzer
 ```
+
+The `rm -rf ~/bin` is destructive but safe on a fresh Mac — `~/bin`
+is empty by default. If you've put your own scripts in `~/bin`, move
+them somewhere else first.
 
 ## What it does
 
