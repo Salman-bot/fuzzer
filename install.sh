@@ -230,6 +230,77 @@ else
     warn "    brew install --cask skim"
 fi
 
+# ── OCR support: tesseract + Arabic/English tessdata_best models ─────────────
+# fuzzer's "OCR" checkbox needs three things on disk:
+#   1. the tesseract binary           (brew install tesseract)
+#   2. the language packs             (brew install tesseract-lang)
+#   3. tessdata_best ara + eng models (~/.fuzzer/tessdata/)
+#
+# Why tessdata_best and not the brew-installed pack? The brew pack ships
+# tessdata_fast (speed-optimized LSTM); on bilingual Arabic/English docs the
+# fast model misreads Arabic-Indic digits ("٤,٨٢" → "£,A0"). The "best"
+# variant fixes that. ~27 MB one-time download.
+if command -v brew >/dev/null 2>&1; then
+    if ! command -v tesseract >/dev/null 2>&1; then
+        step "installing tesseract (OCR engine for image-only PDFs)…"
+        if brew install tesseract; then
+            ok "tesseract installed"
+        else
+            warn "tesseract install failed — fuzzer's OCR checkbox will be hidden."
+        fi
+    else
+        ok "tesseract already installed ($(tesseract --version 2>&1 | head -1))"
+    fi
+
+    if command -v tesseract >/dev/null 2>&1; then
+        if ! tesseract --list-langs 2>&1 | grep -q '^ara$'; then
+            step "installing tesseract-lang (adds Arabic + 100 other languages)…"
+            if brew install tesseract-lang; then
+                ok "tesseract-lang installed"
+            else
+                warn "tesseract-lang install failed — Arabic OCR won't work."
+                warn "  fix manually: brew install tesseract-lang"
+            fi
+        else
+            ok "tesseract-lang already installed (ara, eng, +others available)"
+        fi
+    fi
+else
+    warn "Homebrew not found — skipping tesseract install."
+    warn "  install Homebrew first, then re-run, or install manually:"
+    warn "    brew install tesseract tesseract-lang"
+fi
+
+# tessdata_best — fuzzer reads ~/.fuzzer/tessdata/ via TESSDATA_PREFIX. We
+# only fetch what fuzzer actually defaults to (ara + eng); other langs can
+# be added later by dropping <lang>.traineddata into that dir.
+TESSDATA_BEST_DIR="$HOME/.fuzzer/tessdata"
+TESSDATA_BEST_BASE="https://github.com/tesseract-ocr/tessdata_best/raw/main"
+if command -v tesseract >/dev/null 2>&1; then
+    mkdir -p "$TESSDATA_BEST_DIR"
+    for lang in ara eng; do
+        dest="$TESSDATA_BEST_DIR/$lang.traineddata"
+        if [[ -s "$dest" ]]; then
+            ok "tessdata_best/$lang already cached ($(du -h "$dest" | awk '{print $1}'))"
+            continue
+        fi
+        step "downloading tessdata_best/$lang.traineddata (one-time, ~10-15 MB)…"
+        # -fL: fail loudly on HTTP errors and follow redirects. --retry handles
+        # transient network blips without re-prompting the user.
+        if curl -fL --retry 3 --retry-delay 2 \
+                -o "$dest.partial" \
+                "$TESSDATA_BEST_BASE/$lang.traineddata"; then
+            mv "$dest.partial" "$dest"
+            ok "tessdata_best/$lang downloaded ($(du -h "$dest" | awk '{print $1}'))"
+        else
+            rm -f "$dest.partial"
+            warn "tessdata_best/$lang download failed — falling back to system tessdata."
+            warn "  re-run install.sh when you have network, or fetch manually:"
+            warn "    curl -fL -o $dest $TESSDATA_BEST_BASE/$lang.traineddata"
+        fi
+    done
+fi
+
 # ── Optional: test corpus ─────────────────────────────────────────────────────
 if [[ $WITH_CORPUS -eq 1 ]]; then
     step "fetching test corpus (~140 MB, network)…"

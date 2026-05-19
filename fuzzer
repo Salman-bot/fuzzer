@@ -63,6 +63,85 @@ def _blacklist_pdf_for_mupdf(fp: str) -> None:
 # them in bulk — log it once per session and let the user act on it.
 _pdfplumber_warned = [False]
 
+# ── OCR fallback for image-only PDFs ──────────────────────────────────────────
+# Scanned/photo PDFs return empty text from PyMuPDF. When OCR is on and
+# tesseract is on PATH, the worker rasterizes each empty page at 300 DPI and
+# runs `tesseract <png> stdout -l <lang>` to recover text. Slow (~2-5s/page)
+# so it's opt-in via the GUI toggle, not automatic.
+import shutil as _shutil_for_ocr
+_TESSERACT_PATH = _shutil_for_ocr.which("tesseract")
+
+
+def _detect_tesseract_langs() -> List[str]:
+    """Ask tesseract which trained-data files are installed. Returns the
+    list of language codes (e.g. ['ara', 'eng', 'osd']), empty on failure."""
+    if not _TESSERACT_PATH:
+        return []
+    import subprocess as _sp
+    try:
+        r = _sp.run([_TESSERACT_PATH, "--list-langs"],
+                    capture_output=True, text=True, timeout=5)
+    except (_sp.TimeoutExpired, OSError):
+        return []
+    if r.returncode != 0:
+        return []
+    # First line is a header ("List of available languages…"); rest are codes.
+    return [ln.strip() for ln in r.stdout.splitlines()[1:] if ln.strip()]
+
+
+_TESSERACT_LANGS = _detect_tesseract_langs()
+
+
+def _default_ocr_lang() -> str:
+    """Pick a smart OCR language string. Honours $FUZZER_OCR_LANG if set;
+    otherwise prefers 'ara+eng' when both packs are installed (mixed-script
+    Saudi/Arab documents are the common case here), and falls back to
+    whichever single pack is available."""
+    env = os.environ.get("FUZZER_OCR_LANG", "").strip()
+    if env:
+        return env
+    has_ara = "ara" in _TESSERACT_LANGS
+    has_eng = "eng" in _TESSERACT_LANGS
+    if has_ara and has_eng:
+        return "ara+eng"
+    if has_ara:
+        return "ara"
+    if has_eng:
+        return "eng"
+    # No usable lang found — tesseract would error, but return something
+    # so the worker doesn't crash on a None.
+    return _TESSERACT_LANGS[0] if _TESSERACT_LANGS else "eng"
+
+
+_OCR_LANG = _default_ocr_lang()
+# Per-search flag set by the GUI worker before reading files. Module-level
+# so read_lines / _extract_pdf can see it without threading a parameter.
+_ocr_enabled = [False]
+# Tracks which files got OCR'd this session (path → page count). Read by the
+# GUI to show "OCR'd N page(s) of foo.pdf" in the status log.
+_ocr_used_files: Dict[str, int] = {}
+
+# Page-segmentation mode passed to tesseract. PSM 6 = "assume a single uniform
+# block of text" — significantly better than the default PSM 3 ("auto, fully
+# automatic page segmentation, but no OSD") on documents with mixed
+# Arabic/English columns, because PSM 3 sometimes confuses RTL/LTR run
+# boundaries. Override with $FUZZER_OCR_PSM.
+_OCR_PSM = os.environ.get("FUZZER_OCR_PSM", "6")
+
+# tessdata_best vs tessdata_fast. The brew package installs tessdata_fast,
+# which is markedly worse at Arabic-Indic digits (٤,٨٢ comes out as £,A0
+# because the fast LSTM model is under-confident on Arabic numerals).
+# When ~/.fuzzer/tessdata/ exists, point tesseract at it via TESSDATA_PREFIX.
+# Falls back to system tessdata when the dir is empty / missing.
+_TESSDATA_BEST_DIR = Path.home() / ".fuzzer" / "tessdata"
+_TESSDATA_BEST_AVAILABLE = (
+    _TESSDATA_BEST_DIR.is_dir()
+    and any(_TESSDATA_BEST_DIR.glob("*.traineddata"))
+)
+# Populated by install.sh — see the OCR section there for the download URLs.
+# When this dir is missing the system tessdata is used (Arabic-Indic digits
+# may then misread on Arabic content; install.sh wires up the better models).
+
 # ── types ──────────────────────────────────────────────────────────────────────
 
 
@@ -87,14 +166,47 @@ def _extract_plain(fp: str) -> Optional[List[str]]:
 _pdf_page_map: Dict[str, List[int]] = {}  # fp → page_num per line (1-based)
 
 
-# Subprocess script: reads path from stdin, dumps {lines, page_nums} to stdout.
+# Subprocess script: reads JSON {path, ocr, lang, tesseract} from stdin,
+# dumps {lines, page_nums, ocr_pages} to stdout. When ocr=True and a page
+# has no text but does contain images, the page is rasterized at 300 DPI
+# and piped through tesseract; the recognized text replaces the empty
+# extract. ocr_pages reports how many pages went through OCR so callers
+# can surface that to the user.
 _PYMUPDF_WORKER = (
-    "import sys, json, fitz\n"
-    "fp = sys.stdin.read().strip()\n"
+    "import sys, json, os, subprocess, tempfile, fitz\n"
+    "cfg = json.loads(sys.stdin.read())\n"
+    "fp = cfg['path']\n"
+    "ocr = bool(cfg.get('ocr'))\n"
+    "lang = cfg.get('lang') or 'eng'\n"
+    "tess = cfg.get('tesseract') or 'tesseract'\n"
+    "psm = str(cfg.get('psm') or '6')\n"
+    "tdata = cfg.get('tessdata') or ''\n"
     "doc = fitz.open(fp)\n"
-    "out = {'lines': [], 'page_nums': []}\n"
+    "out = {'lines': [], 'page_nums': [], 'ocr_pages': 0}\n"
+    "def _ocr_page(page):\n"
+    "    pix = page.get_pixmap(dpi=300, alpha=False)\n"
+    "    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)\n"
+    "    tmp.close()\n"
+    "    env = dict(os.environ)\n"
+    "    if tdata:\n"
+    "        env['TESSDATA_PREFIX'] = tdata\n"
+    "    try:\n"
+    "        pix.save(tmp.name)\n"
+    "        r = subprocess.run([tess, tmp.name, 'stdout', '-l', lang,\n"
+    "                            '--psm', psm],\n"
+    "                           capture_output=True, text=True,\n"
+    "                           timeout=180, env=env)\n"
+    "        return r.stdout if r.returncode == 0 else ''\n"
+    "    finally:\n"
+    "        try: os.unlink(tmp.name)\n"
+    "        except OSError: pass\n"
     "for i in range(len(doc)):\n"
-    "    txt = doc[i].get_text('text', sort=True) or ''\n"
+    "    page = doc[i]\n"
+    "    txt = page.get_text('text', sort=True) or ''\n"
+    "    if ocr and not txt.strip() and page.get_images():\n"
+    "        txt = _ocr_page(page)\n"
+    "        if txt.strip():\n"
+    "            out['ocr_pages'] += 1\n"
     "    ls = txt.splitlines()\n"
     "    out['lines'].extend(ls)\n"
     "    out['page_nums'].extend([i + 1] * len(ls))\n"
@@ -110,10 +222,35 @@ def _extract_pdf_pymupdf(fp: str, lines: List[str], page_nums: List[int]) -> Lis
         raise ImportError(f"PyMuPDF blacklisted for {fp}")
     import subprocess as _sp
     import json as _json
+    _ocr = bool(_ocr_enabled[0] and _TESSERACT_PATH)
+    # OCR is per-page expensive (rasterize + tesseract). 180s is fine for
+    # text PDFs; bump the cap so a multi-page scan doesn't time out.
+    _timeout = 1800 if _ocr else 180
+    # Prefer tessdata_best (populated by install.sh into ~/.fuzzer/tessdata/)
+    # when every requested lang is present there. Falls back to system
+    # tessdata otherwise — tesseract would error if we pointed it at a dir
+    # missing any of the requested langs.
+    _tessdata_dir = ""
+    if _ocr and _TESSDATA_BEST_AVAILABLE:
+        _langs = [l for l in _OCR_LANG.split("+") if l]
+        _have_all = all(
+            (_TESSDATA_BEST_DIR / f"{l}.traineddata").exists()
+            for l in _langs
+        )
+        if _have_all:
+            _tessdata_dir = str(_TESSDATA_BEST_DIR)
+    _payload = _json.dumps({
+        "path": fp,
+        "ocr": _ocr,
+        "lang": _OCR_LANG,
+        "tesseract": _TESSERACT_PATH or "tesseract",
+        "psm": _OCR_PSM,
+        "tessdata": _tessdata_dir,
+    })
     try:
         proc = _sp.run(
             [sys.executable, "-c", _PYMUPDF_WORKER],
-            input=fp, capture_output=True, text=True, timeout=180,
+            input=_payload, capture_output=True, text=True, timeout=_timeout,
         )
     except _sp.TimeoutExpired:
         _err(f"{os.path.basename(fp)}: PyMuPDF timed out — blacklisting; falling back to pdfplumber")
@@ -132,6 +269,9 @@ def _extract_pdf_pymupdf(fp: str, lines: List[str], page_nums: List[int]) -> Lis
     lines.extend(data["lines"])
     page_nums.extend(data["page_nums"])
     _pdf_page_map[fp] = page_nums
+    _ocr_pages = int(data.get("ocr_pages", 0))
+    if _ocr_pages:
+        _ocr_used_files[fp] = _ocr_pages
     return lines
 
 
@@ -235,9 +375,15 @@ def _get_cache():
     return _cache_conn
 
 
+def _cache_real_path(key: str) -> str:
+    """Strip the cache-key namespace suffix (e.g. '\\0ocr') so we can stat the
+    actual file. The SQL row key stays as-is so OCR / non-OCR rows coexist."""
+    return key.split("\0", 1)[0]
+
+
 def _cache_get(fp: str):
     try:
-        mtime = os.path.getmtime(fp)
+        mtime = os.path.getmtime(_cache_real_path(fp))
     except OSError:
         return None
     conn = _get_cache()
@@ -254,7 +400,7 @@ def _cache_get(fp: str):
 
 def _cache_put(fp: str, lines: List[str], page_nums: List[int]) -> None:
     try:
-        mtime = os.path.getmtime(fp)
+        mtime = os.path.getmtime(_cache_real_path(fp))
     except OSError:
         return
     conn = _get_cache()
@@ -272,13 +418,26 @@ def _cache_put(fp: str, lines: List[str], page_nums: List[int]) -> None:
             )
 
 
+def _cache_key(fp: str) -> str:
+    """Namespace PDF cache rows by OCR mode + language + quality so:
+      • a PyMuPDF-only extraction doesn't shadow a later OCR run,
+      • a different OCR language doesn't serve the previous lang's text, and
+      • a switch from tessdata_fast → tessdata_best invalidates old rows
+        (the best model corrects Arabic-Indic digits that fast got wrong)."""
+    if _ocr_enabled[0] and Path(fp).suffix.lower() == ".pdf":
+        _quality = "best" if _TESSDATA_BEST_AVAILABLE else "fast"
+        return f"{fp}\0ocr={_OCR_LANG};psm={_OCR_PSM};q={_quality}"
+    return fp
+
+
 def read_lines(fp: str) -> Optional[List[str]]:
     # Try cache first. For PDFs we also require real page numbers — old cache
     # entries from before page-tracking landed have page_nums = [0, 0, ...],
     # which silently breaks "open at matched page" until the user clears the
     # cache. Treat such entries as a miss and re-extract.
     is_pdf = Path(fp).suffix.lower() == ".pdf"
-    _cached = _cache_get(fp)
+    key = _cache_key(fp)
+    _cached = _cache_get(key)
     if _cached is not None:
         _lines, _page_nums = _cached
         has_pages = bool(_page_nums) and any(p > 0 for p in _page_nums)
@@ -293,7 +452,7 @@ def read_lines(fp: str) -> Optional[List[str]]:
     lines = fn(fp)
     if lines is not None:
         page_nums = _pdf_page_map.get(fp, [0] * len(lines))
-        _cache_put(fp, lines, page_nums)
+        _cache_put(key, lines, page_nums)
     return lines
 
 # ── Arabic text normalization ──────────────────────────────────────────────────
@@ -341,6 +500,30 @@ except ImportError:
             s = _AR_DIACRITICS.sub("", s)
             return s.translate(_ALEF_VARIANTS).translate(_YEH_VARIANTS)
         _ENGINE_ARABIC = "regex fallback"
+
+
+# ── digit-script folding ──────────────────────────────────────────────────────
+# Maps Arabic-Indic (٠-٩, U+0660–U+0669) and Extended-Arabic-Indic
+# (۰-۹, U+06F0–U+06F9) digits to ASCII 0-9 so a search for "4.82" finds
+# "٤,٨٢" too. Applied at two seams:
+#   • Convert→txt — so the .txt is searchable in either script.
+#   • search_file's match path — so the OR-of-scripts works without forcing
+#     the user to type the original script.
+_DIGIT_FOLD_MAP = str.maketrans({
+    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+    # Arabic decimal separator (U+066B) → ASCII period for "٤٫٨٢" → "4.82"
+    "٫": ".",
+    # Arabic thousands separator (U+066C) → ASCII comma
+    "٬": ",",
+})
+
+
+def _fold_digits(s: str) -> str:
+    """Translate Arabic-Indic digits to ASCII so '٤,٨٢' matches '4,82'."""
+    return s.translate(_DIGIT_FOLD_MAP)
 
 # ── native-call instrumentation (toggleable at runtime via the GUI) ──────────
 # When debug mode is ON, every call to _normalize_arabic is recorded into
@@ -590,28 +773,33 @@ def search_file(
                 matches.append(Match(fp, i, line, 100, pg))
         return lines, matches
 
-    pat = pattern if case_sensitive else pattern.lower()
+    # Digit-fold pattern so '4.82' matches both '4.82' and '٤,٨٢' in lines.
+    # Each line gets folded too inside _is_hit / the fuzzy fallback. Cheap:
+    # one str.translate per line, on already-loaded text.
+    pattern_folded = _fold_digits(pattern)
+    pat = pattern_folded if case_sensitive else pattern_folded.lower()
 
     if whole_word:
         flags = 0 if case_sensitive else re.IGNORECASE
         try:
-            _ww_rx = re.compile(rf"\b{re.escape(pattern)}\b", flags)
+            _ww_rx = re.compile(rf"\b{re.escape(pattern_folded)}\b", flags)
         except re.error:
             _ww_rx = None
     else:
         _ww_rx = None
 
     def _is_hit(line: str) -> bool:
+        folded = _fold_digits(line)
         if _ww_rx is not None:
-            return bool(_ww_rx.search(line))
-        cmp = line if case_sensitive else line.lower()
+            return bool(_ww_rx.search(folded))
+        cmp = folded if case_sensitive else folded.lower()
         return pat in cmp
 
     # Token pre-filter: skip fuzzy on lines that share zero tokens with the
     # pattern. For long files this is a >10x win when the pattern is rare,
     # because rapidfuzz is the per-line hot path.
-    pat_tokens = _tokenize(pattern) if threshold > 0 else set()
-    pat_lower = pattern if case_sensitive else pattern.lower()
+    pat_tokens = _tokenize(pattern_folded) if threshold > 0 else set()
+    pat_lower = pattern_folded if case_sensitive else pattern_folded.lower()
 
     for i, line in enumerate(lines, start=1):
         pg = _pages[i - 1] if i - 1 < len(_pages) else 0
@@ -620,11 +808,12 @@ def search_file(
             continue
         if threshold <= 0:
             continue
+        line_folded = _fold_digits(line)
         # Pre-filter only when the pattern has tokens (≥2-char alnum runs).
         # Very short patterns skip the filter and fall through to fuzzy.
-        if pat_tokens and not (pat_tokens & _tokenize(line)):
+        if pat_tokens and not (pat_tokens & _tokenize(line_folded)):
             continue
-        cmp = line if case_sensitive else line.lower()
+        cmp = line_folded if case_sensitive else line_folded.lower()
         sc = fuzzy_score(pat_lower, cmp)
         if sc >= threshold:
             matches.append(Match(fp, i, line, sc, pg))
@@ -1733,6 +1922,10 @@ def run_gui() -> int:
     # isn't on PATH so the user sees the option exists but knows it needs install.
     rga_var = tk.BooleanVar(
         value=bool(_gui_state.get("rga_mode", False)) and bool(_RGA_PATH))
+    # OCR is gated on tesseract being installed (similar to rga). When ON,
+    # image-only PDFs are rasterized + recognized so scans/photos become searchable.
+    ocr_var = tk.BooleanVar(
+        value=bool(_gui_state.get("ocr_mode", False)) and bool(_TESSERACT_PATH))
     # When ON, the results pane shows one row per file (file + match count +
     # page range + best score + snippet) rather than one row per match. Saves
     # a lot of vertical scrolling on corpora with hundreds of hits per file.
@@ -1800,6 +1993,33 @@ def run_gui() -> int:
          "\n"
          + ("Detected at: " + _RGA_PATH if _RGA_PATH else
             "NOT INSTALLED — run `brew install ripgrep-all` to enable.")),
+        ("OCR", ocr_var,
+         "Recognize text in image-only PDFs (scans, photos) via Tesseract.\n"
+         "\n"
+         "Only kicks in when PyMuPDF finds no text on a page but the page\n"
+         "does contain images — normal text PDFs are unaffected.\n"
+         "\n"
+         "Cost: slow. Each scanned page is rasterized at 300 DPI and run\n"
+         "through tesseract (~2–5s/page). Results are cached, so a second\n"
+         "search of the same file is fast.\n"
+         "\n"
+         f"Languages: using '{_OCR_LANG}' "
+         + ("(auto-detected)" if not os.environ.get("FUZZER_OCR_LANG") else "(from $FUZZER_OCR_LANG)")
+         + f"  PSM: {_OCR_PSM}\n"
+         + ("Quality: tessdata_best (cached in ~/.fuzzer/tessdata/) — corrects\n"
+            "         Arabic-Indic digits that the fast model misreads.\n"
+            if _TESSDATA_BEST_AVAILABLE else
+            "Quality: tessdata_fast (system default) — Arabic digits may be\n"
+            "         misread. Best model auto-downloads on first OCR run.\n")
+         + (f"Installed packs: {', '.join(sorted(_TESSERACT_LANGS))}\n"
+            if _TESSERACT_LANGS else "")
+         + ("⚠ Arabic ('ara') NOT installed — Arabic glyphs will come out as\n"
+            "Latin gibberish. Install with: brew install tesseract-lang\n"
+            if _TESSERACT_PATH and "ara" not in _TESSERACT_LANGS else "")
+         + "Override with $FUZZER_OCR_LANG=<code+code>, $FUZZER_OCR_PSM=<n>.\n"
+         + "\n"
+         + ("Detected at: " + _TESSERACT_PATH if _TESSERACT_PATH else
+            "NOT INSTALLED — run `brew install tesseract` to enable.")),
         ("Group by file", group_by_file_var,
          "Collapse multiple matches in the same file into a single row.\n"
          "\n"
@@ -1815,11 +2035,20 @@ def run_gui() -> int:
     ]
     # Group the checkboxes by role so the strip reads as three clusters
     # rather than one wall: match-style ┊ scope ┊ backend ┊ threshold.
-    # rga engine is hidden entirely when ripgrep-all isn't installed -- a
-    # disabled checkbox just adds visual noise for users who'll never use it.
+    # rga / OCR are hidden when their binary isn't installed — a disabled
+    # checkbox just adds visual noise for users who'll never use it.
     if not _RGA_PATH:
         _opt_tooltips = [t for t in _opt_tooltips if t[0] != "rga engine"]
-    _OPT_AFTER_GROUP = {"Smart search": True, "Recursive": True, "rga engine": True}
+    if not _TESSERACT_PATH:
+        _opt_tooltips = [t for t in _opt_tooltips if t[0] != "OCR"]
+    # Separator falls after the last backend-cluster item that's actually
+    # present — keeps the "match | scope | backend | rest" grouping intact
+    # even when rga or OCR is hidden.
+    _OPT_AFTER_GROUP = {"Smart search": True, "Recursive": True}
+    for _backend in ("OCR", "rga engine"):
+        if any(t[0] == _backend for t in _opt_tooltips):
+            _OPT_AFTER_GROUP[_backend] = True
+            break
     # Keep refs to the checkbutton widgets so the mutual-exclusion handlers
     # below can toggle their `disabled` state.
     _cb_widgets: Dict[str, ttk.Checkbutton] = {}
@@ -1941,6 +2170,7 @@ def run_gui() -> int:
         f"  Arabic:  {_ENGINE_ARABIC}\n"
         f"  PDF:     {_pdf_engine}\n"
         f"  rga:     {'available — ' + _RGA_PATH if _RGA_PATH else 'not installed'}\n"
+        f"  OCR:     {'tesseract — ' + _TESSERACT_PATH + ' (lang=' + _OCR_LANG + ', psm=' + _OCR_PSM + ', quality=' + ('best' if _TESSDATA_BEST_AVAILABLE else 'fast') + ')' if _TESSERACT_PATH else 'not installed'}\n"
         f"\nFuzzy is the per-line hot path. The token pre-filter skips\n"
         f"rapidfuzz on lines that share zero ≥2-char tokens with the\n"
         f"pattern, which is where most of the speed comes from in big PDFs."
@@ -2183,6 +2413,11 @@ def run_gui() -> int:
     else:
         _sb_pdf = "—"
     _sb_rga = "available" if _RGA_PATH else "—"
+    _sb_ocr = (
+        f"tesseract ({_OCR_LANG}, "
+        f"{'best' if _TESSDATA_BEST_AVAILABLE else 'fast'})"
+        if _TESSERACT_PATH else "—"
+    )
 
     # Two-line status bar anchored to the bottom edge.
     _statusbar_outer = tk.Frame(root, bg=_T["CHAT_BORDER"])
@@ -2419,7 +2654,7 @@ def run_gui() -> int:
     _statusbar_row2.pack(fill="x")
     _sb_engines_text = (
         f"  fuzzy: {_sb_fuzzy}   arabic: {_sb_arabic}   "
-        f"pdf: {_sb_pdf}   rga: {_sb_rga}"
+        f"pdf: {_sb_pdf}   rga: {_sb_rga}   ocr: {_sb_ocr}"
     )
     _sb_engines_lbl = tk.Label(
         _statusbar_row2, text=_sb_engines_text, anchor="w",
@@ -4763,10 +4998,15 @@ def run_gui() -> int:
         _gui_state["recursive"] = recursive_var.get()
         _gui_state["threshold"] = threshold_var.get()
         _gui_state["rga_mode"] = rga_var.get()
+        _gui_state["ocr_mode"] = ocr_var.get()
         _gui_state["whole_word"] = whole_word_var.get()
         _gui_state["smart_mode"] = smart_var.get()
         _gui_state["group_by_file"] = group_by_file_var.get()
         _save_state(_gui_state)
+        # Flip the OCR flag *before* the worker starts reading files. The
+        # subprocess worker inspects this to decide whether to run tesseract.
+        _ocr_enabled[0] = bool(ocr_var.get()) and bool(_TESSERACT_PATH)
+        _ocr_used_files.clear()
         state["searching"] = True
         state["cancel_search"] = False
         state["results"] = {}
@@ -4795,6 +5035,7 @@ def run_gui() -> int:
                  f"thr={threshold_var.get()} "
                  f"recursive={'on' if recursive_var.get() else 'off'} "
                  f"rga={'on' if rga_var.get() else 'off'} "
+                 f"ocr={'on' if _ocr_enabled[0] else 'off'} "
                  f"ww={'on' if whole_word_var.get() else 'off'} "
                  f"smart={'on' if smart_var.get() else 'off'}")
         _log_activity(f"Search '{pat}' — {len(paths)} path(s)  [{_opts}]")
@@ -5231,7 +5472,12 @@ def run_gui() -> int:
                             _refresh_status()
                             _log_activity(
                                 f"Done — {_n} match(es) in {len(results)} file(s)")
-                    else:
+                    if _ocr_used_files:
+                        _ocr_total = sum(_ocr_used_files.values())
+                        _log_activity(
+                            f"OCR — recognized text on {_ocr_total} page(s) "
+                            f"across {len(_ocr_used_files)} file(s)")
+                    if not results:
                         status_var.set(
                             "Stopped — no results yet" if was_cancelled
                             else "No matches found.")
@@ -5324,6 +5570,9 @@ def run_gui() -> int:
                         text = _araby.normalize_hamza(text, method="tasheel")
                     # Yeh fold isn't in pyarabic; do it explicitly.
                     text = text.replace("ى", "ي").replace("ئ", "ي")
+                # Fold Arabic-Indic digits to ASCII so '٤,٨٢' → '4,82' and
+                # both representations become searchable from one query.
+                text = _fold_digits(text)
                 # Whitespace cleanup: collapse runs of spaces/tabs, dedupe
                 # blank-line runs of 3+ to 2.
                 text = _ws_re.sub(" ", text)
@@ -5334,7 +5583,8 @@ def run_gui() -> int:
                     f"# Source: {fp}\n"
                     f"# Matches: {len(matches)}\n"
                     f"# Normalized: NFKC + pyarabic "
-                    f"(tashkeel/tatweel/hamza/yeh)\n"
+                    f"(tashkeel/tatweel/hamza/yeh) + digit-fold "
+                    f"(٠-٩ → 0-9)\n"
                     f"# Generated: {Path(__file__).name}\n"
                     f"\n")
                 out_path.write_text(header + text, encoding="utf-8")
@@ -6148,6 +6398,7 @@ def run_gui() -> int:
         case_var.set(False)
         recursive_var.set(False)
         rga_var.set(False)
+        ocr_var.set(False)
         threshold_var.set(80)
         debug_mode_var.set(False)
         _toggle_debug_mode()
