@@ -1,4 +1,4 @@
-#!/opt/homebrew/opt/python@3.14/bin/python3.14
+#!/Users/salman/.fuzzer/venv/bin/python
 """fuzzer — search file contents for words/phrases.
 
 GUI app; run `fuzzer` with no arguments to launch it.
@@ -1741,6 +1741,12 @@ def run_gui() -> int:
 
         widget.bind("<FocusIn>", on_focus_in, add="+")
         widget.bind("<FocusOut>", on_focus_out, add="+")
+        # Belt-and-braces: on some ttk.Combobox builds <FocusIn> doesn't fire
+        # when the user clicks into the inner entry, so the placeholder never
+        # hides and the user's keystrokes get appended to the ghost text. Also
+        # hide on the first keypress and the first click on the widget.
+        widget.bind("<KeyPress>", lambda _e: hide(), add="+")
+        widget.bind("<Button-1>", lambda _e: hide(), add="+")
         var.trace_add("write", on_var_change)
         show()  # initial
         return state
@@ -4956,11 +4962,21 @@ def run_gui() -> int:
                     "Cancelling previous search to start a new one...")
                 stop_btn.config(state="disabled")
                 return
-        # Skip the ghost-text placeholders when reading: an active placeholder
-        # means "the box is logically empty," even if the StringVar holds the
-        # hint text. Treat both as empty and prompt the user.
-        pat_raw = "" if _pattern_ph["active"] else pattern_var.get()
-        files_raw = "" if _files_ph["active"] else files_var.get()
+        # Skip ghost-text placeholders. We check two signals because either can
+        # desync on weird Tk versions: (a) the `active` flag, set when show()
+        # injected the placeholder text, and (b) literal text equality with the
+        # placeholder string. The flag occasionally lies when focus_in/out events
+        # don't fire on some ttk.Combobox builds — a user types a real query but
+        # the flag stays True, and Search wrongly reports "empty pattern." The
+        # text-equality fallback catches that case.
+        def _read_entry(var_val: str, ph_state: dict, ph_text: str) -> str:
+            if ph_state["active"]:
+                return ""
+            if var_val.strip() == ph_text.strip():
+                return ""
+            return var_val
+        pat_raw = _read_entry(pattern_var.get(), _pattern_ph, _PATTERN_PH_TEXT)
+        files_raw = _read_entry(files_var.get(), _files_ph, _FILES_PH_TEXT)
         pat = pat_raw.strip()
         if not pat:
             messagebox.showwarning("fuzzer", "Enter a search pattern.")
