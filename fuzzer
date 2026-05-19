@@ -112,14 +112,8 @@ _PYMUPDF_WORKER = (
 
 
 def _extract_pdf_pymupdf(fp: str, lines: List[str], page_nums: List[int]) -> List[str]:
-    # MuPDF segfaults on certain malformed PDFs (NULL deref deep in
-    # fz_fill_text) — a C-level crash that no Python try/except can catch.
-    # To keep the GUI alive we run extraction in a short-lived subprocess;
-    # on non-zero exit we raise ImportError so _extract_pdf falls through
-    # to pdfplumber. ~50–100 ms startup cost per PDF, paid once because
-    # results are cached in SQLite.
-    # Files known to have crashed MuPDF before are skipped without even
-    # launching the subprocess — saves the cost + the warning spam.
+    # Run MuPDF in a subprocess: it segfaults on some PDFs (C crash,
+    # not catchable). Previously-crashed files skip straight to pdfplumber.
     if fp in _mupdf_blacklist:
         raise ImportError(f"PyMuPDF blacklisted for {fp}")
     import subprocess as _sp
@@ -486,17 +480,7 @@ def fuzzy_score(pattern: str, line: str) -> int:
     return best
 
 # ── Smart search (Google-Scholar-style query language) ────────────────────────
-# Parses a query into AND / OR / NOT structure:
-#   "exact phrase"   → exact substring (quotes group multi-word phrases)
-#   word1 word2      → AND  (both must appear on the same line, any order)
-#   word1 OR word2   → OR   (capital OR; only one needs to match)
-#   -word            → NOT  (line must NOT contain it)
-#
-# Grammar precedence:  -word  >  OR  >  AND
-#   `a b OR c d` parses as  a AND (b OR c) AND d
-#
-# At least one positive term is required (pure negation would otherwise
-# match every line in every file — match Google Scholar's behavior).
+# Operators: "phrase" AND (space) OR (caps) -NOT. Precedence: NOT > OR > AND.
 
 
 def _parse_smart_query(query: str) -> Dict[str, List[object]]:
@@ -894,14 +878,7 @@ def collect_files(paths: List[str], recursive: bool) -> List[str]:
                     for f in sorted(path.rglob("*"))
                     if f.is_file()
                     and f.suffix.lower() in _EXT_MAP
-                    # Skip junk files that show up by extension but are never
-                    # what the user means to search:
-                    #   ~$foo.docx   Microsoft Office owner lock files
-                    #   .DS_Store    macOS Finder metadata
-                    #   ._foo.pdf    macOS resource forks on non-HFS volumes
-                    #   *.swp/*.swo  vim swap files
-                    #   *~           emacs/vim backup
-                    #   *.bak        generic backup
+                    # Skip OS/editor junk: Office locks, .DS_Store, ._*, vim swap, *~, *.bak.
                     and not f.name.startswith("~$")
                     and not f.name.startswith("._")
                     and f.name != ".DS_Store"
@@ -1236,14 +1213,7 @@ def run_gui() -> int:
         _dnd_available = False
     root.title("fuzzer")
 
-    # Glossy-over-wallpaper feel. macOS Tk supports -alpha for whole-window
-    # translucency (true vibrancy/blur needs PyObjC + NSVisualEffectView —
-    # tracked as a future spike). Persisted per user preference; 1.0 disables.
-    # Default alpha 0.88 -- pushes the window further toward "glass" while
-    # keeping text readable. Real macOS vibrancy (NSVisualEffectView with
-    # blur-behind) needs PyObjC and isn't reachable from Tk; this is the
-    # closest approximation we can do natively. Users can drag the alpha
-    # slider in the status row to taste; their choice is persisted.
+    # Default alpha 0.88 = glass feel. Real vibrancy needs PyObjC + NSVisualEffectView.
     _saved_alpha = float(_gui_state.get("window_alpha", 0.88))
     if not 0.5 <= _saved_alpha <= 1.0:
         _saved_alpha = 0.88
@@ -1475,13 +1445,8 @@ def run_gui() -> int:
                        arrowcolor=[("disabled", t["MUTED"])])
             _style.configure("TSeparator", background=t["BORDER"])
             _style.configure("TPanedwindow", background=t["BG"])
-            # Notebook (tab strip) — midnight-purple chrome. Inactive tabs
-            # sit on the card colour; the active tab uses the violet accent.
-            # Wrapped in suppress() because Tk 8.6.x from the Apple Xcode CLT
-            # Python rejects some of these options ("expected screen distance"
-            # TclError) — losing the styling is OK; losing the whole window
-            # because one style call blew up is not. Defensive against any
-            # stock-Tk install where ttk Notebook options vary.
+            # Notebook tab strip styling. Each call suppress'd so old Tk
+            # rejecting an option degrades to default chrome, not a crash.
             with contextlib.suppress(Exception):
                 _style.configure("TNotebook", background=t["BG"],
                                  borderwidth=0, tabmargins=(8, 6, 8, 0))
@@ -1947,16 +1912,7 @@ def run_gui() -> int:
         messagebox.showinfo("Threshold — what does it do?", _THRESHOLD_TIP)
     _thr_info.bind("<Button-1>", _show_threshold_help)
 
-    # ── Mutual exclusion between options that don't compose ────────────────
-    # Some checkbox/threshold combinations are silently ignored by the
-    # search backend. Rather than let the user toggle them and wonder why
-    # nothing changed, we gray out the incompatible options and uncheck
-    # them when their conflict is enabled.
-    #
-    # Pairs we enforce:
-    #   Smart search   ⊥  Whole word   (Smart has its own phrase syntax)
-    #   rga engine     ⊥  Threshold    (rga doesn't do fuzzy at all)
-    #   rga engine     ⊥  Smart search (rga uses literal/regex, not Smart parsing)
+    # ── Mutual exclusion: Smart⊥Whole word, rga⊥{Smart,Threshold}. ─────────
 
     def _set_widget_enabled(w, enabled: bool) -> None:
         with contextlib.suppress(Exception):
@@ -2110,18 +2066,8 @@ def run_gui() -> int:
     form.columnconfigure(1, weight=1)
     form.columnconfigure(2, weight=1)
 
-    # ── main split: results table (top pane) and chat (bottom pane) ──────────
-    # A vertical PanedWindow lets the user drag the sash to give more vertical
-    # room to whichever pane they care about. Critically, when the window is
-    # resized small the chat panel can never be clipped off — it just gets
-    # smaller, and the user can drag the sash to grow it back.
     # ── tabbed workspace ────────────────────────────────────────────────────
-    # Each task gets its own focused canvas instead of fighting for stacked
-    # vertical space. Tabs:
-    #   🔍  Search & Results  —  results tree (the form above feeds it)
-    #   💬  Chat              —  full-canvas Claude chat
-    #   🎙  Transcribe        —  YouTube/audio → PDF workflow
-    #   ⚙   Settings          —  API key, theme, alpha
+    # One canvas per task: 🔍 Search, 💬 Chat, 🎙 Transcribe, ⚙ Settings.
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
 
@@ -2273,13 +2219,7 @@ def run_gui() -> int:
 
     status_var.trace_add("write", _on_status_change)
 
-    # ── bottom status bar (VS Code-style) ───────────────────────────────────
-    # Two-row strip pinned to the bottom of the root window:
-    #   row 1: live status text (left) + selected-row preview (right)
-    #   row 2: engine indicators (left) + theme + window alpha (right)
-    # Packed with side="bottom" + before=main_paned so it claims its strip
-    # of the cavity first; main_paned then expands into the remainder. This
-    # keeps the bar visible regardless of the chat pane's collapse state.
+    # ── bottom status bar (VS Code-style, always pinned) ─────────────────
     import importlib.util as _iu_sb
 
     def _strip_paren(s: str) -> str:
@@ -2294,17 +2234,13 @@ def run_gui() -> int:
         _sb_pdf = "—"
     _sb_rga = "available" if _RGA_PATH else "—"
 
-    # Two-line status bar with clear vertical separation between roles.
-    # Outer frame's CHAT_BORDER bg + 2px padding becomes a thin top border
-    # that visually anchors the strip below the panes above it.
+    # Two-line status bar anchored to the bottom edge.
     _statusbar_outer = tk.Frame(root, bg=_T["CHAT_BORDER"])
     _statusbar_outer.pack(side="bottom", fill="x", before=notebook)
     _statusbar_inner = tk.Frame(_statusbar_outer, bg=_T["CHAT_ENTRY_BG"])
     _statusbar_inner.pack(fill="x", padx=0, pady=(2, 0))
 
-    # Row 1 — live status (left, icon ⚡) │ selected-row preview (right, icon 📄).
-    # Two cells with a literal vertical separator between them so the eye
-    # has no doubt which text belongs to which role. VS-Code-style.
+    # Row 1: ⚡ live status (left) │ 📄 selected-row preview (right).
     _statusbar_row1 = tk.Frame(_statusbar_inner, bg=_T["CHAT_ENTRY_BG"])
     _statusbar_row1.pack(fill="x")
 
@@ -2720,14 +2656,7 @@ def run_gui() -> int:
         unpin_btn.pack(side="right", padx=(4, 0))
         unpin_btn.state(["disabled"])
 
-        # Live hex memory view — shows the actual bytes py_normalize reads
-        # on the latest call, with highlighting:
-        #   red    = byte will be DROPPED (diacritic / tatweel / superscript-alef)
-        #   yellow = byte will be SUBSTITUTED (alef-variant → ا, yeh-variant → ي)
-        #   plain  = passes through unchanged
-        #
-        # The C function classifies by 2-byte UTF-8 codepoint. We mirror its
-        # rules below to colorize the input hex dump.
+        # Live hex view of py_normalize input: red = drop, yellow = substitute.
         def _classify(raw: bytes) -> List[str]:
             """Return per-byte tag: 'drop' / 'sub' / '' (one entry per byte)."""
             tags = [""] * len(raw)
@@ -3092,20 +3021,10 @@ def run_gui() -> int:
                 files_entry.delete(0, "end")
     root.bind_all("<Escape>", _esc_clear)
 
-    # Always mount the chat body on launch (we force _chat_collapsed=False above).
-    # fill="both", expand=True so dragging the PanedWindow sash actually grows
-    # the chat log instead of leaving blank space at the bottom of the pane.
     chat_frame.pack(fill="both", expand=True)
 
-    # Grid layout (not pack) for the top/flex/bottom pattern:
-    #   col 0: history sidebar  — fixed width, scrollable list of past turns
-    #   col 1: main chat column
-    #     row 0: context label  — fixed
-    #     row 1: chat log       — flex (only row with weight=1)
-    #     row 2: input panel    — fixed (spans both columns)
-    # Pack-with-expand=True is greedy and starves bottom side="bottom" widgets
-    # when the pane is short; grid gives the input panel its natural height
-    # and lets the log absorb whatever is left.
+    # 2-column grid: sidebar | (context / log / input). Log row is the only
+    # flex row, so the input panel keeps its natural height when the pane shrinks.
     chat_frame.columnconfigure(0, weight=0, minsize=150)
     chat_frame.columnconfigure(1, weight=1)
     chat_frame.rowconfigure(0, weight=0)
@@ -3421,14 +3340,7 @@ def run_gui() -> int:
             chat_log.config(state="disabled")
 
     # ── unified input panel ─────────────────────────────────────────────────
-    # Bordered prompt box — just the input row now. Status + selected moved
-    # to the bottom status bar (a permanent root-level strip), freeing the
-    # chat panel to look more like a focused REPL prompt:
-    #   ┌──────────────────────────────────────────────────────────────────┐
-    #   │ ~/bin ❯ [input area ......................]  [Send] [Reset]    │
-    #   └──────────────────────────────────────────────────────────────────┘
-    # Bottom row of chat_frame's grid — guaranteed natural height even when
-    # the pane is short (the log shrinks instead of the input being clipped).
+    # REPL-style prompt row at the bottom of chat_frame; log shrinks first.
     chat_input_panel = tk.Frame(
         chat_frame, bg=_T["CHAT_BORDER"], padx=2, pady=2)
     chat_input_panel.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
@@ -5708,19 +5620,13 @@ def run_gui() -> int:
                     + (" (highlighted)" if _tmp_path != filepath else " (no highlight)"))
 
             elif ext in (".docx", ".doc"):
-                # DOCX has no real page concept in the file (Word computes pages
-                # at render time from paper size + fonts + margins), so we
-                # navigate by *text* instead: open in Word and run Find on the
-                # matched paragraph text. The pre-built highlighted copy (from
-                # _append_file_results) is preferred; falls back to the
-                # original if highlighting failed or python-docx isn't there.
+                # DOCX has no page concept; navigate by text via Word's Find.
+                # Open the pre-highlighted copy when available.
                 _word_app = "/Applications/Microsoft Word.app"
                 _raw_line = _row_lines_raw.get(iid, "").strip()
                 _open_path = _highlighted_docx.get(filepath, filepath)
                 _hl_note = "" if _open_path == filepath else " (highlighted)"
-                # Word's Find handles long strings but truncate to keep the
-                # AppleScript event reasonably sized and dodge edge cases with
-                # paragraph breaks inside very long paragraphs.
+                # Cap at 180 chars to keep AppleScript event small.
                 _needle = _raw_line[:180]
                 _esc = _open_path.replace("\\", "\\\\").replace('"', '\\"')
                 _needle_esc = _needle.replace("\\", "\\\\").replace('"', '\\"')
@@ -5853,12 +5759,7 @@ def run_gui() -> int:
     convert_btn.config(command=convert_to_txt)
     apikey_btn.config(command=set_api_key)
 
-    # ── Transcribe: docx-of-links → batch of PDFs via sibling `transcribe` ──
-    # Matches the CLI invocation the user runs by hand:
-    #   transcribe path/to/links.docx -o output_dir/ --model large \
-    #              --cookies chrome --also txt
-    # Spawned in a background thread so the GUI stays responsive; stdout
-    # lines stream into the activity log.
+    # ── Transcribe: docx-of-YouTube-links → batch PDFs via sibling `transcribe` CLI. ──
     _transcribe_state = {"running": False}
 
     def _run_transcribe() -> None:
