@@ -1747,6 +1747,20 @@ def run_gui() -> int:
         # hide on the first keypress and the first click on the widget.
         widget.bind("<KeyPress>", lambda _e: hide(), add="+")
         widget.bind("<Button-1>", lambda _e: hide(), add="+")
+        # ttk.Combobox can desync: the user types real text into the widget but
+        # the StringVar still holds the placeholder (textvariable updates lag
+        # behind direct widget edits on Aqua). After each keystroke, force the
+        # var to match what's actually displayed and drop the active flag.
+        def _sync_var(_e=None):
+            try:
+                w = widget.get()
+            except Exception:
+                return
+            if w != text and state["active"]:
+                state["active"] = False
+            if w != var.get():
+                var.set(w)
+        widget.bind("<KeyRelease>", _sync_var, add="+")
         var.trace_add("write", on_var_change)
         show()  # initial
         return state
@@ -1929,12 +1943,12 @@ def run_gui() -> int:
     # OCR is gated on tesseract being installed (similar to rga). When ON,
     # image-only PDFs are rasterized + recognized so scans/photos become searchable.
     ocr_var = tk.BooleanVar(
-        value=bool(_gui_state.get("ocr_mode", False)) and bool(_TESSERACT_PATH))
+        value=bool(_gui_state.get("ocr_mode", True)) and bool(_TESSERACT_PATH))
     # When ON, the results pane shows one row per file (file + match count +
     # page range + best score + snippet) rather than one row per match. Saves
     # a lot of vertical scrolling on corpora with hundreds of hits per file.
     group_by_file_var = tk.BooleanVar(
-        value=bool(_gui_state.get("group_by_file", False)))
+        value=bool(_gui_state.get("group_by_file", True)))
 
     _opt_tooltips = [
         ("Case-sensitive", case_var,
@@ -4969,14 +4983,46 @@ def run_gui() -> int:
         # don't fire on some ttk.Combobox builds — a user types a real query but
         # the flag stays True, and Search wrongly reports "empty pattern." The
         # text-equality fallback catches that case.
-        def _read_entry(var_val: str, ph_state: dict, ph_text: str) -> str:
-            if ph_state["active"]:
-                return ""
-            if var_val.strip() == ph_text.strip():
-                return ""
-            return var_val
-        pat_raw = _read_entry(pattern_var.get(), _pattern_ph, _PATTERN_PH_TEXT)
-        files_raw = _read_entry(files_var.get(), _files_ph, _FILES_PH_TEXT)
+        def _read_entry(widget, var, ph_state: dict, ph_text: str) -> str:
+            # Pull from BOTH widget.get() and the StringVar — on some Tk builds
+            # the two can momentarily disagree (the widget shows the typed text
+            # while the var still holds the placeholder, or vice versa). Pick
+            # whichever holds a real (non-placeholder, non-empty) value.
+            try:
+                w_val = widget.get()
+            except Exception:
+                w_val = ""
+            v_val = var.get()
+            ph = ph_text.strip()
+            def _real(s: str) -> str:
+                if not s:
+                    return ""
+                return "" if s.strip() == ph else s
+            r_w, r_v = _real(w_val), _real(v_val)
+            if r_w:
+                return r_w
+            if r_v:
+                return r_v
+            return ""
+        pat_raw = _read_entry(pattern_entry, pattern_var,
+                              _pattern_ph, _PATTERN_PH_TEXT)
+        files_raw = _read_entry(files_entry, files_var,
+                                _files_ph, _FILES_PH_TEXT)
+        _dbg_line = (
+            f"start_search: pat={pat_raw!r} files={files_raw!r} "
+            f"pat_ph_active={_pattern_ph['active']} "
+            f"files_ph_active={_files_ph['active']} "
+            f"pat_widget={pattern_entry.get()!r} "
+            f"pat_var={pattern_var.get()!r}"
+        )
+        try:
+            print(f"[fuzzer] {_dbg_line}", flush=True)
+        except Exception:
+            pass
+        try:
+            status_var.set(_dbg_line)
+        except Exception:
+            pass
         pat = pat_raw.strip()
         if not pat:
             messagebox.showwarning("fuzzer", "Enter a search pattern.")
