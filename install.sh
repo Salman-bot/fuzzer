@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # install.sh — set up the fuzzer environment on a fresh Mac.
 #
-# Installs Python dependencies, builds the _ar_norm C extension, and
-# verifies the toolchain. Designed to be safe to re-run.
+# Pins Homebrew python@3.14 + an isolated venv at ~/.fuzzer/venv so every
+# machine runs the same Python/Tcl-Tk/ABI as the dev box. Mixed minor versions
+# cause subtle Tk-binding bugs (Search button silently no-ops, etc.).
 #
 # Usage:
-#   ./install.sh                 # core deps + native build
+#   ./install.sh                 # pin python@3.14, build venv, install deps
 #   ./install.sh --with-corpus   # also fetch ~50 test PDFs (≈140 MB)
-#   ./install.sh --user          # pip install --user (useful when system Python is PEP 668-locked)
 #   ./install.sh --help          # show this help
 
 set -euo pipefail
@@ -16,12 +16,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 WITH_CORPUS=0
-PIP_USER=0
 
 for arg in "$@"; do
     case "$arg" in
         --with-corpus) WITH_CORPUS=1 ;;
-        --user)        PIP_USER=1 ;;
         -h|--help)
             sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -52,74 +50,64 @@ fi
 ok "platform: macOS"
 
 # ── toolchain checks ──────────────────────────────────────────────────────────
-# Prefer Brew Python: Apple's CLT Python is too old and ships no headers.
-# Probe @X/bin/python3 too -- the /opt/homebrew/bin symlink may be missing.
-find_brew_python() {
-    local p
-    for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-        [[ -x "$p" ]] && { echo "$p"; return 0; }
-    done
-    # Sort numerically descending on the python@X suffix so 3.14 wins over 3.13.
-    while IFS= read -r p; do
-        [[ -x "$p" ]] && { echo "$p"; return 0; }
-    done < <(find /opt/homebrew/opt /usr/local/opt -maxdepth 3 \
-                  -name python3 -path '*python@*/bin/python3' 2>/dev/null \
-             | sort -t@ -k2 -V -r)
-    return 1
-}
+# Hard-pin to Homebrew python@3.14 inside an isolated venv. Why:
+#   - The shipped _ar_norm C extension is built cpython-314; other minors won't load it.
+#   - Tcl/Tk versions differ across Brew Python minors and produce subtle Tk
+#     widget-binding bugs (the canonical symptom: clicking Search silently does
+#     nothing because the tk.Label <Button-1> binding never fires).
+#   - A venv keeps deps out of the user's other Python tooling and sidesteps
+#     PEP 668 EXTERNALLY-MANAGED entirely.
 
-PYTHON="$(find_brew_python || true)"
+if ! command -v brew >/dev/null 2>&1; then
+    fail "Homebrew is required. Install it first:
+  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"
+then re-run ./install.sh"
+fi
+ok "homebrew: $(command -v brew)"
 
-# If no Brew Python and Homebrew itself is available, install python@3.14
-# rather than falling back to Apple's CLT Python (which would break the GUI
-# and the native build).
-if [[ -z "$PYTHON" ]] && command -v brew >/dev/null 2>&1; then
-    step "no Brew Python found — installing python@3.14 via Homebrew…"
-    if brew install python@3.14; then
-        ok "python@3.14 installed"
-        PYTHON="$(find_brew_python || true)"
-    else
-        warn "brew install python@3.14 failed — falling back to system Python."
+if ! brew list --formula python@3.14 >/dev/null 2>&1; then
+    step "installing python@3.14 (pinned for reproducibility)…"
+    brew install python@3.14 || fail "brew install python@3.14 failed"
+fi
+
+if ! brew list --formula python-tk@3.14 >/dev/null 2>&1; then
+    step "installing python-tk@3.14 (Brew Python ships without _tkinter)…"
+    brew install python-tk@3.14 || fail "brew install python-tk@3.14 failed"
+fi
+
+BREW_PY_PREFIX="$(brew --prefix python@3.14)"
+SYSTEM_PYTHON="$BREW_PY_PREFIX/bin/python3.14"
+[[ -x "$SYSTEM_PYTHON" ]] || fail "python@3.14 installed but $SYSTEM_PYTHON missing — try: brew reinstall python@3.14"
+
+if ! "$SYSTEM_PYTHON" -c 'import tkinter' 2>/dev/null; then
+    fail "tkinter not importable from $SYSTEM_PYTHON — try: brew reinstall python-tk@3.14"
+fi
+ok "system python: $SYSTEM_PYTHON"
+
+# ── venv ──────────────────────────────────────────────────────────────────────
+# Recreate the venv if its interpreter ever drifts away from the pinned brew
+# python (e.g. user upgraded python@3.14 and the symlinked base_executable now
+# points to a path that no longer exists).
+VENV_DIR="$HOME/.fuzzer/venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+NEED_VENV=1
+if [[ -x "$VENV_PYTHON" ]]; then
+    CURRENT_BASE="$("$VENV_PYTHON" -c 'import sys; print(sys.base_executable)' 2>/dev/null || true)"
+    if [[ -n "$CURRENT_BASE" && ( "$CURRENT_BASE" == "$SYSTEM_PYTHON" || "$CURRENT_BASE" -ef "$SYSTEM_PYTHON" ) ]]; then
+        NEED_VENV=0
     fi
 fi
 
-# Last resort: whatever's on PATH (usually Apple's CLT Python).
-[[ -z "$PYTHON" ]] && PYTHON="$(command -v python3 || command -v python || true)"
-if [[ -z "$PYTHON" ]]; then
-    fail "python3 not found and Brew install didn't work. Install manually:
-  brew install python@3.14
-  or download from https://www.python.org/downloads/"
+if [[ $NEED_VENV -eq 1 ]]; then
+    step "creating venv at $VENV_DIR (pinned to $SYSTEM_PYTHON)…"
+    rm -rf "$VENV_DIR"
+    mkdir -p "$(dirname "$VENV_DIR")"
+    "$SYSTEM_PYTHON" -m venv "$VENV_DIR" || fail "venv creation failed"
 fi
+
+PYTHON="$VENV_PYTHON"
 PYVER="$("$PYTHON" -c 'import sys; print("%d.%d"%sys.version_info[:2])')"
-
-# Brew Python 3.13+ ships without _tkinter; auto-install python-tk@$PYVER.
-if ! "$PYTHON" -c 'import tkinter' 2>/dev/null; then
-    if command -v brew >/dev/null 2>&1 && [[ "$PYTHON" == /opt/homebrew/* || "$PYTHON" == /usr/local/* ]]; then
-        step "Brew Python missing Tk bindings - installing python-tk@${PYVER}..."
-        if brew install "python-tk@${PYVER}"; then
-            ok "python-tk@${PYVER} installed"
-        else
-            warn "brew install python-tk@${PYVER} failed - GUI will fail to launch."
-            warn "  try manually: brew install python-tk@${PYVER}"
-        fi
-    else
-        warn "tkinter not importable for $PYTHON - GUI will fail to launch."
-    fi
-fi
-ok "python: $PYTHON (v$PYVER)"
-
-if ! "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 9)' 2>/dev/null; then
-    fail "Python 3.9+ required (found $PYVER)."
-fi
-
-# Apple's CLT Python is technically usable for the headless parts but the GUI
-# and native build both break against it. Warn loudly with the exact fix.
-if [[ "$PYTHON" == /usr/bin/python3 ]] || \
-   [[ "$PYTHON" == /Library/Developer/CommandLineTools/* ]]; then
-    warn "Using Apple's Xcode CLT Python — its Tk is too old for the tabbed UI"
-    warn "and it ships no Python.h (so _ar_norm can't build). Recommended:"
-    warn "  brew install python@3.14   # then re-run ./install.sh"
-fi
+ok "venv python: $PYTHON (v$PYVER)"
 
 # Xcode Command Line Tools — needed for the C compiler that builds _ar_norm.
 # The install dialog is async (user clicks Install, download takes ~5-10 min)
@@ -142,8 +130,17 @@ else
 fi
 
 # Python headers (Python.h) — required for the C extension build.
+# Inside a venv, sysconfig.get_path("include") points at the venv's empty
+# include dir; the real headers live under sys.base_prefix. Check both.
 HAS_HEADERS=1
-if ! "$PYTHON" -c 'import sysconfig, os; p=sysconfig.get_path("include"); assert os.path.exists(os.path.join(p, "Python.h"))' 2>/dev/null; then
+if ! "$PYTHON" -c '
+import os, sys, sysconfig
+candidates = [
+    sysconfig.get_path("include"),
+    os.path.join(sys.base_prefix, "include", "python%d.%d" % sys.version_info[:2]),
+]
+sys.exit(0 if any(os.path.exists(os.path.join(p, "Python.h")) for p in candidates if p) else 1)
+' 2>/dev/null; then
     HAS_HEADERS=0
     warn "Python development headers (Python.h) not found — _ar_norm build will be skipped."
     warn "  Homebrew Python ships them; if missing, reinstall with: brew reinstall python@3.14"
@@ -157,19 +154,8 @@ fi
 ok "pip: $($PYTHON -m pip --version | awk '{print $1, $2}')"
 
 # ── Python deps ───────────────────────────────────────────────────────────────
+# Inside the venv: no --user, no --break-system-packages, no PEP 668 gymnastics.
 PIP_ARGS=(install --upgrade)
-[[ $PIP_USER -eq 1 ]] && PIP_ARGS+=(--user)
-
-# PEP 668: Brew Python needs --user + --break-system-packages; detect via marker.
-if "$PYTHON" -c "
-import sysconfig, os, sys
-m = os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
-sys.exit(0 if os.path.exists(m) else 1)
-" 2>/dev/null; then
-    warn "Python is externally-managed (PEP 668) — adding --user --break-system-packages."
-    [[ $PIP_USER -eq 0 ]] && PIP_ARGS+=(--user)
-    PIP_ARGS+=(--break-system-packages)
-fi
 
 CORE_DEPS=(
     setuptools
