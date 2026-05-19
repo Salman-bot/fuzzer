@@ -1683,10 +1683,12 @@ def run_gui() -> int:
 
     ttk.Label(form, text="Pattern:").grid(row=0, column=0, sticky="w")
     _PATTERN_PH_TEXT = "Type a word or phrase…  e.g. machine learning"
-    _saved_pattern = str(_gui_state.get("last_pattern", ""))
-    if _saved_pattern.strip() == _PATTERN_PH_TEXT:
-        _saved_pattern = ""
-    pattern_var = tk.StringVar(value=_saved_pattern)
+    # Always start the pattern box empty. Restoring last_pattern across sessions
+    # races with the ghost-text logic and occasionally leaves the box visually
+    # showing a real value while the placeholder flag is still set — Search
+    # then thinks the pattern is empty. History is still available via ↑/↓ and
+    # the combobox dropdown (search_history).
+    pattern_var = tk.StringVar(value="")
     _search_history: List[str] = [str(x) for x in _gui_state.get(
         "search_history", [])]  # type: ignore[arg-type]
     # Wrap the combobox in a 1px frame that doubles as a focus ring (color
@@ -1767,14 +1769,10 @@ def run_gui() -> int:
              "Keyboard: focus the box and press ESC.")
 
     ttk.Label(form, text="Files/folders:").grid(row=1, column=0, sticky="w")
-    # Defensive: if a previous version saved the placeholder text into
-    # last_files (fixed now, but state files in the wild may still carry it),
-    # treat it as empty so the placeholder logic can run normally.
     _FILES_PH_TEXT = "Drag a folder or file here, or paste a path…"
-    _saved_files = str(_gui_state.get("last_files", ""))
-    if _saved_files.strip() == _FILES_PH_TEXT:
-        _saved_files = ""
-    files_var = tk.StringVar(value=_saved_files)
+    # Always start the files box empty — same reasoning as pattern_var above:
+    # restoring a saved path occasionally races with the ghost-text logic.
+    files_var = tk.StringVar(value="")
     files_entry = ttk.Entry(form, textvariable=files_var)
     files_entry.grid(row=1, column=1, columnspan=2,
                      sticky="ew", padx=4, pady=2)
