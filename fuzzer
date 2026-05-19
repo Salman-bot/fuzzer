@@ -41,12 +41,7 @@ def _err(msg: str) -> None:
     print(f"{_c(_YEL)}warning:{_r()} {msg}", file=sys.stderr)
 
 
-# ── MuPDF crash blacklist + pdfplumber-missing warning ─────────────────────────
-# Some malformed PDFs reliably segfault MuPDF (NULL deref deep in fz_fill_text,
-# usually on Arabic Wikipedia dumps with broken font tables). We isolate the
-# extraction in a subprocess so the GUI survives, but the *same* file crashes
-# every search → re-running the subprocess is wasted work and spams the log.
-# Persist a blacklist so doomed files skip MuPDF entirely on next attempt.
+# ── MuPDF crash blacklist: skip PDFs that previously segfaulted. ─────────────
 from pathlib import Path as _Path_for_blacklist
 import json as _json_blacklist
 _MUPDF_BLACKLIST_FILE = _Path_for_blacklist.home() / ".fuzzer_mupdf_blacklist.json"
@@ -92,10 +87,7 @@ def _extract_plain(fp: str) -> Optional[List[str]]:
 _pdf_page_map: Dict[str, List[int]] = {}  # fp → page_num per line (1-based)
 
 
-# Inline worker script for the PyMuPDF subprocess. Kept short — it reads
-# the path from stdin, dumps {"lines": [...], "page_nums": [...]} to stdout.
-# sort=True re-orders glyphs by position to fix Arabic ligature order in
-# PDFs with non-standard glyph sequences.
+# Subprocess script: reads path from stdin, dumps {lines, page_nums} to stdout.
 _PYMUPDF_WORKER = (
     "import sys, json, fitz\n"
     "fp = sys.stdin.read().strip()\n"
@@ -330,11 +322,7 @@ try:
 
 except ImportError:
     try:
-        # pyarabic is in CORE_DEPS, so this tier is effectively the default
-        # whenever the C extension didn't build (missing CLT, header mismatch,
-        # cross-Python ABI, etc.). Slower than _ar_norm but a proper Arabic
-        # tokenizer — far better than the pure-regex fallback for searches
-        # involving hamza/yeh normalization edge cases.
+        # pyarabic tier: default whenever the C ext didn't build. Slower but correct.
         import pyarabic.araby as _araby  # type: ignore[import-not-found]
 
         def _normalize_arabic(s: str) -> str:
@@ -643,11 +631,7 @@ def search_file(
 
     return lines, matches
 
-# ── rga (ripgrep-all) backend ────────────────────────────────────────────────
-# Optional external engine. When `rga` is on PATH and the user opts in via the
-# GUI checkbox, search is delegated to rga so we get text extraction for docx,
-# epub, xlsx, sqlite, mkv subtitles, etc. for free. Trade-off: substring-only,
-# no fuzzy fallback.
+# ── rga (ripgrep-all) backend: wider format support, no fuzzy. ─────────────
 import shutil as _shutil
 _RGA_PATH = _shutil.which("rga")
 
@@ -696,10 +680,7 @@ def rga_search_file(
                            use_smart=use_smart)
 
     matches: List[Match] = []
-    # rga's PDF adapter prefixes each emitted line with "Page N:" (e.g.
-    # "Page 7: matched content..."). Parse the prefix into Match.page_num
-    # and strip it off the displayed text so snippets show the actual content
-    # rather than the page marker.
+    # rga emits "Page N: content" for PDFs; split prefix into Match.page_num.
     _page_prefix_re = re.compile(r"^Page\s+(\d+):\s*(.*)$")
     for ln in proc.stdout.splitlines():
         if not ln:
@@ -942,10 +923,7 @@ def run_gui() -> int:
                 with contextlib.suppress(Exception):
                     if _now - _f.stat().st_mtime > 86400:  # 24h
                         _f.unlink()
-    # tkinter Treeview cells are always LTR containers, so we need
-    # bidi.get_display() to reorder Arabic words for correct visual order.
-    # CoreText handles letter-level shaping (connecting glyphs) from raw
-    # Unicode, so arabic_reshaper is NOT needed and would fight CoreText.
+    # bidi.get_display for word order; CoreText does glyph shaping (no reshaper).
     import platform as _platform
 
     # Pre-set Preview's saved window frame so PDFs open directly at
@@ -968,14 +946,10 @@ def run_gui() -> int:
         import arabic_reshaper as _arabic_reshaper  # type: ignore[assignment]
     _WS_RUN = re.compile(r"\s+")
     _HAS_ARABIC = re.compile(r"[؀-ۿ]")
-    # Mirror pairs — bidi RTL rendering flips these visually. Pre-swap them in
-    # the logical string so the rendered output reads correctly left-to-right.
+    # Mirror pairs pre-swapped so brackets render right after bidi flip.
     _BIDI_MIRROR = str.maketrans({"(": ")", ")": "(", "[": "]", "]": "[",
                                   "{": "}", "}": "{", "<": ">", ">": "<"})
-    # Some Arabic PDFs encode the definite article ال as ا+م+ل (positions 1-2
-    # swapped). Detect at word start and swap back. ا (0x627) is matched, but
-    # not أ/إ/آ — those are different alef variants for which "أم"/"إم" are
-    # legitimate word starts.
+    # Fix some PDFs encoding ال as ا+م+ل (positions 1-2 swapped). Plain ا only.
     _AL_SWAP = re.compile(r"(?<![ء-ي])امل")
 
     def _fix_arabic(text: str) -> str:
@@ -988,10 +962,7 @@ def run_gui() -> int:
         # Fix broken-encoding ا+م+ل → ا+ل+م at word starts
         text = _AL_SWAP.sub("الم", text)
         if _platform.system() == "Darwin":
-            # PyMuPDF returns logical-order Unicode; CoreText + Geeza Pro
-            # handles RTL shaping and bidi rendering natively in tkinter.
-            # For mixed Arabic text, pre-swap mirror pairs so brackets read
-            # visually correct after bidi mirroring.
+            # macOS: pre-swap mirror pairs so brackets render right after bidi.
             if _HAS_ARABIC.search(text):
                 text = text.translate(_BIDI_MIRROR)
             return text
@@ -1313,12 +1284,7 @@ def run_gui() -> int:
         BTN_GO_BG="#7c3aed", BTN_GO_HOVER="#6d28d9",
         BTN_RUN_BG="#f59e0b", BTN_RUN_HOVER="#d97706",
     )
-    # Midnight-purple palette. Backgrounds layered like night sky → fog →
-    # ink so the eye reads depth across panels: deepest at the window edge
-    # (BG), one step up for raised surfaces (CARD_BG), warmer purple ink for
-    # the chat pane (CHAT_BG). All accents draw from the violet ramp (#a78bfa
-    # → #c4b5fd) so highlights, focus rings, buttons, and "you" tags share
-    # the same hue.
+    # Midnight-purple palette. BG (deepest) → CARD_BG → CHAT_BG, all violet accents.
     _DARK_PAL = dict(
         BG="#0c0a1a", CARD_BG="#171225", BORDER="#3a2f5e",
         TEXT="#ece6ff", MUTED="#a39ec5", ACCENT="#a78bfa",
@@ -1521,11 +1487,7 @@ def run_gui() -> int:
     }
     msg_q: "queue.Queue[tuple]" = queue.Queue()
 
-    # ── top form ─────────────────────────────────────────────────────────────
-    # Tightened padding (10 → (10, 6)) so the search bar doesn't dominate the
-    # window at default size. Row 0 (pattern) is the headline input and gets
-    # a slightly heavier font + a focus ring; row 1 (files) and row 2 (opts)
-    # stay compact.
+    # ── top form: pattern row + files row + options row. ────────────────────
     form = ttk.Frame(root, padding=(10, 6, 10, 6))
     form.pack(fill="x")
     form.columnconfigure(1, weight=1)
@@ -1558,11 +1520,7 @@ def run_gui() -> int:
         lambda _e: _pat_ring.configure(bg=_T["BORDER"]),
         add="+")
 
-    # ── ghost-text placeholders for the top form ────────────────────────────
-    # When a StringVar-backed entry is empty and unfocused, drop a muted hint
-    # into the var ("Type a word…", "Drag a folder…"). The shared state dict
-    # tracks whether the value is the hint vs real user input so consumers
-    # (start_search, drop handler, picker) skip it cleanly.
+    # ── Ghost-text placeholders. `state["active"]` flag lets consumers skip them. ──
     def _install_entry_placeholder(widget, var, text) -> dict:
         state = {"active": False, "text": text}
 
@@ -1996,11 +1954,7 @@ def run_gui() -> int:
     actions = ttk.Frame(form)
     actions.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
 
-    # tk.Label-based "button" — both tk.Button and ttk.Button on macOS Aqua
-    # ignore background colours and render with the native white chrome, which
-    # is wrong for the blue-idle/amber-running affordance and breaks dark mode.
-    # Click and hover are wired manually below; state["searching"] gates clicks
-    # while a search is in flight.
+    # Label-as-button: macOS Aqua's tk.Button/ttk.Button ignore bg colors.
     search_btn = tk.Label(
         actions, text="Search",
         bg=_T["BTN_GO_BG"], fg="white",
@@ -2123,11 +2077,7 @@ def run_gui() -> int:
     ).pack(anchor="nw")
 
     columns = ("file", "line", "page", "match", "score", "content")
-    # `line` and `match` stay in the data model (double-click handler and
-    # selected-row preview both read them) but are hidden from the user
-    # via `displaycolumns` -- the line number lives in the snippet preview
-    # below the table, and `match` ("exact"/"fuzzy"/"ai") duplicates info
-    # already conveyed by `score` (100 vs <100). Less visual noise.
+    # `line` + `match` stay in vals (used by handlers) but are hidden from view.
     _display_columns = ("file", "page", "score", "content")
     tree = ttk.Treeview(table_frame, columns=columns, show="headings",
                         displaycolumns=_display_columns)
@@ -2295,11 +2245,7 @@ def run_gui() -> int:
         frame.pack()
         inner = tk.Frame(frame, bg=_bg)
         inner.pack(padx=1, pady=1)
-        # NOTE: pady/padx in a Tk widget constructor must be a single screen
-        # distance -- only pack()/grid() accept 2-tuples for asymmetric pad.
-        # Passing pady=(4, 0) to tk.Label raises
-        #   TclError: expected screen distance but got "4 0"
-        # on Tk 9.x. Keep all asymmetric padding on the layout call instead.
+        # Widget pady takes single int; only pack/grid accept 2-tuples.
         tk.Label(
             inner, text="Activity history",
             bg=_bg, fg="#9b8cf0", font=("Menlo", 9, "bold"),
@@ -2400,11 +2346,7 @@ def run_gui() -> int:
 
     _set_selected_preview(_SELECTED_PLACEHOLDER)
 
-    # ── progress strip (used by Transcribe, packed only while running) ─────
-    # Custom Canvas-based progress bar so we can:
-    #   1. control thickness (taller than ttk's default ~6 px),
-    #   2. paint the fill in the theme's purple accent for visibility, and
-    #   3. write the current task + percent centered ON the bar itself.
+    # ── progress strip (Transcribe; Canvas-based for thickness + accent fill). ──
     _progress_frame = tk.Frame(_statusbar_inner, bg=_T["CHAT_ENTRY_BG"])
     _progress_visible = [False]
     _PROGRESS_HEIGHT = 22
@@ -4762,11 +4704,7 @@ def run_gui() -> int:
 
     def start_search() -> None:
         if state["searching"]:
-            # Zombie-worker safety: if state still says "searching" but the
-            # worker thread is dead (crashed, hung, killed without posting
-            # `done`/`error`), we'd be stuck forever waiting for a restart
-            # signal that never arrives. Detect and force-reset, then fall
-            # through to start the new search normally.
+            # Zombie-worker safety: dead thread + searching flag = force reset.
             worker_thread = state.get("worker_thread")
             if worker_thread is None or not worker_thread.is_alive():
                 _log_activity(
@@ -4949,11 +4887,7 @@ def run_gui() -> int:
                       for w in _query.split() if w.strip()])
 
             import string as _string
-            # ASCII punctuation that PyMuPDF's search_for tends to normalize
-            # differently than get_text returns (curly vs straight quotes,
-            # smart dashes, etc.). Stripping these from the end of a regex
-            # match before retrying recovers cases like `H"` where the raw
-            # pattern won't match but the alphanumeric core will.
+            # Strip trailing punctuation on retry — search_for normalizes quotes/dashes.
             _strip_chars = _string.punctuation
 
             def _search_with_fallback(_pg_obj: object, _term: str) -> int:
@@ -4979,22 +4913,14 @@ def run_gui() -> int:
                     continue
                 _pg = _doc[_pn - 1]
                 _highlighted_any = False
-                # Smart mode's positive terms ARE literal substrings (quoted
-                # phrases + bare words), so they go straight into the same
-                # search_for pass as the default-mode terms. The regex
-                # finditer + collection step we used to need is no longer
-                # required.
+                # Smart positive terms are literal substrings; same path as default.
                 _regex_terms: List[str] = list(_terms) if _use_smart else []
                 # Pass 1 (literal): exact substring search via PyMuPDF
                 for _term in _terms:
                     if _search_with_fallback(_pg, _term) > 0:
                         _highlighted_any = True
-                # Pass 2: normalized word match. Always runs (cheap) so we
-                # catch additional hits the exact pass missed — e.g. words
-                # with fatha/damma/kasra or أ/إ/ا differences AND words
-                # where search_for failed because of CMap / punctuation
-                # aliasing (regex mode adds the matched substrings to the
-                # per-word check too).
+                # Pass 2: normalized word match catches diacritic / alef variants
+                # exact search misses (e.g. إنّ matches إن).
                 _regex_terms_norm = [
                     _normalize_arabic(_t).lower() for _t in _regex_terms]
                 with contextlib.suppress(Exception):
@@ -5189,11 +5115,7 @@ def run_gui() -> int:
                 match_type, score_text = "fuzzy", str(m.score)
             page_text = str(m.page_num) if m.page_num else ""
             _tag = "odd" if row_index % 2 else "even"
-            # Anchor the snippet on the *actual* regex/literal match
-            # position when we can find one — `_line_context`'s fuzzy-token
-            # heuristic otherwise crops long joined lines (e.g. multi-column
-            # PDFs where PyMuPDF's sort=True merges two columns) before
-            # reaching the match, leaving the ‹…› markers nowhere to land.
+            # Center snippet on the exact match so ‹…› markers always land.
             _full_ranges = _find_match_ranges(
                 m.line, pattern_var.get(),
                 use_smart=smart_var.get(),
@@ -5226,11 +5148,7 @@ def run_gui() -> int:
                     case_sensitive=case_var.get(),
                     whole_word=whole_word_var.get(),
                 )
-            # Mark the matched substring(s) inside the snippet so the user
-            # can see *where* the hit is — Tk's Treeview cells can't paint
-            # per-substring backgrounds, so we wrap with ‹…› guillemets.
-            # The yellow-bg highlight lives in the selected-row preview
-            # below the table (a tk.Text widget supports per-range tags).
+            # Wrap matches in ‹…› in tree cells; real yellow tag lives in preview pane.
             _snippet_marked = _wrap_marks(_snippet, _snippet_ranges)
             iid = tree.insert("", "end", values=(
                 display_name, m.line_num, page_text, match_type, score_text,
@@ -5519,11 +5437,7 @@ def run_gui() -> int:
                 _tmp_path = _highlighted_pdfs.get(filepath, filepath)
                 hl_note = "" if _tmp_path != filepath else " (no highlight — fitz missing?)"
 
-                # Snap fuzzer to the left half and target the PDF viewer at
-                # the right half, so the user sees both panes side-by-side
-                # without manually arranging windows. macOS reserves the top
-                # ~30 px for the menu bar; we leave a similar margin at the
-                # bottom for the Dock.
+                # Snap fuzzer left-half + viewer right-half for side-by-side view.
                 _screen_w = root.winfo_screenwidth()
                 _screen_h = root.winfo_screenheight()
                 _margin = 30
@@ -6296,18 +6210,11 @@ def run_gui() -> int:
     _configure_ttk_styles(_T)
     _apply_raw_colors(_T)
 
-    # Land focus on the search input as soon as the window is realized, and
-    # re-focus it whenever the window comes back from the background with no
-    # specific widget owning focus. Feels like a search bar (open → type →
-    # search) rather than having to click first. `after_idle` waits until Tk
-    # has finished mapping widgets so focus_set sticks reliably on macOS.
+    # Focus the search input on launch and on window-reactivate.
     root.after_idle(lambda: pattern_entry.focus_set())
 
     def _refocus_on_window_activate(_e: object) -> None:
-        # Widget-specific bind (not bind_all) → only fires when root itself
-        # is the FocusIn target, which is the macOS signal that the window
-        # was just activated. Guard against stealing focus from a child the
-        # user has already clicked into.
+        # Only re-grab focus when root itself is the FocusIn target, not a child.
         with contextlib.suppress(Exception):
             cur = root.focus_get()
             if cur in (None, root):

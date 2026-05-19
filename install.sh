@@ -52,15 +52,8 @@ fi
 ok "platform: macOS"
 
 # ── toolchain checks ──────────────────────────────────────────────────────────
-# Prefer Homebrew Python over Apple's Xcode CLT Python. Apple's /usr/bin/python3
-# is 3.9 with a Tk 8.6.x too old for the tabbed Notebook (blank window +
-# "expected screen distance" TclError) AND ships without Python.h, so the
-# _ar_norm C extension can't build against it. Brew Python solves both.
-#
-# Probe Brew installs exhaustively — `brew install python@X` only creates
-# /opt/homebrew/bin/python3 when that version becomes the default; if the user
-# has multiple Pythons installed, the symlink may be missing entirely. Pick
-# the newest Cellar install by sorting the python@X dirs.
+# Prefer Brew Python: Apple's CLT Python is too old and ships no headers.
+# Probe @X/bin/python3 too -- the /opt/homebrew/bin symlink may be missing.
 find_brew_python() {
     local p
     for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
@@ -99,12 +92,7 @@ if [[ -z "$PYTHON" ]]; then
 fi
 PYVER="$("$PYTHON" -c 'import sys; print("%d.%d"%sys.version_info[:2])')"
 
-# Brew split Tcl/Tk out of python@X starting with 3.13 -- without the matching
-# python-tk@X formula, `import tkinter` errors with "No module named '_tkinter'"
-# and fuzzer's GUI can't launch at all. Detect and auto-install.
-# (Use ${PYVER} with braces -- bare $PYVER followed by a Unicode ellipsis
-# made macOS bash 3.2 treat the ellipsis bytes as part of the variable name,
-# tripping `set -u` with a confusing "PYVER?: unbound variable" error.)
+# Brew Python 3.13+ ships without _tkinter; auto-install python-tk@$PYVER.
 if ! "$PYTHON" -c 'import tkinter' 2>/dev/null; then
     if command -v brew >/dev/null 2>&1 && [[ "$PYTHON" == /opt/homebrew/* || "$PYTHON" == /usr/local/* ]]; then
         step "Brew Python missing Tk bindings - installing python-tk@${PYVER}..."
@@ -172,10 +160,7 @@ ok "pip: $($PYTHON -m pip --version | awk '{print $1, $2}')"
 PIP_ARGS=(install --upgrade)
 [[ $PIP_USER -eq 1 ]] && PIP_ARGS+=(--user)
 
-# Auto-detect PEP 668 (externally-managed) Pythons via the marker file. On
-# Homebrew Python the marker lives at <stdlib>/EXTERNALLY-MANAGED and pip
-# refuses system installs without --break-system-packages. --user alone is
-# NOT enough on pip 24.1+ — the marker still blocks. Detect and add both.
+# PEP 668: Brew Python needs --user + --break-system-packages; detect via marker.
 if "$PYTHON" -c "
 import sysconfig, os, sys
 m = os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
@@ -207,13 +192,9 @@ ok "core dependencies installed"
 # ── Build _ar_norm native extension ───────────────────────────────────────────
 if [[ -n "$CC_BIN" && $HAS_HEADERS -eq 1 ]]; then
     step "building _ar_norm C extension…"
-    # Force clean rebuild — a leftover .so built against a different Python
-    # ABI would ghost-pass `make`'s mtime check and ghost-fail the import.
+    # Force clean rebuild — stale .so might pass mtime check but ABI-fail import.
     make clean-native >/dev/null 2>&1 || true
-    # Pass PYTHON to make explicitly — the Makefile defaults to
-    # `command -v python3` which can resolve to a different Python than the
-    # one we chose above (Apple system, Brew without symlink, etc.). Build
-    # output goes to a log so failures aren't silent.
+    # Pin PYTHON for make; output to log so failures aren't silent.
     BUILD_LOG="$ROOT/.ar_norm-build.log"
     if make PYTHON="$PYTHON" build-native >"$BUILD_LOG" 2>&1; then
         if "$PYTHON" -c "import sys; sys.path.insert(0, '$ROOT'); import _ar_norm; print(_ar_norm.normalize('أ'))" >/dev/null 2>&1; then
@@ -232,10 +213,7 @@ else
     warn "skipping native build (compiler or Python headers missing) — pure-Python fallback will be used."
 fi
 
-# ── Skim PDF viewer (optional but recommended) ────────────────────────────────
-# fuzzer prefers Skim over Preview for opening PDF results: Skim has reliable
-# `go to page N` AppleScript, where Preview needs fragile UI scripting via
-# Cmd+Opt+G. If Skim isn't installed we silently fall back to Preview.
+# ── Skim PDF viewer: reliable AppleScript page-nav; Preview is fallback. ──
 if [[ -d "/Applications/Skim.app" ]]; then
     ok "Skim already installed (used as the PDF viewer)"
 elif command -v brew >/dev/null 2>&1; then
@@ -259,11 +237,7 @@ if [[ $WITH_CORPUS -eq 1 ]]; then
     ok "test corpus ready under test_pdfs/"
 fi
 
-# ── Pin fuzzer's shebang to the absolute install Python ──────────────────────
-# Tracked fuzzer uses `#!/usr/bin/env python3` for portability, but when the
-# GUI is launched from Dock/Spotlight (not a terminal) macOS hands the process
-# a stripped PATH that resolves to /usr/bin/python3 (Apple system Python, no
-# packages). Rewriting to an absolute path makes the launch context irrelevant.
+# ── Pin shebang to absolute Python (Dock launches have stripped PATH). ────
 step "pinning fuzzer shebang to $PYTHON …"
 ABS_PYTHON="$("$PYTHON" -c 'import sys; print(sys.executable)')"
 if [[ -x "$ROOT/fuzzer" ]]; then
@@ -348,10 +322,7 @@ next steps:
   make test-corpus && make test
 EOF
 
-# ── Desktop launcher (Fuzzer.app) ─────────────────────────────────────────────
-# Drop a minimal .app bundle on the user's Desktop so they can launch fuzzer
-# by double-clicking instead of opening a Terminal. The bundle is just a
-# shim — Info.plist + a 3-line shell script that exec's the real fuzzer.
+# ── Desktop launcher: minimal Fuzzer.app shim that exec's the real fuzzer. ──
 step "creating Desktop launcher (Fuzzer.app)..."
 APP_DIR="$HOME/Desktop/Fuzzer.app"
 rm -rf "$APP_DIR"
@@ -385,11 +356,7 @@ chmod +x "$APP_DIR/Contents/MacOS/Fuzzer"
 touch "$APP_DIR"
 ok "Fuzzer.app created at $APP_DIR (double-click to launch)"
 
-# ── Launch fuzzer ─────────────────────────────────────────────────────────────
-# Run the GUI now so the user lands directly in the app rather than having to
-# task-switch back from Terminal. Detach via `nohup`+`&` so closing the
-# Terminal doesn't kill the GUI. Stderr goes to a log so a silent-blank-window
-# failure (Tk error during widget setup, etc.) leaves a trail.
+# ── Launch fuzzer (detached, stderr → log). ────────────────────────────────
 step "launching fuzzer..."
 LAUNCH_LOG="$ROOT/.fuzzer-launch.log"
 : >"$LAUNCH_LOG" 2>/dev/null || LAUNCH_LOG="/tmp/fuzzer-launch.log"
